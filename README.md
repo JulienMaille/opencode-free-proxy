@@ -1,76 +1,54 @@
 # opencode-free-proxy
 
-Free AI models from [OpenCode](https://opencode.ai) exposed as standard OpenAI and Anthropic APIs.
+Free AI models from [OpenCode](https://opencode.ai) (the Zen API free tier), exposed as standard OpenAI and Anthropic APIs. Works with any tool that speaks those formats: opencode CLI, Cursor, Claude Code, Cline, aider, raw `curl`, etc.
 
-One server — works with any tool that speaks OpenAI or Anthropic format: Cursor, Continue, Cline, Claude Code, aider, opencode CLI, raw `curl`, whatever.
+## Quick start (Windows)
 
-## Related projects
-
-All three projects share the same CLI interface (`--port`, `--host`, `--proxy`, `--api-key`) and work together through [llama-swap](https://github.com/mmkeeper/llama-swap):
-
-| Project | Port | Prefix | What |
-|---------|------|--------|------|
-| [opencode-free-proxy](https://github.com/mmkeeper/opencode-free-proxy) | 6446 | `ocf-` | OpenCode free models (this) |
-| [deepseek-free-api](https://github.com/mmkeeper/deepseek-free-api) | 18632 | `dsf-` | DeepSeek free API |
-| [mimo-free-proxy](https://github.com/mmkeeper/mimo-free-proxy) | 8788 | `mcf-` | Xiaomi MiMo free API |
-
-## 30-second setup
-
-```bash
-git clone https://github.com/mmkeeper/opencode-free-proxy.git
-cd opencode-free-proxy
+```bat
 pip install -r requirements.txt
-python server.py
+start.bat
 ```
 
-Done. Server is at `http://localhost:6446`. API keys are in `api-keys.json` (auto-generated on first run).
+`start.bat` runs `python server.py --port 6446 --proxy-pool`, which enables the rotating SOCKS5 proxy pool (recommended — free-tier rate limits per IP are aggressive). Use `start-simple.bat` for direct connections without a proxy.
+
+`stop.bat` kills the server on port 6446.
+
+Server is at `http://localhost:6446`.
 
 ## CLI arguments
 
-All projects use the same CLI interface:
-
 ```bash
-python server.py --port 6446 --host 127.0.0.1 --proxy socks5://127.0.0.1:9150 --api-key sk-my-key
+python server.py --port 6446 --host 0.0.0.0 --proxy-pool
 ```
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--port` | `6446` | Listen port |
-| `--host` | `127.0.0.1` | Listen host |
-| `--proxy` | _(none)_ | SOCKS5 proxy (e.g. `socks5://127.0.0.1:9150`) |
-| `--api-key` | _(from api-keys.json)_ | API key for client auth |
+| `--host` | `0.0.0.0` | Listen host |
+| `--proxy` | _(none)_ | Static SOCKS5 proxy (e.g. `socks5://127.0.0.1:9150`) |
+| `--proxy-pool` | off | Rotating SOCKS5 proxy pool with auto-switch on rate-limit |
+| `--api-key` | _(none)_ | API key for client auth (see env vars) |
 
 ## Environment variables
 
-| Variable | Default | What |
-|----------|---------|------|
-| `PROXY_PORT` | `6446` | Server port |
-| `HOST` | `127.0.0.1` | Listen host |
-| `KEYS_FILE` | `./api-keys.json` | API keys file path |
-| `SOCKS5_PROXY` | _(none)_ | SOCKS5 proxy address for upstream requests |
+| Variable | What |
+|----------|------|
+| `PORT` / `HOST` | Override listen port/host |
+| `SOCKS5_PROXY` | Static SOCKS5 proxy (used when `--proxy-pool` is off) |
+| `OPENCODE_PROXY_POOL` | `1`/`true` to enable the proxy pool via env |
+| `LOCAL_KEY` / `API_KEY` | API key for client auth; if unset, the server accepts any request |
+| `OPENCODE_ENABLE_EXA=1` | Enables the `websearch` tool for opencode CLI (set in `start.bat`) |
 
-## What you get
+## Models
 
-| Model | What it is | Reliability | Works with proxy | Works without proxy |
-|-------|-----------|-------------|------------------|---------------------|
-| `mimo-v2.5-free` | Xiaomi MiMo v2.5 | Solid | ✅ | ✅ |
-| `deepseek-v4-flash-free` | DeepSeek V4 Flash | Solid | ✅ | ✅ |
-| `north-mini-code-free` | North Mini Code | Solid | ✅ | ✅ |
-| `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | Solid | ✅ | ⚠️ sometimes fails |
-| `big-pickle` | DeepSeek V4 Flash (alias) | Solid | ✅ | ✅ |
+The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/models`) and enriched with context limits / modalities from `models.dev`. It refreshes every 5 hours. Typical free models:
 
-All models support streaming, tool calls, and system messages.
-
-### Model name aliases (opencode CLI / Hermes)
-
-When using the proxy with tools that support provider-prefixed model names (opencode CLI, Hermes), use the `ocf-` prefix:
-
-| Tool format | Actual model sent to upstream |
-|-------------|------------------------------|
-| `ocf-mimo-v2.5-free` | `mimo-v2.5-free` |
-| `ocf-deepseek-v4-flash-free` | `deepseek-v4-flash-free` |
-
-The `ocf-` prefix is stripped before forwarding to opencode.ai, so multiple providers (mimo-free-proxy, opencode-free-proxy) can coexist without model name conflicts.
+- `deepseek-v4-flash-free`
+- `mimo-v2.5-free` (only one that also accepts image/audio/video input)
+- `ling-3.0-flash-free`
+- `nemotron-3-ultra-free`
+- `north-mini-code-free`
+- `laguna-s-2.1-free`
 
 ## API
 
@@ -106,148 +84,28 @@ curl http://localhost:6446/v1/messages \
 
 | Method | Path | What |
 |--------|------|------|
-| `GET` | `/v1/models` | List models |
+| `GET` | `/v1/models` | List models (includes limits + modalities) |
 | `GET` | `/health` | Health + version |
 
 ### Auth
 
 Both `Authorization: Bearer KEY` and `x-api-key: KEY` work on all endpoints.
 
-## Use with tools
-
-### opencode CLI
-
-Add to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "provider": {
-    "free": {
-      "name": "free",
-      "type": "openai",
-      "apiKey": "YOUR_KEY",
-      "baseURL": "http://localhost:6446/v1",
-      "models": {
-        "free/deepseek-v4-flash-free": {
-          "id": "deepseek-v4-flash-free",
-          "name": "free/deepseek-v4-flash-free",
-          "attachment": true,
-          "reasoning": true
-        }
-      }
-    }
-  }
-}
-```
-
-### Cursor / Continue / Cline
-
-- Base URL: `http://YOUR_HOST:6446/v1`
-- API Key: your key from `api-keys.json`
-- Model: `deepseek-v4-flash-free`
-
-### Claude Code (Anthropic format)
-
-- Base URL: `http://YOUR_HOST:6446`
-- API Key: your key from `api-keys.json`
-- Works with `/v1/messages` endpoint
-
-## Deploy on a VPS
-
-```bash
-# On your VPS
-git clone https://github.com/bigdata2211it-web/opencode-free-proxy.git
-cd opencode-free-proxy
-pip install -r requirements.txt
-python server.py          # foreground
-# or
-nohup python server.py > proxy.log 2>&1 &   # background
-```
-
-If your VPS doesn't expose port 6446, use an SSH tunnel:
-
-```bash
-ssh -L 6446:127.0.0.1:6446 user@your-vps
-# Now http://localhost:6446 works locally
-```
-
-### systemd service (optional)
-
-```ini
-# /etc/systemd/system/opencode-proxy.service
-[Unit]
-Description=OpenCode Free Proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/opencode-proxy
-ExecStart=/usr/bin/python3 server.py
-Restart=always
-RestartSec=5
-Environment=PROXY_PORT=6446
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable --now opencode-proxy
-```
-
-## SOCKS5 Proxy
-
-Route all upstream requests to opencode.ai through a SOCKS5 proxy.
-
-### CLI argument
-
-```bash
-python server.py --proxy 127.0.0.1:9150
-python server.py --proxy socks5://user:pass@10.0.0.1:1080
-```
-
-### Environment variable
-
-```bash
-SOCKS5_PROXY=127.0.0.1:9150 python server.py
-SOCKS5_PROXY=socks5://user:pass@10.0.0.1:1080 python server.py
-```
-
-CLI `--proxy` takes priority over `SOCKS5_PROXY`. If neither is set, requests go directly.
-
-### systemd with proxy
-
-```ini
-Environment=SOCKS5_PROXY=127.0.0.1:9150
-```
-
-## llama-swap integration
-
-This server works with [llama-swap](https://github.com/mmkeeper/llama-swap) as a peer. See `config.yaml` in the llama-swap repo for an example.
-
 ## How it works
 
 ```
-Your tool (Cursor, CLI, curl, etc.)
+Your tool (opencode CLI, Cursor, curl, etc.)
         │
         ▼
-  opencode-free-proxy        ← this server, translates formats
+  opencode-free-proxy        ← translates formats, manages sessions & proxies
         │
         ▼  HTTPS
   opencode.ai/zen/v1/       ← free tier API
 ```
 
-### Session persistence
-
-The proxy maintains conversation sessions automatically. It uses a hash of the message prefix to identify which upstream session to reuse, so multi-turn conversations stay coherent without the client managing session IDs.
-
-### Model prefix (`ocf-`)
-
-All models are exposed with an `ocf-` prefix (e.g. `ocf-mimo-v2.5-free`) to avoid conflicts with other providers in tools like Hermes. The prefix is stripped before forwarding to opencode.ai.
-
-The proxy adds `x-opencode-*` authentication headers that the Zen API requires. These were discovered by reverse engineering the opencode binary — without them, even `Authorization: Bearer public` gets rejected with `AuthError`.
-
-### Zen API auth headers (for the curious)
+- **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
+- **Proxy pool**: when `--proxy-pool` is on, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy is blacklisted on any 4xx/5xx (incl. `429` rate limits) with exponential backoff.
+- **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
 
 ```
 Authorization: Bearer public
