@@ -4,3 +4,5 @@ api-keys.json
 __pycache__/
 *.pyc
 *.bak
+data/
+proxy.log
