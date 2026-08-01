@@ -80,7 +80,7 @@ app = FastAPI(lifespan=_lifespan)
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.15.0"
-PROXY_VERSION = "10"
+PROXY_VERSION = "12"
 
 # ── API Keys ──────────────────────────────────────────────────────
 
@@ -92,7 +92,7 @@ def auth(request: Request) -> str | None:
         return "user"
     hdr = request.headers.get("authorization") or request.headers.get("x-api-key") or ""
     tok = hdr[7:] if hdr.startswith("Bearer ") else hdr
-    if tok == API_KEY:
+    if tok and secrets.compare_digest(tok, API_KEY):
         return "user"
     return None
 
@@ -115,6 +115,34 @@ def oc_id(prefix: str) -> str:
     ts = format(int(time.time() * 1000), "x")
     rnd = secrets.token_urlsafe(12)[:16]
     return f"{prefix}_{ts}{rnd}"
+
+
+_NO_CACHE = {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+
+
+def _first_chunk_error(raw_line: str) -> str | None:
+    """Return an error message if a first chunk is an error/rate-limit payload."""
+    trimmed = raw_line.strip()
+    if trimmed.startswith("data: "):
+        trimmed = trimmed[6:].strip()
+    if not trimmed or trimmed == "[DONE]" or not trimmed.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(trimmed)
+    except json.JSONDecodeError:
+        return None
+    if "FreeUsageLimitError" in trimmed or parsed.get("error") or parsed.get("type") == "error":
+        return (parsed.get("error") or {}).get("message") or parsed.get("message") or "Rate limit exceeded"
+    return None
+
+
+def _blocks_text(content) -> str:
+    """Extract plain text from Anthropic content blocks (str or list)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return str(content) if content is not None else ""
 
 
 # Dynamically discovered free models from Zen API (fallback if fetch fails)
@@ -193,6 +221,13 @@ def _normalize_model(model: str) -> str:
 
 # Session per conversation (hash-based lookup)
 _user_sessions: dict[str, dict[str, str]] = {}
+_MAX_SESSIONS_PER_USER = 500
+
+
+def _remember_session(sessions: dict[str, str], key: str, value: str):
+    sessions[key] = value
+    while len(sessions) > _MAX_SESSIONS_PER_USER:
+        sessions.pop(next(iter(sessions)))
 
 
 def _hash_messages(messages: list[dict]) -> str:
@@ -215,13 +250,13 @@ def get_session(user: str, messages: list[dict]) -> str:
         h = _hash_messages(messages[:n])
         if h in sessions:
             full_h = _hash_messages(messages)
-            sessions[full_h] = sessions[h]
+            _remember_session(sessions, full_h, sessions[h])
             _log(f"SESSION match prefix={n}/{len(messages)} -> {sessions[h]}")
             return sessions[h]
 
     new_id = f"ses_{oc_id('ses')}"
     full_h = _hash_messages(messages)
-    sessions[full_h] = new_id
+    _remember_session(sessions, full_h, new_id)
     _log(f"SESSION new {new_id} (msgs={len(messages)})")
     return new_id
 
@@ -231,7 +266,7 @@ def force_new_session(user: str, messages: list[dict]) -> str:
     if user not in _user_sessions:
         _user_sessions[user] = {}
     full_h = _hash_messages(messages)
-    _user_sessions[user][full_h] = new_id
+    _remember_session(_user_sessions[user], full_h, new_id)
     _log(f"SESSION forced new {new_id} (msgs={len(messages)})")
     return new_id
 
@@ -459,26 +494,44 @@ async def _zen_stream_with_retry(
 
         # Success — stream the response
         chunk_count = 0
+        first_chunk = True
+        retry_stream = False
         try:
             try:
                 async for line in resp.aiter_lines():
-                    if line:
-                        if line.startswith(":"):
-                            continue
-                        chunk_count += 1
-                        yield line + "\n\n"
-                        if line.strip() == "data: [DONE]":
-                            break
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if first_chunk:
+                        first_chunk = False
+                        err_msg = _first_chunk_error(line)
+                        if err_msg:
+                            _log(f"[zen] Stream error in body (attempt {attempt}): {err_msg}")
+                            if PROXY_POOL_ENABLED and proxy_addr:
+                                proxy_pool.report_ratelimit(proxy_addr)
+                            if attempt < attempts:
+                                retry_stream = True
+                                break
+                            yield f'data: {json.dumps({"error": {"message": err_msg + " (free model rate limit)", "type": "rate_limit_error", "code": "rate_limit_exceeded"}})}\n\n'
+                            return
+                    chunk_count += 1
+                    yield line + "\n\n"
+                    if line.strip() == "data: [DONE]":
+                        break
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
                 _log(f"[zen] Stream interrupted: {e}")
                 last_error = e
                 if attempt < attempts:
-                    await _backoff(attempt)
-                    continue
-                yield f'data: {json.dumps({"error": {"message": f"Stream interrupted: {e}", "type": "upstream_error"}})}\n\n'
-                return
+                    retry_stream = True
+                else:
+                    yield f'data: {json.dumps({"error": {"message": f"Stream interrupted: {e}", "type": "upstream_error"}})}\n\n'
+                    return
         finally:
             await resp.aclose()
+        if retry_stream:
+            await _backoff(attempt)
+            continue
         _log(f"STREAM done: {chunk_count} chunks")
         return
 
@@ -507,6 +560,16 @@ async def _zen_stream_anthropic_with_retry(
 
     def send_sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    def close_indices() -> list[int]:
+        """Indices of all open content blocks needing content_block_stop."""
+        idx = []
+        if content_idx > 0 and not text_closed:
+            idx.append(0)
+        offset = 1 if content_idx > 0 else 0
+        for i in range(tool_idx + 1):
+            idx.append(i + offset)
+        return idx
 
     for attempt in range(attempts + 1):
         if PROXY_POOL_ENABLED:
@@ -570,27 +633,20 @@ async def _zen_stream_anthropic_with_retry(
                         continue
 
                     if not headers_sent:
-                        trimmed = raw_line.strip()
-                        if trimmed.startswith("{") and ("FreeUsageLimitError" in trimmed or '"error"' in trimmed):
-                            try:
-                                parsed = json.loads(trimmed)
-                                if parsed.get("error") or parsed.get("type") == "error":
-                                    err_msg = (parsed.get("error") or {}).get("message") or parsed.get("message") or "Rate limit"
-                                    _log(f"[zen] Anthropic error in body (attempt {attempt}): {err_msg}")
-                                    if PROXY_POOL_ENABLED and proxy_addr:
-                                        proxy_pool.report_ratelimit(proxy_addr)
-                                    if attempt < attempts:
-                                        break
-                                    yield send_sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err_msg + " (free model rate limit)"}})
-                                    return
-                            except json.JSONDecodeError:
-                                pass
+                        err_msg = _first_chunk_error(raw_line)
+                        if err_msg:
+                            _log(f"[zen] Anthropic error in body (attempt {attempt}): {err_msg}")
+                            if PROXY_POOL_ENABLED and proxy_addr:
+                                proxy_pool.report_ratelimit(proxy_addr)
+                            if attempt < attempts:
+                                break
+                            yield send_sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err_msg + " (free model rate limit)"}})
+                            return
 
                     if raw_line.startswith("data: "):
                         payload = raw_line[6:].strip()
                         if payload == "[DONE]":
-                            total_blocks = (1 if content_idx > 0 and not text_closed else 0) + (tool_idx + 1 if tool_idx >= 0 else 0)
-                            for i in range(total_blocks):
+                            for i in close_indices():
                                 yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
                             yield send_sse("message_delta", {
                                 "type": "message_delta",
@@ -616,7 +672,7 @@ async def _zen_stream_anthropic_with_retry(
                                 "message": {
                                     "id": msg_id, "type": "message", "role": "assistant", "content": [],
                                     "model": model, "stop_reason": None,
-                                    "usage": {"input_tokens": input_tokens or 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                                    "usage": {"input_tokens": input_tokens or 0, "output_tokens": 0, **_NO_CACHE},
                                 },
                             })
 
@@ -653,8 +709,7 @@ async def _zen_stream_anthropic_with_retry(
 
                         finish_reason = (parsed.get("choices") or [{}])[0].get("finish_reason")
                         if finish_reason:
-                            total_blocks = (1 if content_idx > 0 and not text_closed else 0) + (tool_idx + 1 if tool_idx >= 0 else 0)
-                            for i in range(total_blocks):
+                            for i in close_indices():
                                 yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
 
                             stop_reason = "end_turn"
@@ -700,13 +755,7 @@ def anthropic_to_openai(body: dict) -> tuple[list[dict], list[dict] | None]:
     messages = []
 
     if body.get("system"):
-        sys_val = body["system"]
-        if isinstance(sys_val, str):
-            sys_text = sys_val
-        elif isinstance(sys_val, list):
-            sys_text = "\n".join(b.get("text", "") for b in sys_val)
-        else:
-            sys_text = ""
+        sys_text = _blocks_text(body["system"])
         if sys_text:
             messages.append({"role": "system", "content": sys_text})
 
@@ -715,7 +764,7 @@ def anthropic_to_openai(body: dict) -> tuple[list[dict], list[dict] | None]:
         if isinstance(content, str):
             messages.append({"role": msg["role"], "content": content})
         elif isinstance(content, list):
-            text = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+            text = _blocks_text(content)
             tool_uses = [b for b in content if b.get("type") == "tool_use"]
 
             if tool_uses and msg.get("role") == "assistant":
@@ -737,17 +786,10 @@ def anthropic_to_openai(body: dict) -> tuple[list[dict], list[dict] | None]:
             elif any(b.get("type") == "tool_result" for b in content):
                 for b in content:
                     if b.get("type") == "tool_result":
-                        c = b.get("content")
-                        if isinstance(c, str):
-                            result_text = c
-                        elif isinstance(c, list):
-                            result_text = "\n".join(x.get("text", "") for x in c)
-                        else:
-                            result_text = ""
                         messages.append({
                             "role": "tool",
                             "tool_call_id": b["tool_use_id"],
-                            "content": result_text,
+                            "content": _blocks_text(b.get("content")),
                         })
             else:
                 messages.append({"role": msg["role"], "content": text})
@@ -784,8 +826,7 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
             "usage": {
                 "input_tokens": input_tokens or 0,
                 "output_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
+                **_NO_CACHE,
             },
         }
 
@@ -824,8 +865,7 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
         "usage": {
             "input_tokens": (oai_resp.get("usage") or {}).get("prompt_tokens") or input_tokens or 0,
             "output_tokens": (oai_resp.get("usage") or {}).get("completion_tokens") or 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
+            **_NO_CACHE,
         },
     }
 
