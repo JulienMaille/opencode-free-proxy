@@ -9,7 +9,9 @@ pip install -r requirements.txt
 start.bat
 ```
 
-`start.bat` runs `python server.py --port 6446 --proxy-pool`, which enables the rotating SOCKS5 proxy pool (recommended — free-tier rate limits per IP are aggressive). Use `start-simple.bat` for direct connections without a proxy.
+A standalone `dist\opencode-free-proxy.exe` (~12 MB) is also provided — same defaults (port 6446 + proxy pool), no Python required. Rebuild it with `pyinstaller --onefile --exclude-module fastapi server.py` (see the full exclude list in git history).
+
+`start.bat` runs `python server.py` — the defaults are `--port 6446 --proxy-pool`, so the rotating SOCKS5 proxy pool is on by default (recommended — free-tier rate limits per IP are aggressive). Use `start-simple.bat` (equivalent to `python server.py --no-proxy-pool`) for direct connections without a proxy.
 
 `stop.bat` kills the server on port 6446.
 
@@ -18,7 +20,9 @@ Server is at `http://localhost:6446`.
 ## CLI arguments
 
 ```bash
-python server.py --port 6446 --host 0.0.0.0 --proxy-pool
+python server.py                    # default: port 6446 + proxy pool
+python server.py --no-proxy-pool    # direct connections
+python server.py --port 8080 --proxy socks5://127.0.0.1:9150
 ```
 
 | Argument | Default | Description |
@@ -26,7 +30,7 @@ python server.py --port 6446 --host 0.0.0.0 --proxy-pool
 | `--port` | `6446` | Listen port |
 | `--host` | `0.0.0.0` | Listen host |
 | `--proxy` | _(none)_ | Static SOCKS5 proxy (e.g. `socks5://127.0.0.1:9150`) |
-| `--proxy-pool` | off | Rotating SOCKS5 proxy pool with auto-switch on rate-limit |
+| `--proxy-pool` | on | Rotating SOCKS5 proxy pool with auto-switch on rate-limit (`--no-proxy-pool` disables) |
 | `--api-key` | _(none)_ | API key for client auth (see env vars) |
 
 ## Environment variables
@@ -34,8 +38,8 @@ python server.py --port 6446 --host 0.0.0.0 --proxy-pool
 | Variable | What |
 |----------|------|
 | `PORT` / `HOST` | Override listen port/host |
-| `SOCKS5_PROXY` | Static SOCKS5 proxy (used when `--proxy-pool` is off) |
-| `OPENCODE_PROXY_POOL` | `1`/`true` to enable the proxy pool via env |
+| `SOCKS5_PROXY` | Static SOCKS5 proxy (used when the proxy pool is off) |
+| `OPENCODE_PROXY_POOL` | `0`/`false` to disable the proxy pool via env |
 | `LOCAL_KEY` / `API_KEY` | API key for client auth; if unset, the server accepts any request |
 | `OPENCODE_ENABLE_EXA=1` | Enables the `websearch` tool for opencode CLI (set in `start.bat`) |
 
@@ -104,7 +108,7 @@ Your tool (opencode CLI, Cursor, curl, etc.)
 ```
 
 - **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
-- **Proxy pool**: when `--proxy-pool` is on, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy is blacklisted on any 4xx/5xx (incl. `429` rate limits) with exponential backoff.
+- **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy is blacklisted on any 4xx/5xx (incl. `429` rate limits) with exponential backoff.
 - **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
 
 ```

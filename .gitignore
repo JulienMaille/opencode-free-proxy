@@ -6,3 +6,9 @@ __pycache__/
 *.bak
 data/
 proxy.log
+tokens.json
+reasoning_cache.json
+build/
+dist/
+*.spec
+opencode-free-proxy.exe
