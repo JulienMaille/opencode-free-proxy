@@ -1,13 +1,15 @@
 import asyncio
 import json
 import random
+import sys
 import time
 from pathlib import Path
 
 import httpx
 
 log_file = None
-_data_dir = Path(__file__).parent / "data"
+_base_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+_data_dir = _base_dir / "data"
 
 
 def _log(*a):
@@ -38,14 +40,21 @@ SOCKS5_SOURCES = [
 MAX_PER_SOURCE = 1000
 MAX_POOL_SIZE = 5000
 POLL_INTERVAL = 30 * 60
-CACHE_TTL = 60
-VERIFY_TIMEOUT = 4
+# Candidates stay valid across restarts for a full poll cycle; a 60s TTL made
+# the on-disk cache useless since refreshes only run every 30 minutes.
+CACHE_TTL = POLL_INTERVAL
+VERIFY_TIMEOUT = 6
 HOT_TARGET = 15
 HOT_MIN = 5
-HOT_TTL = 60
+# Hot entries must outlive a refill cycle (~45s) plus typical idle gaps,
+# otherwise every request after a pause pays on-the-fly verification.
+HOT_TTL = 600
 RATE_LIMIT_TTL = 30 * 60
 BLACKLIST_TTL = 120 * 60
-MAX_RETRIES = 10
+# Retries after the first attempt: 3 -> 4 total attempts, worst-case backoff
+# 1+2+4 = 7s. Each retry rotates to a fresh verified proxy, so more attempts
+# mostly add latency (up to ~94s at 10) for marginal recovery.
+MAX_RETRIES = 3
 EXHAUSTED_FORCE_REFRESH_INTERVAL = 30
 REQUEST_CONNECT_TIMEOUT = 5
 REQUEST_READ_TIMEOUT = 120
@@ -103,6 +112,7 @@ class ProxyPool:
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._no_proxy_client: httpx.AsyncClient | None = None
         self._verify_sem = asyncio.Semaphore(25)
+        self._select_lock = asyncio.Lock()
         self._load_rate_limits()
         self._try_load_cache()
 
@@ -223,53 +233,47 @@ class ProxyPool:
         self._trigger_refill()
 
     async def _verify(self, proxy: dict) -> bool:
+        """Full-path check: SOCKS5 tunnel + real HTTPS request through the proxy.
+
+        A bare SOCKS5 CONNECT passes proxies that then blackhole, throttle, or
+        break TLS on real traffic; requiring a 2xx from the actual Zen endpoint
+        keeps those out of the hot buffer. The httpx phase timeouts do NOT
+        bound the whole check (SOCKS handshake / DNS / TLS can stall beyond
+        them), so wait_for is the hard deadline: one stalled proxy must never
+        block an entire verify batch.
+        """
         addr = proxy["address"]
-        host, port_str = addr.split(":", 1)
-        port = int(port_str)
+        url = f"socks5://{addr}"
 
-        async def _socks5_handshake():
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=VERIFY_TIMEOUT
+        async def _check() -> bool:
+            timeout = httpx.Timeout(VERIFY_TIMEOUT)
+            async with httpx.AsyncClient(proxy=url, verify=False, timeout=timeout) as c:
+                r = await c.get(
+                    "https://opencode.ai/zen/v1/models",
+                    headers={
+                        "User-Agent": "opencode/1.15.0",
+                        "x-opencode-client": "cli",
+                    },
                 )
-                try:
-                    writer.write(bytes([0x05, 0x01, 0x00]))
-                    await writer.drain()
-                    resp = await asyncio.wait_for(
-                        reader.read(2), timeout=VERIFY_TIMEOUT
-                    )
-                    if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
-                        return False
-
-                    # Require the proxy to connect to the actual Zen host.
-                    target = b"opencode.ai"
-                    request = (
-                        bytes([0x05, 0x01, 0x00, 0x03, len(target)])
-                        + target
-                        + (443).to_bytes(2, "big")
-                    )
-                    writer.write(request)
-                    await writer.drain()
-                    reply = await asyncio.wait_for(
-                        reader.readexactly(4), timeout=VERIFY_TIMEOUT
-                    )
-                    return reply[0] == 0x05 and reply[1] == 0x00
-                finally:
-                    writer.close()
-                    await writer.wait_closed()
-            except Exception:
-                return False
+                return 200 <= r.status_code < 300
 
         async with self._verify_sem:
             try:
-                return await asyncio.wait_for(
-                    _socks5_handshake(), timeout=VERIFY_TIMEOUT + 1
-                )
-            except (asyncio.TimeoutError, Exception):
+                return await asyncio.wait_for(_check(), timeout=VERIFY_TIMEOUT + 2)
+            except Exception:
                 return False
 
     async def select(self) -> bool:
-        """Get the next usable proxy. Checks hot buffer first, then verifies one on-the-fly."""
+        """Get the next usable proxy. Checks hot buffer first, then verifies one on-the-fly.
+
+        Serialized with a lock so concurrent requests share one verification
+        pass instead of each blacklisting its own failed batch.
+        """
+        async with self._select_lock:
+            return await self._select_unlocked()
+
+    async def _select_unlocked(self) -> bool:
+        """select() body; callers must hold _select_lock."""
         if self.current:
             if not self._is_bad(self.current["address"]):
                 return True
@@ -303,18 +307,40 @@ class ProxyPool:
 
         if batch:
             _log(f"Verifying {len(batch)} candidates on-the-fly...")
-            results = await asyncio.gather(
-                *[self._verify(p) for p in batch], return_exceptions=True
-            )
-            for p, ok in zip(batch, results):
-                addr = p["address"]
-                self.verifying.discard(addr)
-                if ok is True:
-                    self.current = p
-                    _log(f"Selected after on-the-fly verify: {addr}")
-                    self._trigger_refill()
-                    return True
-                self.blacklist[addr] = time.time() + BLACKLIST_TTL
+            pending = {asyncio.create_task(self._verify(p)): p for p in batch}
+            try:
+                while pending:
+                    done, _ = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for fut in done:
+                        p = pending.pop(fut)
+                        if fut.cancelled():
+                            continue
+                        addr = p["address"]
+                        if fut.result() is True:
+                            # First verified proxy wins; don't wait for the rest
+                            # (up to ~8s of latency saved per cold request).
+                            for f in pending:
+                                f.cancel()
+                            self.current = p
+                            _log(f"Selected after on-the-fly verify: {addr}")
+                            self._trigger_refill()
+                            return True
+                        self.blacklist[addr] = time.time() + BLACKLIST_TTL
+                # All failed
+                _log(f"No usable proxy ({self.get_pool_state()})")
+                return False
+            finally:
+                # Cancel stragglers (success path or caller cancellation) and
+                # always release the in-flight markers, even if the request
+                # handler is cancelled mid-verify.
+                if pending:
+                    for f in pending:
+                        f.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for p in batch:
+                    self.verifying.discard(p["address"])
 
         # 3. Nothing usable
         _log(f"No usable proxy ({self.get_pool_state()})")
@@ -352,13 +378,17 @@ class ProxyPool:
                 break
 
             _log(f"Refilling hot buffer: verifying {len(batch)} candidates (hot={len(self.hot)}/{HOT_TARGET})")
-            results = await asyncio.gather(
-                *[self._verify(p) for p in batch], return_exceptions=True
-            )
+            try:
+                results = await asyncio.gather(
+                    *[self._verify(p) for p in batch], return_exceptions=True
+                )
+            finally:
+                # Always release in-flight markers, even on task cancellation.
+                for p in batch:
+                    self.verifying.discard(p["address"])
             checked += len(batch)
             for p, ok in zip(batch, results):
                 addr = p["address"]
-                self.verifying.discard(addr)
                 if (
                     ok is True
                     and len(self.hot) < HOT_TARGET
@@ -376,6 +406,7 @@ class ProxyPool:
         if not target:
             return
         self.rate_limits[target] = time.time() + RATE_LIMIT_TTL
+        self._evict_client(target)
         self._save_rate_limits()
         _log(f"Rate-limited {target} for {RATE_LIMIT_TTL // 60}m")
         self.current = None
@@ -385,8 +416,20 @@ class ProxyPool:
         if not target:
             return
         self.blacklist[target] = time.time() + BLACKLIST_TTL
+        self._evict_client(target)
         _log(f"Blacklisted {target} for {BLACKLIST_TTL // 60}m")
         self.current = None
+
+    def _evict_client(self, addr: str):
+        """Drop the pooled AsyncClient for a proxy that just failed, releasing
+        its connection pool (and any half-dead keep-alive sockets) and keeping
+        self._clients from growing without bound as proxies rotate."""
+        c = self._clients.pop(f"socks5://{addr}", None)
+        if c is not None:
+            try:
+                asyncio.ensure_future(c.aclose())
+            except Exception:
+                pass
 
     def get_pool_state(self) -> str:
         now = time.time()
@@ -399,17 +442,14 @@ class ProxyPool:
         if now - self.last_force_refresh < EXHAUSTED_FORCE_REFRESH_INTERVAL:
             return
         self.last_force_refresh = now
-        self.blacklist.clear()
-        cleared = 0
-        for addr in list(self.rate_limits.keys()):
-            if any(c["address"] == addr for c in self.candidates):
-                del self.rate_limits[addr]
-                cleared += 1
-        if cleared:
-            self._save_rate_limits()
-        self.hot.clear()
-        _log(f"Force-refreshing (cleared {cleared} rate-limits, blacklist reset)")
-        self.last_refresh = 0
+        # Never wipe live blacklist/rate-limit knowledge: clearing it would
+        # re-test known-dead proxies on every request. Only let entries expire
+        # on their TTLs.
+        expired = [a for a, exp in self.blacklist.items() if exp <= now]
+        for a in expired:
+            del self.blacklist[a]
+        _log(f"Force-refreshing (expired {len(expired)} blacklist entries, "
+             f"hot={len(self.hot)}, candidates={len(self.candidates)})")
         if self._source_task is None or self._source_task.done():
             self._source_task = asyncio.create_task(self._refresh_candidates())
         await self._source_task

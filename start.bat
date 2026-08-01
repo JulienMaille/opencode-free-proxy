@@ -9,4 +9,4 @@ for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":6446" ^| findstr "LISTENING
 )
 
 set OPENCODE_ENABLE_EXA=1
-python server.py --port 6446 --proxy-pool
+python server.py
