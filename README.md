@@ -114,7 +114,7 @@ Your tool (opencode CLI, Cursor, curl, etc.)
 ```
 
 - **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
-- **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. Transport failures are blacklisted; `429` responses temporarily skip the current proxy so the caller can retry through another IP.
+- **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy gets one transport retry, then is blacklisted after its second transport failure; `429` responses temporarily skip the current proxy so the caller can retry through another IP.
 - **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
 
 ```

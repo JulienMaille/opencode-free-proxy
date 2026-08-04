@@ -115,6 +115,7 @@ class ProxyPool:
         self.hot: list[dict] = []
         self.blacklist: dict[str, float] = {}
         self.rate_limits: dict[str, float] = {}
+        self.transport_failures: dict[str, int] = {}
         self.current: dict | None = None
         self.verifying: set[str] = set()
         self.last_refresh = 0.0
@@ -489,6 +490,7 @@ class ProxyPool:
         target = addr or (self.current and self.current["address"])
         if not target:
             return
+        self.transport_failures.pop(target, None)
         self.rate_limits[target] = time.time() + RATE_LIMIT_TTL
         self._evict_client(target)
         _log(f"Rate-limited {target} for {RATE_LIMIT_TTL // 60}m; rotating")
@@ -499,11 +501,22 @@ class ProxyPool:
         target = addr or (self.current and self.current["address"])
         if not target:
             return
-        self.blacklist[target] = time.time() + BLACKLIST_TTL
+        failures = self.transport_failures.get(target, 0) + 1
+        self.transport_failures[target] = failures
         self._evict_client(target)
-        _log(f"Blacklisted {target} for {BLACKLIST_TTL // 60}m")
+        if failures < 2:
+            _log(f"Transport failure {target} ({failures}/2); retrying same proxy")
+            return
+        self.blacklist[target] = time.time() + BLACKLIST_TTL
+        self.transport_failures.pop(target, None)
+        _log(f"Blacklisted {target} after {failures} transport failures for {BLACKLIST_TTL // 60}m")
         if self.current and self.current["address"] == target:
             self.current = None
+
+    def report_success(self, addr: str | None = None):
+        target = addr or (self.current and self.current["address"])
+        if target:
+            self.transport_failures.pop(target, None)
 
     def _evict_client(self, addr: str):
         """Drop the pooled AsyncClient for a proxy that just failed, releasing
