@@ -322,6 +322,11 @@ def _openai_stream_error(
     )
 
 
+def _stream_preview(value: str, limit: int = 160) -> str:
+    """Return a bounded, escaped preview suitable for diagnostics."""
+    return repr(value[:limit])
+
+
 def _blocks_text(content) -> str:
     """Extract plain text from Anthropic content blocks (str or list)."""
     if isinstance(content, str):
@@ -873,7 +878,10 @@ async def _zen_stream_with_retry(
                         continue
                     if not line.startswith("data:"):
                         err = ValueError("upstream stream event is not an SSE data event")
-                        _log(f"[zen] Malformed upstream stream (attempt {attempt}): {err}")
+                        _log(
+                            f"[zen] Malformed upstream stream (attempt {attempt}): "
+                            f"{err}; raw={_stream_preview(line)}"
+                        )
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_failure(proxy_addr)
                         last_error = err
@@ -896,7 +904,10 @@ async def _zen_stream_with_retry(
                         piece = json.loads(payload)
                     except (json.JSONDecodeError, TypeError, ValueError) as e:
                         err = ValueError(f"malformed upstream SSE JSON: {e}")
-                        _log(f"[zen] Malformed upstream stream (attempt {attempt}): {err}")
+                        _log(
+                            f"[zen] Malformed upstream stream (attempt {attempt}): "
+                            f"{err}; raw={_stream_preview(payload)}"
+                        )
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_failure(proxy_addr)
                         last_error = err
@@ -907,7 +918,10 @@ async def _zen_stream_with_retry(
                         return
                     if not isinstance(piece, dict):
                         err = ValueError("malformed upstream SSE JSON: expected an object")
-                        _log(f"[zen] Malformed upstream stream (attempt {attempt}): {err}")
+                        _log(
+                            f"[zen] Malformed upstream stream (attempt {attempt}): "
+                            f"{err}; raw={_stream_preview(payload)}"
+                        )
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_failure(proxy_addr)
                         last_error = err
