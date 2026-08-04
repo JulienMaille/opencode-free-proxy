@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import random
 import sys
 import time
@@ -63,6 +64,14 @@ REQUEST_READ_TIMEOUT = 120
 # thinking phase between SSE events. Keep the shorter timeout for buffered
 # requests, but give streaming clients a longer idle window.
 STREAM_READ_TIMEOUT = 300
+
+# Public SOCKS lists contain many stale or mislabelled HTTP endpoints. Keep the
+# default candidate set focused on the two SOCKS ports that are most common in
+# these lists; set OPENCODE_PROXY_PORT_FILTER=false to allow every port.
+PROXY_PORT_FILTER_ENABLED = os.environ.get(
+    "OPENCODE_PROXY_PORT_FILTER", "true"
+).lower() not in ("0", "false", "no", "off")
+ALLOWED_PROXY_PORTS = frozenset((4145, 1080))
 
 CACHE_FILE = _data_dir / "proxy-pool-cache.json"
 
@@ -135,10 +144,13 @@ class ProxyPool:
                 )
             )
             if isinstance(candidates, list) and candidates and has_sources and age <= CACHE_TTL:
-                self.candidates = candidates
-                self.last_refresh = saved_at
-                _log(f"Loaded {len(candidates)} cached candidates ({age:.0f}s old)")
-                return True
+                candidates = self._filter_allowed_ports(candidates)
+                if candidates:
+                    self.candidates = candidates
+                    self.last_refresh = saved_at
+                    _log(f"Loaded {len(candidates)} cached candidates ({age:.0f}s old)")
+                    return True
+                _log("Ignored cached candidates: none use an allowed proxy port")
             if candidates and isinstance(candidates, list) and not has_sources:
                 _log("Ignored proxy cache without source provenance")
             if candidates:
@@ -151,7 +163,39 @@ class ProxyPool:
             "candidates": self.candidates,
         })
 
+    @staticmethod
+    def _proxy_port(addr: str) -> int | None:
+        try:
+            return int(addr.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    @classmethod
+    def _port_allowed(cls, addr: str) -> bool:
+        return (
+            not PROXY_PORT_FILTER_ENABLED
+            or cls._proxy_port(addr) in ALLOWED_PROXY_PORTS
+        )
+
+    @classmethod
+    def _filter_allowed_ports(cls, candidates: list[dict]) -> list[dict]:
+        if not PROXY_PORT_FILTER_ENABLED:
+            return candidates
+        filtered = [
+            p for p in candidates
+            if cls._port_allowed(p.get("address", ""))
+        ]
+        rejected = len(candidates) - len(filtered)
+        if rejected:
+            _log(
+                f"Ignored {rejected} candidates on unsupported ports "
+                f"(allowed: {', '.join(map(str, sorted(ALLOWED_PROXY_PORTS)))})"
+            )
+        return filtered
+
     def _is_bad(self, addr: str) -> bool:
+        if not self._port_allowed(addr):
+            return True
         now = time.time()
         bl = self.blacklist.get(addr)
         if bl and bl > now:
@@ -223,6 +267,7 @@ class ProxyPool:
         if len(proxies) > MAX_POOL_SIZE:
             proxies = proxies[:MAX_POOL_SIZE]
 
+        proxies = self._filter_allowed_ports(proxies)
         if proxies:
             self.candidates = proxies
             self.last_refresh = time.time()

@@ -40,6 +40,7 @@ python server.py --port 8080 --proxy socks5://127.0.0.1:9150
 | `PORT` / `HOST` | Override listen port/host |
 | `SOCKS5_PROXY` | Static SOCKS5 proxy (used when the proxy pool is off) |
 | `OPENCODE_PROXY_POOL` | `0`/`false` to disable the proxy pool via env |
+| `OPENCODE_PROXY_PORT_FILTER` | Enabled by default; set `0`/`false` to allow proxy ports other than `4145` and `1080` |
 | `LOCAL_KEY` / `API_KEY` | API key for client auth; if unset, the server accepts any request |
 | `OPENCODE_ENABLE_EXA=1` | Enables the `websearch` tool for opencode CLI (set in `start.bat`) |
 

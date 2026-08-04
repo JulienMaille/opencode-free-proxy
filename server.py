@@ -18,7 +18,9 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from proxy_pool import pool as proxy_pool
 from proxy_pool import (
+    ALLOWED_PROXY_PORTS,
     MAX_RETRIES,
+    PROXY_PORT_FILTER_ENABLED,
     REQUEST_CONNECT_TIMEOUT,
     REQUEST_READ_TIMEOUT,
     STREAM_READ_TIMEOUT,
@@ -110,7 +112,7 @@ def _json(fn):
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.15.0"
-PROXY_VERSION = "14"
+PROXY_VERSION = "15"
 
 # ── API Keys ──────────────────────────────────────────────────────
 
@@ -1664,6 +1666,7 @@ async def health(request: Request):
         "models": len(_models_cache),
         "socks5": STATIC_PROXY,
         "proxy_pool": PROXY_POOL_ENABLED,
+        "proxy_port_filter": sorted(ALLOWED_PROXY_PORTS) if PROXY_PORT_FILTER_ENABLED else None,
         "pool_state": pool_state,
         "pool_size": len(proxy_pool.hot) if PROXY_POOL_ENABLED else None,
         "tokens": dict(_tokens),
