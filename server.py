@@ -112,7 +112,7 @@ def _json(fn):
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.15.0"
-PROXY_VERSION = "15"
+PROXY_VERSION = "16"
 
 # ── API Keys ──────────────────────────────────────────────────────
 
@@ -695,6 +695,8 @@ async def _zen_request_with_retry(
                 status_code=502,
                 content={"error": {"message": f"Upstream response read failed: {_exc_desc(e)}", "type": "upstream_error"}},
             )
+        if PROXY_POOL_ENABLED and proxy_addr:
+            proxy_pool.report_success(proxy_addr)
         body_text = body_bytes.decode("utf-8", errors="replace")
         try:
             data = json.loads(body_bytes)
@@ -851,6 +853,8 @@ async def _zen_stream_with_retry(
                     continue
                 yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
                 return
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.report_success(proxy_addr)
             is_context_exceeded = b"context_length_exceeded" in raw
             _log(f"[zen] Stream error {resp.status_code}: {raw[:500]}")
             if resp.status_code == 400:
@@ -895,6 +899,8 @@ async def _zen_stream_with_retry(
 
                     payload = line[5:].strip()
                     if payload == "[DONE]":
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.report_success(proxy_addr)
                         stream_completed = True
                         if session_id and _reason_buf and _content_buf:
                             _remember_reasoning(session_id, _content_buf, _reason_buf)
@@ -933,6 +939,8 @@ async def _zen_stream_with_retry(
                         yield _openai_stream_error(str(err))
                         return
 
+                    if PROXY_POOL_ENABLED and proxy_addr:
+                        proxy_pool.report_success(proxy_addr)
                     event_error = _first_chunk_error(line)
                     if event_error:
                         err_msg, is_rate_limit = event_error
@@ -985,9 +993,9 @@ async def _zen_stream_with_retry(
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
                 _log(f"[zen] Stream interrupted: {_exc_desc(e)}")
                 last_error = e
-                # A torn-down tunnel is a proxy failure: flag it so the next
-                # request does not re-select this proxy and pay the timeout
-                # again (report_failure also clears self.current).
+                # A torn-down tunnel is a proxy failure: let the first retry
+                # reconnect through this proxy; a second failure makes
+                # report_failure clear self.current and rotate away from it.
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_failure(proxy_addr)
                 # Never retry once bytes have already been sent to the client; a
