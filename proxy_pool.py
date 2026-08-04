@@ -44,6 +44,7 @@ POLL_INTERVAL = 30 * 60
 # the on-disk cache useless since refreshes only run every 30 minutes.
 CACHE_TTL = POLL_INTERVAL
 VERIFY_TIMEOUT = 6
+VERIFY_BATCH_SIZE = 20
 HOT_TARGET = 15
 HOT_MIN = 5
 # Hot entries must outlive a refill cycle (~45s) plus typical idle gaps,
@@ -58,8 +59,11 @@ MAX_RETRIES = 3
 EXHAUSTED_FORCE_REFRESH_INTERVAL = 30
 REQUEST_CONNECT_TIMEOUT = 5
 REQUEST_READ_TIMEOUT = 120
+# Streaming requests may legitimately spend several minutes in the model's
+# thinking phase between SSE events. Keep the shorter timeout for buffered
+# requests, but give streaming clients a longer idle window.
+STREAM_READ_TIMEOUT = 300
 
-RATE_LIMIT_FILE = _data_dir / "proxy-rate-limits.json"
 CACHE_FILE = _data_dir / "proxy-pool-cache.json"
 
 
@@ -110,28 +114,12 @@ class ProxyPool:
         self._refill_task: asyncio.Task | None = None
         self._source_task: asyncio.Task | None = None
         self._clients: dict[str, httpx.AsyncClient] = {}
+        self._stream_clients: dict[str, httpx.AsyncClient] = {}
         self._no_proxy_client: httpx.AsyncClient | None = None
+        self._stream_no_proxy_client: httpx.AsyncClient | None = None
         self._verify_sem = asyncio.Semaphore(25)
         self._select_lock = asyncio.Lock()
-        self._load_rate_limits()
         self._try_load_cache()
-
-    def _load_rate_limits(self):
-        data = _load_json(RATE_LIMIT_FILE, {})
-        now = time.time()
-        changed = False
-        for addr, expires_at in list(data.items()):
-            if expires_at < now:
-                del data[addr]
-                changed = True
-        if changed:
-            _save_json(RATE_LIMIT_FILE, data)
-        self.rate_limits = {k: float(v) for k, v in data.items()}
-        if self.rate_limits:
-            _log(f"Loaded {len(self.rate_limits)} rate-limited proxies from cache")
-
-    def _save_rate_limits(self):
-        _save_json(RATE_LIMIT_FILE, self.rate_limits)
 
     def _try_load_cache(self) -> bool:
         data = _load_json(CACHE_FILE, {})
@@ -139,11 +127,20 @@ class ProxyPool:
             saved_at = float(data.get("saved_at", 0))
             candidates = data.get("candidates")
             age = time.time() - saved_at
-            if isinstance(candidates, list) and candidates and age <= CACHE_TTL:
+            has_sources = (
+                isinstance(candidates, list)
+                and all(
+                    isinstance(p, dict) and p.get("address") and p.get("source")
+                    for p in candidates
+                )
+            )
+            if isinstance(candidates, list) and candidates and has_sources and age <= CACHE_TTL:
                 self.candidates = candidates
                 self.last_refresh = saved_at
                 _log(f"Loaded {len(candidates)} cached candidates ({age:.0f}s old)")
                 return True
+            if candidates and isinstance(candidates, list) and not has_sources:
+                _log("Ignored proxy cache without source provenance")
             if candidates:
                 _log(f"Ignored stale proxy cache ({age:.0f}s old)")
         return False
@@ -210,13 +207,17 @@ class ProxyPool:
 
         seen = set()
         proxies = []
-        for lines in results:
+        for source_url, lines in zip(SOCKS5_SOURCES, results):
             if isinstance(lines, list):
                 random.shuffle(lines)
                 for addr in lines[:MAX_PER_SOURCE]:
                     if addr not in seen:
                         seen.add(addr)
-                        proxies.append({"address": addr, "protocol": "socks5"})
+                        proxies.append({
+                            "address": addr,
+                            "protocol": "socks5",
+                            "source": source_url,
+                        })
 
         random.shuffle(proxies)
         if len(proxies) > MAX_POOL_SIZE:
@@ -263,6 +264,53 @@ class ProxyPool:
             except Exception:
                 return False
 
+    def _take_verification_batch(
+        self,
+        limit: int,
+        excluded: set[str] | None = None,
+    ) -> list[dict]:
+        """Take a round-robin batch across source lists.
+
+        Candidates are shuffled within each source at refresh time, while the
+        source round-robin prevents a large/noisy list from monopolizing a
+        verification batch.
+        """
+        excluded = excluded or set()
+        by_source: dict[str, list[dict]] = {}
+        for p in self.candidates:
+            addr = p.get("address")
+            if (
+                not addr
+                or addr in excluded
+                or addr in self.verifying
+                or self._is_bad(addr)
+            ):
+                continue
+            source = p.get("source") or "legacy"
+            by_source.setdefault(source, []).append(p)
+
+        source_order = list(by_source)
+        random.shuffle(source_order)
+        positions = {source: 0 for source in source_order}
+        batch: list[dict] = []
+        while len(batch) < limit and source_order:
+            progressed = False
+            for source in source_order:
+                position = positions[source]
+                candidates = by_source[source]
+                if position >= len(candidates):
+                    continue
+                p = candidates[position]
+                positions[source] = position + 1
+                self.verifying.add(p["address"])
+                batch.append(p)
+                progressed = True
+                if len(batch) >= limit:
+                    break
+            if not progressed:
+                break
+        return batch
+
     async def select(self) -> bool:
         """Get the next usable proxy. Checks hot buffer first, then verifies one on-the-fly.
 
@@ -295,18 +343,13 @@ class ProxyPool:
                 return True
 
         # 2. On-the-fly: verify a batch of candidates in parallel
-        batch = []
-        for p in self.candidates:
-            addr = p["address"]
-            if self._is_bad(addr) or addr in self.verifying:
-                continue
-            self.verifying.add(addr)
-            batch.append(p)
-            if len(batch) >= 10:
-                break
+        batch = self._take_verification_batch(VERIFY_BATCH_SIZE)
 
         if batch:
-            _log(f"Verifying {len(batch)} candidates on-the-fly...")
+            _log(
+                f"Verifying {len(batch)} candidates on-the-fly across "
+                f"{len({p.get('source', 'legacy') for p in batch})} sources..."
+            )
             pending = {asyncio.create_task(self._verify(p)): p for p in batch}
             try:
                 while pending:
@@ -364,20 +407,16 @@ class ProxyPool:
             hot_addresses = {p["address"] for p in self.hot}
             if self.current:
                 hot_addresses.add(self.current["address"])
-            batch = []
-            for p in self.candidates:
-                addr = p["address"]
-                if addr in hot_addresses or addr in self.verifying or self._is_bad(addr):
-                    continue
-                self.verifying.add(addr)
-                batch.append(p)
-                if len(batch) >= 20:
-                    break
+            batch = self._take_verification_batch(VERIFY_BATCH_SIZE, hot_addresses)
 
             if not batch:
                 break
 
-            _log(f"Refilling hot buffer: verifying {len(batch)} candidates (hot={len(self.hot)}/{HOT_TARGET})")
+            _log(
+                f"Refilling hot buffer: verifying {len(batch)} candidates across "
+                f"{len({p.get('source', 'legacy') for p in batch})} sources "
+                f"(hot={len(self.hot)}/{HOT_TARGET})"
+            )
             try:
                 results = await asyncio.gather(
                     *[self._verify(p) for p in batch], return_exceptions=True
@@ -407,9 +446,9 @@ class ProxyPool:
             return
         self.rate_limits[target] = time.time() + RATE_LIMIT_TTL
         self._evict_client(target)
-        self._save_rate_limits()
-        _log(f"Rate-limited {target} for {RATE_LIMIT_TTL // 60}m")
-        self.current = None
+        _log(f"Rate-limited {target} for {RATE_LIMIT_TTL // 60}m; rotating")
+        if self.current and self.current["address"] == target:
+            self.current = None
 
     def report_failure(self, addr: str | None = None):
         target = addr or (self.current and self.current["address"])
@@ -418,23 +457,25 @@ class ProxyPool:
         self.blacklist[target] = time.time() + BLACKLIST_TTL
         self._evict_client(target)
         _log(f"Blacklisted {target} for {BLACKLIST_TTL // 60}m")
-        self.current = None
+        if self.current and self.current["address"] == target:
+            self.current = None
 
     def _evict_client(self, addr: str):
         """Drop the pooled AsyncClient for a proxy that just failed, releasing
         its connection pool (and any half-dead keep-alive sockets) and keeping
         self._clients from growing without bound as proxies rotate."""
-        c = self._clients.pop(f"socks5://{addr}", None)
-        if c is not None:
-            try:
-                asyncio.ensure_future(c.aclose())
-            except Exception:
-                pass
+        for clients in (self._clients, self._stream_clients):
+            c = clients.pop(f"socks5://{addr}", None)
+            if c is not None:
+                try:
+                    asyncio.ensure_future(c.aclose())
+                except Exception:
+                    pass
 
     def get_pool_state(self) -> str:
         now = time.time()
-        rl = sum(1 for a in self.rate_limits if self.rate_limits.get(a, 0) > now)
         bl = sum(1 for a in self.blacklist if self.blacklist.get(a, 0) > now)
+        rl = sum(1 for a in self.rate_limits if self.rate_limits.get(a, 0) > now)
         return f"candidates={len(self.candidates)} hot={len(self.hot)} verifying={len(self.verifying)} blacklisted={bl} rate_limited={rl}"
 
     async def force_refresh(self):
@@ -442,48 +483,63 @@ class ProxyPool:
         if now - self.last_force_refresh < EXHAUSTED_FORCE_REFRESH_INTERVAL:
             return
         self.last_force_refresh = now
-        # Never wipe live blacklist/rate-limit knowledge: clearing it would
-        # re-test known-dead proxies on every request. Only let entries expire
-        # on their TTLs.
+        # Never wipe live blacklist knowledge: clearing it would re-test known-
+        # dead proxies on every request. Only let entries expire on their TTLs.
         expired = [a for a, exp in self.blacklist.items() if exp <= now]
         for a in expired:
             del self.blacklist[a]
-        _log(f"Force-refreshing (expired {len(expired)} blacklist entries, "
-             f"hot={len(self.hot)}, candidates={len(self.candidates)})")
+        expired_rate_limits = [a for a, exp in self.rate_limits.items() if exp <= now]
+        for a in expired_rate_limits:
+            del self.rate_limits[a]
+        _log(f"Force-refreshing (expired {len(expired)} blacklist and "
+             f"{len(expired_rate_limits)} rate-limit entries, hot={len(self.hot)}, "
+             f"candidates={len(self.candidates)})")
         if self._source_task is None or self._source_task.done():
             self._source_task = asyncio.create_task(self._refresh_candidates())
         await self._source_task
 
-    def get_client(self, proxy_url: str | None = None) -> httpx.AsyncClient:
+    def get_client(
+        self,
+        proxy_url: str | None = None,
+        streaming: bool = False,
+    ) -> httpx.AsyncClient:
+        read_timeout = STREAM_READ_TIMEOUT if streaming else REQUEST_READ_TIMEOUT
         timeout = httpx.Timeout(
             connect=REQUEST_CONNECT_TIMEOUT,
-            read=REQUEST_READ_TIMEOUT,
-            write=REQUEST_READ_TIMEOUT,
+            read=read_timeout,
+            write=read_timeout,
             pool=REQUEST_CONNECT_TIMEOUT,
         )
+        clients = self._stream_clients if streaming else self._clients
         if not proxy_url:
-            if self._no_proxy_client is None:
-                self._no_proxy_client = httpx.AsyncClient(
+            client_attr = "_stream_no_proxy_client" if streaming else "_no_proxy_client"
+            client = getattr(self, client_attr)
+            if client is None:
+                client = httpx.AsyncClient(
                     base_url="https://opencode.ai",
                     timeout=timeout,
                 )
-            return self._no_proxy_client
-        if proxy_url not in self._clients:
-            self._clients[proxy_url] = httpx.AsyncClient(
+                setattr(self, client_attr, client)
+            return client
+        if proxy_url not in clients:
+            clients[proxy_url] = httpx.AsyncClient(
                 base_url="https://opencode.ai",
                 timeout=timeout,
                 proxy=proxy_url,
                 verify=False,
             )
-        return self._clients[proxy_url]
+        return clients[proxy_url]
 
     async def close(self):
-        for c in self._clients.values():
+        for c in [*self._clients.values(), *self._stream_clients.values()]:
             await c.aclose()
-        if self._no_proxy_client:
-            await self._no_proxy_client.aclose()
+        for client in (self._no_proxy_client, self._stream_no_proxy_client):
+            if client:
+                await client.aclose()
         self._clients.clear()
+        self._stream_clients.clear()
         self._no_proxy_client = None
+        self._stream_no_proxy_client = None
 
     @property
     def ready(self) -> bool:

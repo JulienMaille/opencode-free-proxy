@@ -30,7 +30,7 @@ python server.py --port 8080 --proxy socks5://127.0.0.1:9150
 | `--port` | `6446` | Listen port |
 | `--host` | `0.0.0.0` | Listen host |
 | `--proxy` | _(none)_ | Static SOCKS5 proxy (e.g. `socks5://127.0.0.1:9150`) |
-| `--proxy-pool` | on | Rotating SOCKS5 proxy pool with auto-switch on rate-limit (`--no-proxy-pool` disables) |
+| `--proxy-pool` | on | Rotating SOCKS5 proxy pool with transport-failure and per-proxy 429 rotation (`--no-proxy-pool` disables) |
 | `--api-key` | _(none)_ | API key for client auth (see env vars) |
 
 ## Environment variables
@@ -68,6 +68,11 @@ curl http://localhost:6446/v1/chat/completions \
     "stream": true
   }'
 ```
+
+Streaming responses are forwarded as SSE as soon as the upstream emits them.
+Use `"stream": true` for long-thinking models; the proxy allows up to 300
+seconds of silence between streaming events while keeping the shorter timeout
+for buffered requests.
 
 ### Anthropic format — `POST /v1/messages`
 
@@ -108,7 +113,7 @@ Your tool (opencode CLI, Cursor, curl, etc.)
 ```
 
 - **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
-- **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy is blacklisted on any 4xx/5xx (incl. `429` rate limits) with exponential backoff.
+- **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. Transport failures are blacklisted; `429` responses temporarily skip the current proxy so the caller can retry through another IP.
 - **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
 
 ```

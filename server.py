@@ -17,7 +17,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
 from proxy_pool import pool as proxy_pool
-from proxy_pool import MAX_RETRIES, REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT
+from proxy_pool import (
+    MAX_RETRIES,
+    REQUEST_CONNECT_TIMEOUT,
+    REQUEST_READ_TIMEOUT,
+    STREAM_READ_TIMEOUT,
+)
 
 _BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -28,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=6446, help="Listen port (default: 6446)")
     p.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
     p.add_argument("--proxy", default=None, help="Static SOCKS5 proxy (socks5://host:port)")
-    p.add_argument("--proxy-pool", action=argparse.BooleanOptionalAction, default=True, help="Enable SOCKS5 proxy pool with auto-rotation on rate-limit (default: on, use --no-proxy-pool to disable)")
+    p.add_argument("--proxy-pool", action=argparse.BooleanOptionalAction, default=True, help="Enable SOCKS5 proxy pool with transport-failure and per-proxy 429 rotation (default: on, use --no-proxy-pool to disable)")
     p.add_argument("--api-key", default=None, help="API key for client auth")
     return p.parse_args()
 
@@ -64,6 +69,16 @@ _default_client = httpx.AsyncClient(
     ),
     proxy=_default_proxy,
 )
+_stream_default_client = httpx.AsyncClient(
+    base_url="https://opencode.ai",
+    timeout=httpx.Timeout(
+        connect=REQUEST_CONNECT_TIMEOUT,
+        read=STREAM_READ_TIMEOUT,
+        write=STREAM_READ_TIMEOUT,
+        pool=REQUEST_CONNECT_TIMEOUT,
+    ),
+    proxy=_default_proxy,
+)
 
 # ── App ───────────────────────────────────────────────────────────
 
@@ -77,6 +92,8 @@ async def _lifespan(app: Starlette):
         _log("  (pool will be ready once verification completes)")
     yield
     await proxy_pool.close()
+    await _default_client.aclose()
+    await _stream_default_client.aclose()
 
 app = Starlette(lifespan=_lifespan)
 
@@ -93,7 +110,7 @@ def _json(fn):
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.15.0"
-PROXY_VERSION = "12"
+PROXY_VERSION = "14"
 
 # ── API Keys ──────────────────────────────────────────────────────
 
@@ -253,7 +270,7 @@ def _exc_desc(e: Exception | None) -> str:
 
 
 def _first_chunk_error(raw_line: str) -> tuple[str, bool] | None:
-    """Classify a first SSE chunk that is an upstream error payload.
+    """Classify an SSE chunk that is an upstream error payload.
 
     Returns (message, is_rate_limit) or None for normal chunks. Only genuine
     rate-limit markers (FreeUsageLimitError / 429 / rate_limit|free_usage|
@@ -288,6 +305,21 @@ def _first_chunk_error(raw_line: str) -> tuple[str, bool] | None:
         )
         return msg, is_rate_limit
     return None
+
+
+def _openai_stream_error(
+    message: str,
+    error_type: str = "upstream_error",
+    code: str | None = None,
+) -> str:
+    """Return a terminal OpenAI SSE error event."""
+    error = {"message": message, "type": error_type}
+    if code:
+        error["code"] = code
+    return (
+        f"data: {json.dumps({'error': error})}\n\n"
+        "data: [DONE]\n\n"
+    )
 
 
 def _blocks_text(content) -> str:
@@ -547,6 +579,20 @@ async def _backoff(attempt: int, base: float = 1.0, max_delay: float = 10.0):
     await asyncio.sleep(delay + jitter)
 
 
+def _local_rate_limit_response(message: str) -> JSONResponse:
+    """Return promptly so the caller can retry through another proxy."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": message,
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded",
+            }
+        },
+    )
+
+
 # ── Zen API transport ─────────────────────────────────────────────
 
 
@@ -584,7 +630,6 @@ async def _zen_request_with_retry(
     """Non-streaming Zen API call with proxy pool retry on 429."""
     last_error = None
     attempts = MAX_RETRIES if max_retries is None else max_retries
-    force_session = False  # only reset the upstream session on a real rate-limit
 
     for attempt in range(attempts + 1):
         if PROXY_POOL_ENABLED:
@@ -610,15 +655,6 @@ async def _zen_request_with_retry(
                 proxy_addr = p["address"]
                 client = proxy_pool.get_client(f"socks5://{proxy_addr}")
 
-            # Keep the same session across proxy rotation so the upstream's
-            # persisted context (tool_calls, reasoning) survives. Only force a
-            # fresh session after a genuine 429 to dodge per-session usage caps.
-            if force_session:
-                headers["x-opencode-session"] = force_new_session(user, messages)
-                force_session = False
-                # Fresh session has no memory: prune orphaned tool responses
-                if isinstance(req_body.get("messages"), list):
-                    req_body["messages"] = _prune_dangling_tools(req_body["messages"])
         else:
             client = _default_client
             proxy_addr = None
@@ -666,14 +702,7 @@ async def _zen_request_with_retry(
             _log(f"[zen] 429 (attempt {attempt}): {err_msg}")
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.report_ratelimit(proxy_addr)
-            if attempt < attempts:
-                force_session = True
-                await _backoff(attempt)
-                continue
-            return JSONResponse(
-                status_code=429,
-                content={"error": {"message": err_msg + " (free model rate limit)", "type": "rate_limit_error", "code": "rate_limit_exceeded"}},
-            )
+            return _local_rate_limit_response(err_msg + " (free model rate limit)")
 
         if resp.status_code >= 400:
             err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
@@ -730,7 +759,6 @@ async def _zen_stream_with_retry(
     """Streaming Zen API call with proxy pool retry on 429/403 and ReadError recovery."""
     last_error = None
     attempts = MAX_RETRIES if max_retries is None else max_retries
-    force_session = False  # only reset the upstream session after a genuine 429
 
     for attempt in range(attempts + 1):
         if PROXY_POOL_ENABLED:
@@ -742,26 +770,22 @@ async def _zen_stream_with_retry(
                 await proxy_pool.force_refresh()
                 if not await proxy_pool.select():
                     _log("[pool] Still no proxy after refresh, falling back to direct")
-                    client = _default_client
+                    client = _stream_default_client
                     proxy_addr = None
                 else:
                     p = proxy_pool.current
                     proxy_addr = p["address"]
-                    client = proxy_pool.get_client(f"socks5://{proxy_addr}")
+                    client = proxy_pool.get_client(
+                        f"socks5://{proxy_addr}", streaming=True
+                    )
             else:
                 p = proxy_pool.current
                 proxy_addr = p["address"]
-                client = proxy_pool.get_client(f"socks5://{proxy_addr}")
-
-            # Keep the session across proxy rotation so upstream context
-            # (tool_calls, reasoning) survives; reset only after a 429.
-            if force_session:
-                headers["x-opencode-session"] = force_new_session(user, messages)
-                force_session = False
-                if isinstance(req_body.get("messages"), list):
-                    req_body["messages"] = _prune_dangling_tools(req_body["messages"])
+                client = proxy_pool.get_client(
+                    f"socks5://{proxy_addr}", streaming=True
+                )
         else:
-            client = _default_client
+            client = _stream_default_client
             proxy_addr = None
 
         try:
@@ -794,17 +818,17 @@ async def _zen_stream_with_retry(
                 if attempt < attempts:
                     await _backoff(attempt)
                     continue
-                yield f'data: {json.dumps({"error": {"message": f"Upstream error: {_exc_desc(e)}", "type": "upstream_error"}})}\n\n'
+                yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
                 return
             _log(f"[zen] Stream 429 (attempt {attempt}): {err_msg}")
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.report_ratelimit(proxy_addr)
             await resp.aclose()
-            if attempt < attempts:
-                force_session = True
-                await _backoff(attempt)
-                continue
-            yield f'data: {json.dumps({"error": {"message": err_msg + " (free model rate limit)", "type": "rate_limit_error", "code": "rate_limit_exceeded"}})}\n\n'
+            yield _openai_stream_error(
+                err_msg + " (free model rate limit)",
+                "rate_limit_error",
+                "rate_limit_exceeded",
+            )
             return
 
         if resp.status_code >= 400:
@@ -818,7 +842,7 @@ async def _zen_stream_with_retry(
                 if attempt < attempts:
                     await _backoff(attempt)
                     continue
-                yield f'data: {json.dumps({"error": {"message": f"Upstream error: {_exc_desc(e)}", "type": "upstream_error"}})}\n\n'
+                yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
                 return
             is_context_exceeded = b"context_length_exceeded" in raw
             _log(f"[zen] Stream error {resp.status_code}: {raw[:500]}")
@@ -831,13 +855,13 @@ async def _zen_stream_with_retry(
             if not is_context_exceeded and attempt < attempts:
                 await _backoff(attempt)
                 continue
-            yield f'data: {json.dumps({"error": {"message": f"Upstream error {resp.status_code}", "type": "upstream_error"}})}\n\n'
+            yield _openai_stream_error(f"Upstream error {resp.status_code}")
             return
 
         # Success — stream the response
-        first_chunk = True
         retry_stream = False
         streamed_any = False
+        stream_completed = False
         _reason_buf = ""
         _content_buf = ""
         try:
@@ -847,59 +871,101 @@ async def _zen_stream_with_retry(
                         continue
                     if line.startswith(":"):
                         continue
-                    if first_chunk:
-                        first_chunk = False
-                        first_err = _first_chunk_error(line)
-                        if first_err:
-                            err_msg, is_rate_limit = first_err
-                            _log(f"[zen] Stream error in body (attempt {attempt}): {err_msg}")
-                            if PROXY_POOL_ENABLED and proxy_addr and is_rate_limit:
-                                proxy_pool.report_ratelimit(proxy_addr)
-                            if attempt < attempts:
-                                if is_rate_limit:
-                                    force_session = True
-                                retry_stream = True
-                                break
-                            if is_rate_limit:
-                                yield f'data: {json.dumps({"error": {"message": err_msg + " (free model rate limit)", "type": "rate_limit_error", "code": "rate_limit_exceeded"}})}\n\n'
-                            else:
-                                yield f'data: {json.dumps({"error": {"message": err_msg, "type": "upstream_error"}})}\n\n'
+                    if not line.startswith("data:"):
+                        err = ValueError("upstream stream event is not an SSE data event")
+                        _log(f"[zen] Malformed upstream stream (attempt {attempt}): {err}")
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.report_failure(proxy_addr)
+                        last_error = err
+                        if not streamed_any and attempt < attempts:
+                            retry_stream = True
+                            break
+                        yield _openai_stream_error(str(err))
+                        return
+
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        stream_completed = True
+                        if session_id and _reason_buf and _content_buf:
+                            _remember_reasoning(session_id, _content_buf, _reason_buf)
+                        yield line + "\n\n"
+                        streamed_any = True
+                        break
+
+                    try:
+                        piece = json.loads(payload)
+                    except (json.JSONDecodeError, TypeError, ValueError) as e:
+                        err = ValueError(f"malformed upstream SSE JSON: {e}")
+                        _log(f"[zen] Malformed upstream stream (attempt {attempt}): {err}")
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.report_failure(proxy_addr)
+                        last_error = err
+                        if not streamed_any and attempt < attempts:
+                            retry_stream = True
+                            break
+                        yield _openai_stream_error(str(err))
+                        return
+                    if not isinstance(piece, dict):
+                        err = ValueError("malformed upstream SSE JSON: expected an object")
+                        _log(f"[zen] Malformed upstream stream (attempt {attempt}): {err}")
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.report_failure(proxy_addr)
+                        last_error = err
+                        if not streamed_any and attempt < attempts:
+                            retry_stream = True
+                            break
+                        yield _openai_stream_error(str(err))
+                        return
+
+                    event_error = _first_chunk_error(line)
+                    if event_error:
+                        err_msg, is_rate_limit = event_error
+                        _log(f"[zen] Stream error in body (attempt {attempt}): {err_msg}")
+                        if PROXY_POOL_ENABLED and proxy_addr and is_rate_limit:
+                            proxy_pool.report_ratelimit(proxy_addr)
+                        if is_rate_limit:
+                            yield _openai_stream_error(
+                                err_msg + " (free model rate limit)",
+                                "rate_limit_error",
+                                "rate_limit_exceeded",
+                            )
                             return
+                        if not streamed_any and attempt < attempts:
+                            retry_stream = True
+                            break
+                        yield _openai_stream_error(err_msg)
+                        return
+
                     # Capture emitted reasoning_content for re-injection on later turns
-                    if session_id and line.startswith("data: ") and '"delta"' in line:
-                        try:
-                            piece = json.loads(line[6:].strip())
-                            d = (((piece.get("choices") or [{}])[0]) or {}).get("delta") or {}
-                            if d.get("reasoning_content"):
-                                _reason_buf += d["reasoning_content"]
-                            if d.get("content"):
-                                _content_buf += d["content"]
-                            fr = (((piece.get("choices") or [{}])[0]) or {}).get("finish_reason")
-                            if fr:
-                                if _reason_buf and _content_buf:
-                                    _remember_reasoning(session_id, _content_buf, _reason_buf)
-                                _reason_buf = ""
-                                _content_buf = ""
-                        except (json.JSONDecodeError, ValueError):
-                            pass
+                    if session_id and '"delta"' in line:
+                        choices = piece.get("choices")
+                        first_choice = choices[0] if isinstance(choices, list) and choices else {}
+                        if not isinstance(first_choice, dict):
+                            first_choice = {}
+                        d = first_choice.get("delta") or {}
+                        if not isinstance(d, dict):
+                            d = {}
+                        if d.get("reasoning_content"):
+                            _reason_buf += d["reasoning_content"]
+                        if d.get("content"):
+                            _content_buf += d["content"]
+                        fr = first_choice.get("finish_reason")
+                        if fr:
+                            if _reason_buf and _content_buf:
+                                _remember_reasoning(session_id, _content_buf, _reason_buf)
+                            _reason_buf = ""
+                            _content_buf = ""
                     yield line + "\n\n"
                     streamed_any = True
                     if '"usage"' in line:
-                        try:
-                            u = json.loads(line[6:].strip()).get("usage") or {}
-                            if u.get("prompt_tokens") or u.get("completion_tokens"):
-                                _add_tokens(
-                                    u.get("prompt_tokens") or 0,
-                                    u.get("completion_tokens") or 0,
-                                    u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                                    u.get("prompt_cache_miss_tokens") or 0,
-                                )
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-                    if line.strip() == "data: [DONE]":
-                        if session_id and _reason_buf and _content_buf:
-                            _remember_reasoning(session_id, _content_buf, _reason_buf)
-                        break
+                        u = piece.get("usage") or {}
+                        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                            _add_tokens(
+                                u.get("prompt_tokens") or 0,
+                                u.get("completion_tokens") or 0,
+                                u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                                u.get("prompt_cache_miss_tokens") or 0,
+                            )
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
                 _log(f"[zen] Stream interrupted: {_exc_desc(e)}")
                 last_error = e
@@ -913,8 +979,7 @@ async def _zen_stream_with_retry(
                 if not streamed_any and attempt < attempts:
                     retry_stream = True
                 else:
-                    if not streamed_any:
-                        yield f'data: {json.dumps({"error": {"message": f"Stream interrupted: {_exc_desc(e)}", "type": "upstream_error"}})}\n\n'
+                    yield _openai_stream_error(f"Stream interrupted: {_exc_desc(e)}")
                     return
         finally:
             try:
@@ -924,10 +989,22 @@ async def _zen_stream_with_retry(
         if retry_stream:
             await _backoff(attempt)
             continue
+        if not stream_completed:
+            err = ValueError("upstream stream ended before [DONE]")
+            _log(f"[zen] {_exc_desc(err)} (attempt {attempt})")
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.report_failure(proxy_addr)
+            last_error = err
+            if not streamed_any and attempt < attempts:
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error(str(err))
         return
 
     # All retries exhausted
-    yield f'data: {json.dumps({"error": {"message": f"Stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}", "type": "upstream_error"}})}\n\n'
+    yield _openai_stream_error(
+        f"Stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}"
+    )
 
 
 async def _zen_stream_anthropic_with_retry(
@@ -952,7 +1029,6 @@ async def _zen_stream_anthropic_with_retry(
     _reason_buf = ""
     _content_buf = ""
     attempts = MAX_RETRIES if max_retries is None else max_retries
-    force_session = False  # only reset the upstream session after a genuine 429
 
     def send_sse(event: str, data: dict) -> str:
         nonlocal streamed_any
@@ -979,24 +1055,22 @@ async def _zen_stream_anthropic_with_retry(
                 await proxy_pool.force_refresh()
                 if not await proxy_pool.select():
                     _log("[pool] Fallback to direct")
-                    client = _default_client
+                    client = _stream_default_client
                     proxy_addr = None
                 else:
                     p = proxy_pool.current
                     proxy_addr = p["address"]
-                    client = proxy_pool.get_client(f"socks5://{proxy_addr}")
+                    client = proxy_pool.get_client(
+                        f"socks5://{proxy_addr}", streaming=True
+                    )
             else:
                 p = proxy_pool.current
                 proxy_addr = p["address"]
-                client = proxy_pool.get_client(f"socks5://{proxy_addr}")
-
-            if force_session:
-                headers["x-opencode-session"] = force_new_session(user, messages)
-                force_session = False
-                if isinstance(req_body.get("messages"), list):
-                    req_body["messages"] = _prune_dangling_tools(req_body["messages"])
+                client = proxy_pool.get_client(
+                    f"socks5://{proxy_addr}", streaming=True
+                )
         else:
-            client = _default_client
+            client = _stream_default_client
             proxy_addr = None
 
         try:
@@ -1011,10 +1085,6 @@ async def _zen_stream_anthropic_with_retry(
                     _log(f"[zen] Anthropic stream 429 (attempt {attempt}): {err_msg}")
                     if PROXY_POOL_ENABLED and proxy_addr:
                         proxy_pool.report_ratelimit(proxy_addr)
-                    if attempt < attempts:
-                        force_session = True
-                        await _backoff(attempt)
-                        continue
                     yield send_sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err_msg + " (free model rate limit)"}})
                     return
 
@@ -1041,14 +1111,12 @@ async def _zen_stream_anthropic_with_retry(
                             _log(f"[zen] Anthropic error in body (attempt {attempt}): {err_msg}")
                             if PROXY_POOL_ENABLED and proxy_addr and is_rate_limit:
                                 proxy_pool.report_ratelimit(proxy_addr)
-                            if attempt < attempts:
-                                if is_rate_limit:
-                                    force_session = True
-                                break
                             if is_rate_limit:
                                 yield send_sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err_msg + " (free model rate limit)"}})
-                            else:
-                                yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
+                                return
+                            if attempt < attempts:
+                                break
+                            yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                             return
 
                     if raw_line.startswith("data: "):
