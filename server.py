@@ -112,7 +112,7 @@ def _json(fn):
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.15.0"
-PROXY_VERSION = "16"
+PROXY_VERSION = "17"
 
 # ── API Keys ──────────────────────────────────────────────────────
 
@@ -327,6 +327,37 @@ def _openai_stream_error(
 def _stream_preview(value: str, limit: int = 160) -> str:
     """Return a bounded, escaped preview suitable for diagnostics."""
     return repr(value[:limit])
+
+
+def _is_context_limit_error(data: dict | None = None, body: str = "") -> bool:
+    """Recognize deterministic upstream context-size errors.
+
+    Providers do not use one consistent error code: some return
+    ``context_length_exceeded`` while others label the same 400 as
+    ``invalid_request_error`` and put the useful signal in the message.
+    These errors cannot be fixed by changing proxies, so retrying them only
+    repeats the same request and needlessly delays the caller.
+    """
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        error = {}
+    text = " ".join(
+        str(value)
+        for value in (
+            error.get("code"),
+            error.get("type"),
+            error.get("message"),
+            body,
+        )
+        if value is not None
+    ).lower()
+    return (
+        "context_length_exceeded" in text
+        or "maximum context length" in text
+        or "max context length" in text
+        or "too many tokens" in text
+        or ("requested" in text and "tokens" in text and "prompt" in text)
+    )
 
 
 def _blocks_text(content) -> str:
@@ -715,10 +746,12 @@ async def _zen_request_with_retry(
 
         if resp.status_code >= 400:
             err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-            is_context_exceeded = "context_length_exceeded" in (data.get("error") or {}).get("code", "")
+            is_context_exceeded = _is_context_limit_error(data, body_text)
             _log(f"[zen] Error {resp.status_code}: {err_msg}")
             # Not a proxy failure: 4xx/5xx are upstream or request errors that
             # repeat identically on every proxy, so never blacklist for them.
+            if is_context_exceeded:
+                _log("[zen] Context limit error; not retrying on another proxy")
             if not is_context_exceeded and attempt < attempts:
                 await _backoff(attempt)
                 continue
@@ -855,18 +888,26 @@ async def _zen_stream_with_retry(
                 return
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.report_success(proxy_addr)
-            is_context_exceeded = b"context_length_exceeded" in raw
+            body_text = raw.decode("utf-8", errors="replace")
+            try:
+                data = json.loads(body_text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                data = {}
+            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            is_context_exceeded = _is_context_limit_error(data, body_text)
             _log(f"[zen] Stream error {resp.status_code}: {raw[:500]}")
             if resp.status_code == 400:
                 _log_reasoning_diag(req_body)
 
             # Not a proxy failure: 4xx/5xx are upstream or request errors that
             # repeat identically on every proxy, so never blacklist for them.
+            if is_context_exceeded:
+                _log("[zen] Context limit error; not retrying on another proxy")
             await resp.aclose()
             if not is_context_exceeded and attempt < attempts:
                 await _backoff(attempt)
                 continue
-            yield _openai_stream_error(f"Upstream error {resp.status_code}")
+            yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
             return
 
         # Success — stream the response
@@ -1114,14 +1155,22 @@ async def _zen_stream_anthropic_with_retry(
 
                 if resp.status_code >= 400:
                     raw = await resp.aread()
-                    is_context_exceeded = b"context_length_exceeded" in raw
+                    body_text = raw.decode("utf-8", errors="replace")
+                    try:
+                        data = json.loads(body_text)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        data = {}
+                    err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                    is_context_exceeded = _is_context_limit_error(data, body_text)
                     _log(f"[zen] Anthropic stream error {resp.status_code}: {raw[:300]}")
                     # Not a proxy failure: 4xx/5xx are upstream or request
                     # errors that repeat identically on every proxy.
+                    if is_context_exceeded:
+                        _log("[zen] Context limit error; not retrying on another proxy")
                     if not is_context_exceeded and attempt < attempts:
                         await _backoff(attempt)
                         continue
-                    yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"HTTP {resp.status_code}"}})
+                    yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                     return
 
                 async for raw_line in resp.aiter_lines():
