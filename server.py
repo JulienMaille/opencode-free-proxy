@@ -112,7 +112,7 @@ def _json(fn):
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.15.0"
-PROXY_VERSION = "17"
+PROXY_VERSION = "18"
 
 # ── API Keys ──────────────────────────────────────────────────────
 
@@ -935,7 +935,7 @@ async def _zen_stream_with_retry(
                         if not streamed_any and attempt < attempts:
                             retry_stream = True
                             break
-                        yield _openai_stream_error(str(err))
+                        yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
                         return
 
                     payload = line[5:].strip()
@@ -963,7 +963,7 @@ async def _zen_stream_with_retry(
                         if not streamed_any and attempt < attempts:
                             retry_stream = True
                             break
-                        yield _openai_stream_error(str(err))
+                        yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
                         return
                     if not isinstance(piece, dict):
                         err = ValueError("malformed upstream SSE JSON: expected an object")
@@ -977,11 +977,12 @@ async def _zen_stream_with_retry(
                         if not streamed_any and attempt < attempts:
                             retry_stream = True
                             break
-                        yield _openai_stream_error(str(err))
+                        yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
                         return
 
-                    if PROXY_POOL_ENABLED and proxy_addr:
-                        proxy_pool.report_success(proxy_addr)
+                    # A valid fragment only proves that the stream is alive;
+                    # it is not a successful request yet. Keep the transport
+                    # failure counter until the upstream sends [DONE].
                     event_error = _first_chunk_error(line)
                     if event_error:
                         err_msg, is_rate_limit = event_error
@@ -1044,7 +1045,11 @@ async def _zen_stream_with_retry(
                 if not streamed_any and attempt < attempts:
                     retry_stream = True
                 else:
-                    yield _openai_stream_error(f"Stream interrupted: {_exc_desc(e)}")
+                    yield _openai_stream_error(
+                        f"Stream interrupted: {_exc_desc(e)}",
+                        "upstream_error",
+                        "transport_error",
+                    )
                     return
         finally:
             try:
@@ -1063,12 +1068,14 @@ async def _zen_stream_with_retry(
             if not streamed_any and attempt < attempts:
                 await _backoff(attempt)
                 continue
-            yield _openai_stream_error(str(err))
+            yield _openai_stream_error(str(err), "upstream_error", "incomplete_stream")
         return
 
     # All retries exhausted
     yield _openai_stream_error(
-        f"Stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}"
+        f"Stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}",
+        "upstream_error",
+        "transport_error",
     )
 
 
