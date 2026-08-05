@@ -1,6 +1,6 @@
 # opencode-free-proxy
 
-Free AI models from [OpenCode](https://opencode.ai) (the Zen API free tier), exposed as standard OpenAI and Anthropic APIs. Works with any tool that speaks those formats: opencode CLI, Cursor, Claude Code, Cline, aider, raw `curl`, etc.
+Free AI models from [OpenCode](https://opencode.ai) (the Zen API free tier), exposed as standard OpenAI and Anthropic APIs. Works with any tool that speaks those formats: opencode CLI, Cursor, Claude Code, Cline, aider, [oh-my-pi](docs/omp.md), raw `curl`, etc.
 
 ## Quick start (Windows)
 
@@ -50,10 +50,16 @@ The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/mode
 
 - `deepseek-v4-flash-free`
 - `mimo-v2.5-free` (only one that also accepts image/audio/video input)
-- `ling-3.0-flash-free`
 - `nemotron-3-ultra-free`
-- `north-mini-code-free`
 - `laguna-s-2.1-free`
+- `longcat-2.0-free`
+
+> Removed from the curated set (still auto-discovered if the Zen API lists them):
+> `north-mini-code-free` — opaque `400 Provider returned error` on multi-turn
+> tool calls; and `ling-3.0-flash-free` — no longer on the free tier upstream
+> (404: "use this slug instead: inclusionai/ling-3.0-flash"). If your client
+> configures models by hand, drop both; the proxy itself serves whatever the
+> Zen API returns.
 
 ## API
 
