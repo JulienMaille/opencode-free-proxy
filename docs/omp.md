@@ -82,27 +82,33 @@ Notes on the `compat` knobs (validated against the Zen gateway behavior the prox
 
 ## 2. Default model roles — `~/.omp/agent/config.yml`
 
+Only DeepSeek V4 Flash is trusted end-to-end, so every role points at it with a per-role reasoning level (`low`/`high`/`max`). DeepSeek is always-thinking, so there is no `off` — `low` is the floor for lightweight roles. `vision` is the exception: DeepSeek is text-only, so it uses the image-capable MiMo.
+
 ```yaml
 modelRoles:
   default: opencode-local/deepseek-v4-flash-free:high
-  smol: opencode-local/nemotron-3-ultra-free:medium
-  slow: opencode-local/nemotron-3-ultra-free:max
+  smol: opencode-local/deepseek-v4-flash-free:low
+  slow: opencode-local/deepseek-v4-flash-free:max
+  plan: opencode-local/deepseek-v4-flash-free:max
   vision: opencode-local/mimo-v2.5-free:high
-  plan: opencode-local/deepseek-v4-flash-free:high
   designer: opencode-local/deepseek-v4-flash-free:high
-  commit: opencode-local/nemotron-3-ultra-free:medium
-  tiny: opencode-local/nemotron-3-ultra-free:medium
+  commit: opencode-local/deepseek-v4-flash-free:low
+  tiny: opencode-local/deepseek-v4-flash-free:low
   task: opencode-local/deepseek-v4-flash-free:high
-  advisor: opencode-local/nemotron-3-ultra-free:max
+  advisor: opencode-local/deepseek-v4-flash-free:high
 cycleOrder:
   - smol
   - default
   - slow
   - vision
   - plan
+symbolPreset: unicode
+theme:
+  dark: titanium
+setupVersion: 1
 ```
 
-Pre-assigning every role avoids oh-my-pi's first-run model picker. The `:high`/`:medium`/`:max` suffixes set per-role reasoning `effort` (the proxy accepts `reasoning_effort`); keep them when editing.
+Pre-assigning every role avoids oh-my-pi's first-run model picker. The `:low`/`:high`/`:max` suffixes set per-role reasoning `effort` (the proxy accepts `reasoning_effort`): `max` for planning/deep work (`plan`, `slow`), `high` for the default workload (`default`, `designer`, `task`, `advisor`), `low` for quick/background tasks (`smol`, `commit`, `tiny`).
 
 ## 3. Verify
 
