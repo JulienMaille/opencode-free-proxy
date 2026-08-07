@@ -153,31 +153,65 @@ _NO_CACHE = {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
 
 
 # ── Token usage tracking (persisted across runs) ──────────────────
+# tokens.json maps model id -> {input, output, cache_hit, cache_miss}.
 
 _TOKENS_FILE = _BASE_DIR / "tokens.json"
 _DEFAULT_TOKENS = {"input": 0, "output": 0, "cache_hit": 0, "cache_miss": 0}
 
 
 def _load_tokens():
+    """Load per-model token usage from disk.
+
+    Migrates the legacy flat-file shape (a single bucket at the top level)
+    into an "unknown" bucket, since those totals predate per-model tracking
+    and their originating model is not recorded.
+    """
     global _tokens
     try:
         with open(_TOKENS_FILE, encoding="utf-8") as f:
-            _tokens = {**_DEFAULT_TOKENS, **(json.load(f) or {})}
+            raw = json.load(f) or {}
     except Exception:
-        _tokens = dict(_DEFAULT_TOKENS)
+        raw = {}
+
+    if isinstance(raw, dict) and "input" in raw:
+        # Legacy flat shape -> single "unknown" bucket.
+        _tokens = {
+            "unknown": {
+                key: (raw.get(key) if isinstance(raw.get(key), int) else 0)
+                for key in ("input", "output", "cache_hit", "cache_miss")
+            }
+        }
+        _persist_tokens()
+    elif isinstance(raw, dict):
+        _tokens = {}
+        for m, bucket in raw.items():
+            if isinstance(bucket, dict):
+                _tokens[m] = {
+                    **_DEFAULT_TOKENS,
+                    **{k: int(v or 0) for k, v in bucket.items() if k in _DEFAULT_TOKENS},
+                }
+    else:
+        _tokens = {}
 
 
-def _add_tokens(inp: int = 0, out: int = 0, cache_hit: int = 0, cache_miss: int = 0):
-    _tokens["input"] += max(0, inp or 0)
-    _tokens["output"] += max(0, out or 0)
-    _tokens["cache_hit"] += max(0, cache_hit or 0)
-    _tokens["cache_miss"] += max(0, cache_miss or 0)
+def _persist_tokens():
     try:
         _TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_TOKENS_FILE, "w", encoding="utf-8") as f:
-            json.dump(_tokens, f, indent=2)
+            json.dump(_tokens, f, indent=2, sort_keys=True)
     except OSError:
         pass
+
+
+def _add_tokens(model: str, inp: int = 0, out: int = 0, cache_hit: int = 0, cache_miss: int = 0):
+    """Accumulate usage counters under the given model id."""
+    model = _normalize_model(model) or "unknown"
+    bucket = _tokens.setdefault(model, dict(_DEFAULT_TOKENS))
+    bucket["input"] += max(0, inp or 0)
+    bucket["output"] += max(0, out or 0)
+    bucket["cache_hit"] += max(0, cache_hit or 0)
+    bucket["cache_miss"] += max(0, cache_miss or 0)
+    _persist_tokens()
 
 
 _load_tokens()
@@ -663,6 +697,7 @@ async def _zen_request_with_retry(
     user: str,
     messages: list[dict],
     session_id: str = None,
+    model: str = None,
     max_retries: int = None,
 ):
     """Non-streaming Zen API call with proxy pool retry on 429."""
@@ -762,7 +797,7 @@ async def _zen_request_with_retry(
 
         usage = (data.get("usage") or {})
         if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
-            _add_tokens(
+            _add_tokens(model,
                 usage.get("prompt_tokens") or 0,
                 usage.get("completion_tokens") or 0,
                 usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
@@ -796,6 +831,7 @@ async def _zen_stream_with_retry(
     user: str,
     messages: list[dict],
     session_id: str = None,
+    model: str = None,
     max_retries: int = None,
 ):
     """Streaming Zen API call with proxy pool retry on 429/403 and ReadError recovery."""
@@ -1026,7 +1062,7 @@ async def _zen_stream_with_retry(
                     if '"usage"' in line:
                         u = piece.get("usage") or {}
                         if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
-                            _add_tokens(
+                            _add_tokens(model,
                                 u.get("prompt_tokens") or 0,
                                 u.get("completion_tokens") or 0,
                                 u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
@@ -1219,7 +1255,7 @@ async def _zen_stream_anthropic_with_retry(
 
                         u = parsed.get("usage")
                         if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
-                            _add_tokens(
+                            _add_tokens(model,
                                 u.get("prompt_tokens") or 0,
                                 u.get("completion_tokens") or 0,
                                 u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
@@ -1597,7 +1633,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _zen_stream_with_retry(req_body, headers, user, messages or [], session_id),
+            _zen_stream_with_retry(req_body, headers, user, messages or [], session_id, model),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -1605,7 +1641,7 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        return await _zen_request_with_retry(req_body, headers, user, messages or [], session_id)
+        return await _zen_request_with_retry(req_body, headers, user, messages or [], session_id, model)
 
 
 # ── Routes: Anthropic Messages format ─────────────────────────────
@@ -1647,7 +1683,7 @@ async def messages(request: Request):
             },
         )
     else:
-        data = await _zen_request_with_retry(req_body, headers, user, oai_messages, session_id)
+        data = await _zen_request_with_retry(req_body, headers, user, oai_messages, session_id, model)
         if isinstance(data, JSONResponse):
             return data
         if not data.get("choices"):
@@ -1679,7 +1715,7 @@ async def handle_responses(request: Request):
 
     if stream:
         return StreamingResponse(
-            _zen_stream_with_retry(req_body, headers, user, messages, session_id),
+            _zen_stream_with_retry(req_body, headers, user, messages, session_id, zen_model),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -1687,7 +1723,7 @@ async def handle_responses(request: Request):
             },
         )
     else:
-        return await _zen_request_with_retry(req_body, headers, user, messages, session_id)
+        return await _zen_request_with_retry(req_body, headers, user, messages, session_id, zen_model)
 
 def _input_to_messages(inp):
     """Convert Responses API 'input' to chat messages array."""
