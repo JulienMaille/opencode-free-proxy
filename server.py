@@ -651,6 +651,14 @@ async def _backoff(attempt: int, base: float = 1.0, max_delay: float = 10.0):
     await asyncio.sleep(delay + jitter)
 
 
+async def _client_gone(request: Request) -> bool:
+    """True if the requesting client has disconnected (so retries stop)."""
+    try:
+        return await request.is_disconnected()
+    except Exception:
+        return False
+
+
 def _local_rate_limit_response(message: str) -> JSONResponse:
     """Return promptly so the caller can retry through another proxy."""
     return JSONResponse(
@@ -692,6 +700,7 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id):
 # ── Proxy-aware Zen API calls ─────────────────────────────────────
 
 async def _zen_request_with_retry(
+    request: Request,
     req_body: dict,
     headers: dict,
     user: str,
@@ -705,6 +714,9 @@ async def _zen_request_with_retry(
     attempts = MAX_RETRIES if max_retries is None else max_retries
 
     for attempt in range(attempts + 1):
+        if await _client_gone(request):
+            _log("[zen] Client disconnected; aborting retries")
+            return None
         if PROXY_POOL_ENABLED:
             # Load pool if needed
             if not proxy_pool.ready:
@@ -826,6 +838,7 @@ async def _zen_request_with_retry(
 
 
 async def _zen_stream_with_retry(
+    request: Request,
     req_body: dict,
     headers: dict,
     user: str,
@@ -839,6 +852,9 @@ async def _zen_stream_with_retry(
     attempts = MAX_RETRIES if max_retries is None else max_retries
 
     for attempt in range(attempts + 1):
+        if await _client_gone(request):
+            _log("[zen] Client disconnected; aborting retries")
+            return
         if PROXY_POOL_ENABLED:
             if not proxy_pool.ready:
                 await proxy_pool.load()
@@ -968,7 +984,7 @@ async def _zen_stream_with_retry(
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_failure(proxy_addr)
                         last_error = err
-                        if not streamed_any and attempt < attempts:
+                        if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
                             break
                         yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
@@ -996,7 +1012,7 @@ async def _zen_stream_with_retry(
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_failure(proxy_addr)
                         last_error = err
-                        if not streamed_any and attempt < attempts:
+                        if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
                             break
                         yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
@@ -1010,7 +1026,7 @@ async def _zen_stream_with_retry(
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_failure(proxy_addr)
                         last_error = err
-                        if not streamed_any and attempt < attempts:
+                        if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
                             break
                         yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
@@ -1032,7 +1048,7 @@ async def _zen_stream_with_retry(
                                 "rate_limit_exceeded",
                             )
                             return
-                        if not streamed_any and attempt < attempts:
+                        if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
                             break
                         yield _openai_stream_error(err_msg)
@@ -1078,7 +1094,7 @@ async def _zen_stream_with_retry(
                     proxy_pool.report_failure(proxy_addr)
                 # Never retry once bytes have already been sent to the client; a
                 # fresh request would replay the whole stream and corrupt output.
-                if not streamed_any and attempt < attempts:
+                if not streamed_any and attempt < attempts and not await _client_gone(request):
                     retry_stream = True
                 else:
                     yield _openai_stream_error(
@@ -1116,6 +1132,7 @@ async def _zen_stream_with_retry(
 
 
 async def _zen_stream_anthropic_with_retry(
+    request: Request,
     req_body: dict,
     headers: dict,
     user: str,
@@ -1154,6 +1171,9 @@ async def _zen_stream_anthropic_with_retry(
         return idx
 
     for attempt in range(attempts + 1):
+        if await _client_gone(request):
+            _log("[zen] Client disconnected; aborting retries")
+            return
         if PROXY_POOL_ENABLED:
             if not proxy_pool.ready:
                 await proxy_pool.load()
@@ -1342,7 +1362,7 @@ async def _zen_stream_anthropic_with_retry(
                             return
 
                 # If we broke out before emitting headers, retry with another proxy.
-                if not headers_sent and attempt < attempts:
+                if not headers_sent and attempt < attempts and not await _client_gone(request):
                     await _backoff(attempt)
                     continue
                 return
@@ -1356,7 +1376,7 @@ async def _zen_stream_anthropic_with_retry(
             last_error = e
             # Never retry once bytes have already been sent to the client; a
             # fresh request would replay the whole stream and corrupt output.
-            if not streamed_any and attempt < attempts:
+            if not streamed_any and attempt < attempts and not await _client_gone(request):
                 await _backoff(attempt)
                 continue
             if not streamed_any:
@@ -1633,7 +1653,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _zen_stream_with_retry(req_body, headers, user, messages or [], session_id, model),
+            _zen_stream_with_retry(request, req_body, headers, user, messages or [], session_id, model),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -1641,7 +1661,13 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        return await _zen_request_with_retry(req_body, headers, user, messages or [], session_id, model)
+        data = await _zen_request_with_retry(request, req_body, headers, user, messages or [], session_id, model)
+        if data is None:
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": "Client disconnected", "type": "upstream_error"}},
+            )
+        return data
 
 
 # ── Routes: Anthropic Messages format ─────────────────────────────
@@ -1675,7 +1701,7 @@ async def messages(request: Request):
 
     if stream:
         return StreamingResponse(
-            _zen_stream_anthropic_with_retry(req_body, headers, user, oai_messages, model, input_tokens, session_id),
+            _zen_stream_anthropic_with_retry(request, req_body, headers, user, oai_messages, model, input_tokens, session_id),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -1683,9 +1709,14 @@ async def messages(request: Request):
             },
         )
     else:
-        data = await _zen_request_with_retry(req_body, headers, user, oai_messages, session_id, model)
+        data = await _zen_request_with_retry(request, req_body, headers, user, oai_messages, session_id, model)
         if isinstance(data, JSONResponse):
             return data
+        if data is None:
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
+            )
         if not data.get("choices"):
             return JSONResponse(
                 status_code=502,
@@ -1715,7 +1746,7 @@ async def handle_responses(request: Request):
 
     if stream:
         return StreamingResponse(
-            _zen_stream_with_retry(req_body, headers, user, messages, session_id, zen_model),
+            _zen_stream_with_retry(request, req_body, headers, user, messages, session_id, zen_model),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -1723,7 +1754,13 @@ async def handle_responses(request: Request):
             },
         )
     else:
-        return await _zen_request_with_retry(req_body, headers, user, messages, session_id, zen_model)
+        data = await _zen_request_with_retry(request, req_body, headers, user, messages, session_id, zen_model)
+        if data is None:
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": "Client disconnected", "type": "upstream_error"}},
+            )
+        return data
 
 def _input_to_messages(inp):
     """Convert Responses API 'input' to chat messages array."""
