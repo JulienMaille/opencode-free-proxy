@@ -2589,40 +2589,315 @@ async def messages(request: Request):
 
 # ── /v1/responses (Responses API for Codex openai_base_url) ─────────────
 
+def _responses_sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _response_obj(resp_id: str, model: str, status: str, output: list, usage: dict | None = None) -> dict:
+    obj = {
+        "id": resp_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model,
+        "status": status,
+        "output": output,
+    }
+    if usage is not None:
+        obj["usage"] = usage
+    return obj
+
+
+def _chat_usage_to_responses(usage: dict | None) -> dict:
+    usage = usage or {}
+    return {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+
+
+def _chat_to_responses(data: dict, model: str):
+    """Convert a chat/completions completion object into a Responses object."""
+    choice = (data.get("choices") or [None])[0]
+    msg = (choice or {}).get("message") or {}
+    output = []
+    content = msg.get("content")
+    tcs = msg.get("tool_calls")
+    if content:
+        output.append({
+            "type": "message", "id": oc_id("msg"), "status": "completed",
+            "role": "assistant", "content": [{"type": "output_text", "text": content}],
+        })
+    if tcs:
+        for tc in tcs:
+            fn = tc.get("function") or {}
+            output.append({
+                "type": "function_call", "id": tc.get("id") or oc_id("call"),
+                "status": "completed", "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", ""), "call_id": tc.get("id"),
+            })
+    return JSONResponse(_response_obj(
+        data.get("id") or oc_id("resp"), model, "completed", output,
+        _chat_usage_to_responses(data.get("usage")),
+    ))
+
+
+async def _stream_as_responses(upstream, model: str, session_id=None):
+    """Translate an upstream OpenAI chat-completions SSE stream into the
+    Responses API event sequence a codex_responses client expects.
+
+    Zen only speaks chat/completions, so we reshape its ``chat.completion.chunk``
+    stream into ``response.*`` SSE events (including a terminal
+    ``response.completed`` carrying status). Without this the client sees an
+    empty stream and reports 'stream closed before finish_reason'.
+    """
+    resp_id = oc_id("resp")
+    msg_id = oc_id("msg")
+    text_buf: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    fc_order: list[int] = []
+    fc_index: dict[int, int] = {}
+    fc_open: dict[int, bool] = {}
+    finish_reason = None
+    usage = None
+    msg_open = False
+    msg_output_index = 0
+    next_index = 0
+    yield _responses_sse("response.created", {
+        "type": "response.created",
+        "response": _response_obj(resp_id, model, "in_progress", []),
+    })
+    yield _responses_sse("response.in_progress", {
+        "type": "response.in_progress",
+        "response": _response_obj(resp_id, model, "in_progress", []),
+    })
+
+    try:
+        while True:
+            try:
+                raw = await asyncio.wait_for(anext(upstream), timeout=30.0)
+            except StopAsyncIteration:
+                break
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError as e:
+                _log(f"[zen] Responses upstream stalled; finalizing partial output: {_exc_desc(e)}")
+                break
+            payload = raw[len("data:"):].strip()
+            if payload in ("[DONE]", ""):
+                continue
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            choices = data.get("choices") or []
+            if not choices:
+                if data.get("usage"):
+                    usage = data["usage"]
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            tcs = delta.get("tool_calls")
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            if data.get("usage"):
+                usage = data["usage"]
+            if content:
+                if not msg_open:
+                    msg_open = True
+                    idx = next_index
+                    next_index += 1
+                    msg_output_index = idx
+                    yield _responses_sse("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "output_index": idx,
+                        "item": {"type": "message", "id": msg_id, "status": "in_progress",
+                                 "role": "assistant", "content": []},
+                    })
+                    yield _responses_sse("response.content_part.added", {
+                        "type": "response.content_part.added",
+                        "item_id": msg_id, "output_index": idx, "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    })
+                text_buf.append(content)
+                yield _responses_sse("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id, "output_index": msg_output_index, "content_index": 0,
+                    "delta": content,
+                })
+            if tcs:
+                for t in tcs:
+                    idx = t.get("index", 0)
+                    tc = tool_calls.get(idx)
+                    if tc is None:
+                        tc = {"id": t.get("id") or oc_id("call"), "name": "", "args": ""}
+                        tool_calls[idx] = tc
+                        fc_order.append(idx)
+                    if t.get("id"):
+                        tc["id"] = t["id"]
+                    fn = t.get("function") or {}
+                    if fn.get("name"):
+                        tc["name"] = fn["name"]
+                    frag = fn.get("arguments") or ""
+                    if frag:
+                        tc["args"] += frag
+                    if not fc_open.get(idx):
+                        fc_open[idx] = True
+                        fc_index[idx] = next_index
+                        next_index += 1
+                        yield _responses_sse("response.output_item.added", {
+                            "type": "response.output_item.added",
+                            "output_index": fc_index[idx],
+                            "item": {"type": "function_call", "id": tc["id"],
+                                     "status": "in_progress", "name": tc["name"],
+                                     "arguments": ""},
+                        })
+                    if frag:
+                        yield _responses_sse("response.function_call_arguments.delta", {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": tc["id"], "delta": frag,
+                        })
+    except Exception as e:
+        _log(f"[zen] Responses upstream stream error: {_exc_desc(e)}")
+
+    output = []
+    if msg_open and text_buf:
+        full = "".join(text_buf)
+        yield _responses_sse("response.output_text.done", {
+            "type": "response.output_text.done",
+            "item_id": msg_id, "output_index": msg_output_index, "content_index": 0, "text": full,
+        })
+        yield _responses_sse("response.content_part.done", {
+            "type": "response.content_part.done",
+            "item_id": msg_id, "output_index": msg_output_index, "content_index": 0,
+            "part": {"type": "output_text", "text": full},
+        })
+        yield _responses_sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": msg_output_index,
+            "item": {"type": "message", "id": msg_id, "status": "completed",
+                     "role": "assistant", "content": [{"type": "output_text", "text": full}]},
+        })
+        output.append({"type": "message", "id": msg_id, "status": "completed",
+                       "role": "assistant", "content": [{"type": "output_text", "text": full}]})
+
+    for idx in fc_order:
+        tc = tool_calls[idx]
+        yield _responses_sse("response.function_call_arguments.done", {
+            "type": "response.function_call_arguments.done",
+            "item_id": tc["id"], "delta": tc["args"],
+        })
+        yield _responses_sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": fc_index.get(idx, len(output)),
+            "item": {"type": "function_call", "id": tc["id"], "status": "completed",
+                     "name": tc["name"], "arguments": tc["args"], "call_id": tc["id"]},
+        })
+        output.append({"type": "function_call", "id": tc["id"], "status": "completed",
+                       "name": tc["name"], "arguments": tc["args"], "call_id": tc["id"]})
+
+    status = "completed" if finish_reason in ("stop", "tool_calls", "function_call") else "incomplete"
+    yield _responses_sse("response.completed", {
+        "type": "response.completed",
+        "response": _response_obj(resp_id, model, status, output, _chat_usage_to_responses(usage)),
+    })
+
+
 async def handle_responses(request: Request):
-    body = await request.json()
-    model = body.get("model", "")
-    stream = body.get("stream", False)
-    messages = _input_to_messages(body.get("input", ""))
-    tools = _extract_tools(body)
+    try:
+        body = await request.json()
+        model = body.get("model", "")
+        stream = body.get("stream", False)
+        messages = _input_to_messages(body.get("input", ""))
+        tools = _extract_tools(body)
+        tool_choice = body.get("tool_choice")
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function" and "function" not in tool_choice:
+            tool_choice = {"type": "function", "function": {"name": tool_choice.get("name", "")}}
 
-    user = auth(request)
-    if not user:
-        return JSONResponse(status_code=401, content={"error": {"message": "Invalid API key"}})
+        user = auth(request)
+        if not user:
+            return JSONResponse(status_code=401, content={"error": {"message": "Invalid API key"}})
 
-    zen_model = _map_model(model)
-    messages = _normalize_messages(messages)
-    session_id = get_session(user, messages)
-    up_messages = _prepare_upstream_messages(session_id, messages)
-    req_body, headers = zen_request(zen_model, up_messages, stream, tools, body.get("tool_choice"), session_id)
+        # Ensure discovered model list is warm before alias mapping (cold-start gap: alias -> _models_cache[0])
+        if not _models_cache:
+            await _fetch_free_models()
+        zen_model = _map_model(model)
+        # Validate against discovered free list like chat_completions/messages do
+        if not await _ensure_model_known(zen_model):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": f"Unknown model: {zen_model}. Available: {', '.join(_models_cache)}"}},
+            )
+        messages = _normalize_messages(messages)
+        session_id = get_session(user, messages)
+        up_messages = _prepare_upstream_messages(session_id, messages)
+        req_body, headers = zen_request(zen_model, up_messages, stream, tools, tool_choice, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
+        if stream:
+            # Known-truncating models: stream:true+tools (muse-spark) or stream:true reasoning (x-preview)
+            # closes without finish_reason/[DONE]. Same buffered bridge as chat/messages.
+            if _needs_buffered_fallback(zen_model, tools, True):
+                _log(f"[zen] responses buffered fallback: stream:true -> stream:false upstream (model={zen_model})")
+                buffered_body = dict(req_body)
+                buffered_body["stream"] = False
+                data = await _zen_request_with_retry(request, buffered_body, headers, user, messages, session_id, zen_model)
+                if data is None:
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": {"message": "Client disconnected", "type": "upstream_error"}},
+                    )
+                if isinstance(data, JSONResponse):
+                    return data
+                # Reframe buffered chat/completions as Responses stream
+                async def _buffered_responses():
+                    async def _single_chunk():
+                        # Buffered choices carry a full "message"; reshape to a
+                        # streaming "delta" event so _stream_as_responses
+                        # actually emits the text/tool-call output items.
+                        ch = dict((data.get("choices") or [{}])[0] or {})
+                        msg = ch.get("message") or {}
+                        delta = {"role": "assistant", "content": msg.get("content")}
+                        if msg.get("tool_calls"):
+                            delta["tool_calls"] = [dict(tc, index=i) for i, tc in enumerate(msg["tool_calls"])]
+                        ch["delta"] = delta
+                        yield f"data: {json.dumps({'choices': [ch], 'usage': data.get('usage')})}\n\n"
+                        yield "data: [DONE]\n\n"
+                    async for evt in _stream_as_responses(_single_chunk(), model, session_id):
+                        yield evt
+                return StreamingResponse(
+                    _buffered_responses(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache, no-transform",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            upstream = _zen_stream_with_retry(request, req_body, headers, user, messages, session_id, zen_model)
+            return StreamingResponse(
+                _stream_as_responses(upstream, model, session_id),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
-    if stream:
-        return StreamingResponse(
-            _zen_stream_with_retry(request, req_body, headers, user, messages, session_id, zen_model),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-            },
-        )
-    else:
         data = await _zen_request_with_retry(request, req_body, headers, user, messages, session_id, zen_model)
+        if isinstance(data, JSONResponse):
+            return data
         if data is None:
             return JSONResponse(
                 status_code=502,
                 content={"error": {"message": "Client disconnected", "type": "upstream_error"}},
             )
-        return data
+        return _chat_to_responses(data, model)
+    except Exception as e:
+        import traceback as _tb
+        _log(f"[responses] ERROR: {_tb.format_exc()}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e), "type": "proxy_error"}},
+        )
 
 def _input_to_messages(inp):
     """Convert Responses API 'input' to chat messages array."""
@@ -2641,17 +2916,41 @@ def _input_to_messages(inp):
     return [{"role": "user", "content": ""}]
 
 def _extract_tools(body):
-    tools = body.get("tools", [])
-    return [t for t in tools if isinstance(t, dict)] if tools else None
+    tools = body.get("tools") or []
+    if not tools:
+        return None
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if "function" in t:
+            out.append(t)
+        else:
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("parameters") or {},
+                },
+            })
+    return out or None
 
 def _map_model(model: str) -> str:
+    """Resolve legacy role aliases against the DISCOVERED model list only.
+
+    No model ids are hardcoded: aliases pick from whatever the Zen API
+    currently exposes, falling back to the first discovered free model.
+    """
+    if not _models_cache:
+        return _normalize_model(model)
     m = model.lower().replace("-", "").replace("_", "")
-    if m in ("opencodedefault",):
-        return "ling-3.0-flash-free"
-    if m in ("opencodefast",):
-        return "deepseek-v4-flash-free"
-    if m in ("opencodesmart",):
-        return "mimo-v2.5-free"
+    if m == "opencodedefault":
+        return _models_cache[0]
+    if m == "opencodefast":
+        return next((x for x in _models_cache if "flash" in x or "lightning" in x or "mini" in x), _models_cache[0])
+    if m == "opencodesmart":
+        return next((x for x in _models_cache if "ultra" in x or "pro" in x or "smart" in x), _models_cache[0])
     return _normalize_model(model)
 
 
@@ -2669,7 +2968,7 @@ async def health(request: Request):
         "pool_state": pool_state,
         "pool_size": len(proxy_pool.hot) if PROXY_POOL_ENABLED else None,
         "tokens": dict(_tokens),
-        "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/models"],
+        "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
     }
 
 
