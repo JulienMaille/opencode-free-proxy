@@ -766,14 +766,139 @@ def _local_rate_limit_response(message: str) -> JSONResponse:
 
 # ── Zen API transport ─────────────────────────────────────────────
 
+# Mid-stream transport deaths (torn tunnel / incomplete chunked read) are
+# resumed by re-issuing the request with the partially-streamed assistant
+# output appended, so the model continues from the cutoff instead of
+# replaying the turn. Bound resume attempts separately from MAX_RETRIES.
+MAX_STREAM_CONTINUATIONS = 4  # torn-stream resumes; long reasoning models need headroom
 
-def zen_request(model, messages, stream, tools, tool_choice, session_id):
+
+def _needs_buffered_fallback(model: str | None, tools, stream) -> bool:
+    """Buffered bridge for models whose streaming truncates.
+
+    Muse Spark 1.2 via zen/go truncates streaming tool-calls (opencodex#2156
+    / opencode#40888). x-preview-f-free now shows the same: reasoning=2-7k
+    then streamed_any=True reason_len=3k+ content_len=0 and no [DONE].
+    Same safe fix: model-scoped stream:false upstream, reframe as SSE,
+    rather than loosening the global fail-closed guard.
+    TODO: narrow x-preview gate to reasoning-heavy turns once upstream fixes
+    stream:true without tools; currently buffered on every stream:true.
+    """
+    if not stream:
+        return False
+    m = (model or "").lower()
+    # Gate: muse-spark only when tools are present (stream:true+tools matrix);
+    # x-preview-f truncates even on plain reasoning turns, so buffer it whenever streaming.
+    if "muse-spark" in m or "muse_spark" in m:
+        return bool(tools)
+    if "x-preview" in m or "x_preview" in m:
+        return True
+    return False
+
+def _buffered_to_openai_sse(data: dict, model: str):
+    """Reframe a buffered chat/completions object as OpenAI SSE chunks."""
+    choice = (data.get("choices") or [{}])[0] or {}
+    msg = choice.get("message") or {}
+    content = msg.get("content") or ""
+    tool_calls = msg.get("tool_calls") or []
+    raw_finish = choice.get("finish_reason")
+    finish = raw_finish if raw_finish is not None else ("tool_calls" if tool_calls else "stop")
+    usage = data.get("usage") or {}
+    cid = data.get("id") or oc_id("chatcmpl")
+    created = data.get("created") or int(time.time())
+    # Tokens already counted by _zen_request_with_retry buffered path; do not double-count.
+    # role chunk
+    yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+    if content:
+        # Keep one delta; chunking is not required for correctness
+        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]})}\n\n"
+    for idx, tc in enumerate(tool_calls):
+        fn = tc.get("function") or {}
+        args = fn.get("arguments") or ""
+        if isinstance(args, dict):
+            args = json.dumps(args, ensure_ascii=False)
+        # tool_calls delta (OpenAI streaming shape)
+        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': tc.get('id') or oc_id('call'), 'type': 'function', 'function': {'name': fn.get('name') or '', 'arguments': args}}]}, 'finish_reason': None}]})}\n\n"
+    # finish chunk
+    yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]})}\n\n"
+    if usage:
+        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [], 'usage': usage})}\n\n"
+    yield "data: [DONE]\n\n"
+
+def _buffered_to_anthropic_sse(data: dict, model: str, input_tokens: int):
+    """Reframe a buffered chat/completions object as Anthropic Messages SSE."""
+    choice = (data.get("choices") or [{}])[0] or {}
+    msg = choice.get("message") or {}
+    content = msg.get("content") or ""
+    tool_calls = msg.get("tool_calls") or []
+    raw_finish = choice.get("finish_reason")
+    finish = raw_finish if raw_finish is not None else ("tool_calls" if tool_calls else "stop")
+    usage = data.get("usage") or {}
+    # Tokens already counted by _zen_request_with_retry buffered path; do not double-count.
+    msg_id = oc_id("msg")
+    # message_start
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'usage': {'input_tokens': input_tokens or 0, 'output_tokens': 0, **_NO_CACHE}}})}\n\n"
+    idx = 0
+    has_text = bool(content)
+    if has_text:
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+        idx = 1
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        args = fn.get("arguments") or ""
+        if isinstance(args, dict):
+            args = json.dumps(args, ensure_ascii=False)
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'tool_use', 'id': tc.get('id') or oc_id('toolu'), 'name': fn.get('name') or ''}})}\n\n"
+        if args:
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+        idx += 1
+    if not has_text and not tool_calls:
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    output_tokens = usage.get("completion_tokens") if usage.get("completion_tokens") is not None else (len(content) // 4 + sum(len((tc.get('function') or {}).get('arguments') or '') for tc in tool_calls) // 4) or 0
+    stop_reason = "tool_use" if finish == "tool_calls" else ("max_tokens" if finish == "length" else "end_turn")
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+
+def _continuation_body(req_body: dict, content: str, reasoning: str) -> dict:
+    """Clone the request body with the partial assistant output appended."""
+    body = dict(req_body)
+    msgs = list(body.get("messages") or [])
+    if content:
+        msgs.append({
+            "role": "assistant",
+            "content": content,
+            "reasoning_content": reasoning or "",
+        })
+    body["messages"] = msgs
+    return body
+
+
+_SAMPLING_KEYS = ("temperature", "top_p", "stop")
+
+
+def _sampling_from(body: dict) -> dict:
+    """Pick client sampling params the upstream accepts; absent = upstream default."""
+    return {k: body[k] for k in _SAMPLING_KEYS if body.get(k) is not None}
+
+
+def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tokens=None, max_completion_tokens=None, sampling: dict | None = None):
     model = _normalize_model(model)
     req_body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
     if tools:
         req_body["tools"] = tools
     if tool_choice:
         req_body["tool_choice"] = tool_choice
+    if max_tokens is not None:
+        req_body["max_tokens"] = max_tokens
+    if max_completion_tokens is not None:
+        req_body["max_completion_tokens"] = max_completion_tokens
+    if sampling:
+        req_body.update(sampling)
 
     request_id = oc_id("msg")
     headers = {
@@ -790,6 +915,203 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id):
 
 # ── Proxy-aware Zen API calls ─────────────────────────────────────
 
+def _needs_stream_bridge(model: str | None) -> bool:
+    """True for models whose upstream hangs on fully-buffered generations.
+
+    x-preview reasons for minutes before emitting its first byte; the
+    non-streaming transport (short read timeout, no keep-alive traffic) dies
+    with ReadTimeout long before the answer materializes, while the streaming
+    transport survives the silent warm-up. Clients asking stream=false for
+    such models get an internal bridge: stream upstream, aggregate, return
+    one chat.completion object.
+    """
+    if not model:
+        return False
+    m = str(model)
+    return any(alias in m for alias in ("x-preview", "hy3"))
+
+
+async def _aggregate_upstream_completion(
+    request: Request,
+    req_body: dict,
+    headers: dict,
+    user: str,
+    messages: list[dict],
+    session_id: str = None,
+    model: str = None,
+    max_retries: int = None,
+):
+    """Stream the upstream response and assemble a buffered chat.completion.
+
+    Consumes ``_zen_stream_with_retry`` (which already owns proxy-pool
+    selection, retries, torn-stream resume and terminal-error framing) and
+    folds the emitted deltas into the same JSON object the non-streaming
+    transport would have returned.
+    """
+    stream_body = dict(req_body)
+    stream_body["stream"] = True
+
+    cid = oc_id("chatcmpl")
+    created = int(time.time())
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    finish_reason = None
+    usage: dict | None = None
+    saw_error = None
+
+    gen = _zen_stream_with_retry(
+        request, stream_body, headers, user, messages, session_id, model, max_retries
+    )
+    got_any_chunk = False
+    async for raw in gen:
+        for block in str(raw).split("\n\n"):
+            block = block.strip()
+            if not block.startswith("data:"):
+                continue
+            payload = block[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                piece = json.loads(payload)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            got_any_chunk = True
+            if isinstance(piece.get("error"), dict):
+                saw_error = piece["error"].get("message") or "Upstream stream error"
+                continue
+            choices = piece.get("choices")
+            first_choice = choices[0] if isinstance(choices, list) and choices else {}
+            if not isinstance(first_choice, dict):
+                continue
+            delta = first_choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                delta = {}
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = tool_calls.setdefault(
+                    idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                )
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] = slot["function"]["name"] + fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] = slot["function"]["arguments"] + fn["arguments"]
+            if first_choice.get("finish_reason"):
+                finish_reason = first_choice["finish_reason"]
+            u = piece.get("usage")
+            if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                usage = u
+
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    has_tool_calls = bool(tool_calls)
+
+    # Terminal failures: nothing usable was produced. Surface the upstream
+    # error exactly like the buffered transport would (502 + error JSON).
+    # _openai_stream_error frames errors as literal "[upstream error] …"
+    # content; strip that framing so callers never see it as an answer.
+    if saw_error and not has_tool_calls and content.startswith("[upstream error]"):
+        msg = content[len("[upstream error] "):]
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": msg, "type": "upstream_error"}},
+        )
+    if not got_any_chunk:
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": "Upstream stream produced no data", "type": "upstream_error"}},
+        )
+    # Reasoning-only with no answer text: the model spent its whole output
+    # budget thinking. Not a transport failure — return a well-formed
+    # completion carrying finish_reason (usually "length") plus whatever
+    # reasoning survived, so clients can raise max_tokens and retry.
+    if not content and not has_tool_calls:
+        _log(f"[zen] [{model}|stream-bridge] reasoning-only response, finish={finish_reason} ({len(reasoning)} chars of thinking)")
+        usage = usage or {
+            "prompt_tokens": len(json.dumps(messages)) // 4,
+            "completion_tokens": len(reasoning) // 4,
+            "completion_tokens_details": {"reasoning_tokens": len(reasoning) // 4},
+        }
+        return {
+            "id": cid,
+            "object": "chat.completion",
+            "created": created,
+            "model": model or "",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "", "reasoning_content": reasoning},
+                    "finish_reason": finish_reason or "length",
+                }
+            ],
+            "usage": usage,
+        }
+
+    if session_id and reasoning and content:
+        _remember_reasoning(session_id, content, reasoning)
+
+    message: dict = {"role": "assistant"}
+    if content:
+        message["content"] = content
+    elif has_tool_calls:
+        message["content"] = None
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    ordered_calls = [tool_calls[i] for i in sorted(tool_calls)]
+    if ordered_calls:
+        message["tool_calls"] = [
+            {
+                "id": c["id"] or oc_id("call"),
+                "type": "function",
+                "function": {
+                    "name": c["function"]["name"],
+                    "arguments": c["function"]["arguments"],
+                },
+            }
+            for c in ordered_calls
+        ]
+        finish_reason = finish_reason or "tool_calls"
+
+    if not usage:
+        usage = {
+            "prompt_tokens": len(json.dumps(messages)) // 4,
+            "completion_tokens": (len(content) + len(reasoning)) // 4,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": len(reasoning) // 4},
+        }
+
+    _add_tokens(
+        model or "unknown",
+        usage.get("prompt_tokens") or 0,
+        usage.get("completion_tokens") or 0,
+        usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+        usage.get("prompt_cache_miss_tokens") or 0,
+    )
+
+    _log(f"[zen] OK [{model}|stream-bridge] aggregated {len(content)} chars, finish={finish_reason}")
+    return {
+        "id": cid,
+        "object": "chat.completion",
+        "created": created,
+        "model": model or "",
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason or "stop",
+            }
+        ],
+        "usage": usage,
+    }
+
+
 async def _zen_request_with_retry(
     request: Request,
     req_body: dict,
@@ -801,6 +1123,12 @@ async def _zen_request_with_retry(
     max_retries: int = None,
 ):
     """Non-streaming Zen API call with proxy pool retry on 429."""
+    if req_body.get("stream") is False and _needs_stream_bridge(model):
+        # Buffered transport times out on this model's silent warm-up; stream
+        # internally and hand the caller a normal completion object instead.
+        return await _aggregate_upstream_completion(
+            request, req_body, headers, user, messages, session_id, model, max_retries
+        )
     last_error = None
     attempts = MAX_RETRIES if max_retries is None else max_retries
 
@@ -1779,9 +2107,29 @@ async def chat_completions(request: Request):
     session_id = get_session(user, messages)
 
     up_messages = _prepare_upstream_messages(session_id, _normalize_messages(messages))
-    req_body, headers = zen_request(model, up_messages, stream, tools, tool_choice, session_id)
+    req_body, headers = zen_request(model, up_messages, stream, tools, tool_choice, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
 
     if stream:
+        if _needs_buffered_fallback(model, tools, stream):
+            _log(f"[zen] buffered fallback: stream:true -> stream:false upstream (model={model})")
+            buffered_body = dict(req_body)
+            buffered_body["stream"] = False
+            data = await _zen_request_with_retry(request, buffered_body, headers, user, messages or [], session_id, model)
+            if isinstance(data, JSONResponse):
+                return data
+            if data is None:
+                return JSONResponse(status_code=502, content={"error": {"message": "Client disconnected", "type": "upstream_error"}})
+            async def _muse_spark_openai_sse():
+                for chunk in _buffered_to_openai_sse(data, model):
+                    yield chunk
+            return StreamingResponse(
+                _muse_spark_openai_sse(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         return StreamingResponse(
             _zen_stream_with_retry(request, req_body, headers, user, messages or [], session_id, model),
             media_type="text/event-stream",
@@ -1792,10 +2140,17 @@ async def chat_completions(request: Request):
         )
     else:
         data = await _zen_request_with_retry(request, req_body, headers, user, messages or [], session_id, model)
+        if isinstance(data, JSONResponse):
+            return data
         if data is None:
             return JSONResponse(
                 status_code=502,
                 content={"error": {"message": "Client disconnected", "type": "upstream_error"}},
+            )
+        if not data.get("choices"):
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": "Invalid upstream response", "type": "upstream_error"}},
             )
         return data
 
@@ -1827,9 +2182,32 @@ async def messages(request: Request):
     input_tokens = len(json.dumps(oai_messages)) // 4
 
     up_messages = _prepare_upstream_messages(session_id, oai_messages)
-    req_body, headers = zen_request(model, up_messages, stream, tools, None, session_id)
+    req_body, headers = zen_request(model, up_messages, stream, tools, None, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
 
     if stream:
+        if _needs_buffered_fallback(model, tools, stream):
+            _log(f"[zen] muse-spark buffered fallback (anthropic): stream:true+tools -> stream:false upstream (model={model})")
+            buffered_body = dict(req_body)
+            buffered_body["stream"] = False
+            data = await _zen_request_with_retry(request, buffered_body, headers, user, oai_messages, session_id, model)
+            if isinstance(data, JSONResponse):
+                return data
+            if data is None:
+                return JSONResponse(
+                    status_code=502,
+                    content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
+                )
+            async def _muse_spark_anthropic_sse():
+                for chunk in _buffered_to_anthropic_sse(data, model, input_tokens):
+                    yield chunk
+            return StreamingResponse(
+                _muse_spark_anthropic_sse(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         return StreamingResponse(
             _zen_stream_anthropic_with_retry(request, req_body, headers, user, oai_messages, model, input_tokens, session_id),
             media_type="text/event-stream",
