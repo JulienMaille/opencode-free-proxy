@@ -12,3 +12,8 @@ build/
 dist/
 *.spec
 opencode-free-proxy.exe
+diag/
+.omp/
+.pi/
+.tmp*
+icon_preview.png
