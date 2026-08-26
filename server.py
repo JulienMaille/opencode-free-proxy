@@ -391,12 +391,44 @@ def _openai_stream_error(
     error_type: str = "upstream_error",
     code: str | None = None,
 ) -> str:
-    """Return a terminal OpenAI SSE error event."""
+    """Return a terminal OpenAI SSE sequence that always carries finish_reason.
+
+    The wire error object is emitted first for compatibility, then a normal
+    assistant chunk carries ``message`` as content and closes with
+    ``finish_reason: "stop"`` followed by ``[DONE]``. Clients that hard-fail
+    when a stream ends without any finish_reason (observed as "OpenAI
+    completions stream closed before a finish_reason was received") instead
+    receive a completed turn whose text explains the failure.
+    """
     error = {"message": message, "type": error_type}
     if code:
         error["code"] = code
+    cid = oc_id("chatcmpl")
+    now = int(time.time())
+    content_chunk = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": now,
+        "model": "",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": f"[upstream error] {message}"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    stop_chunk = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": now,
+        "model": "",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
     return (
         f"data: {json.dumps({'error': error})}\n\n"
+        f"data: {json.dumps(content_chunk)}\n\n"
+        f"data: {json.dumps(stop_chunk)}\n\n"
         "data: [DONE]\n\n"
     )
 
@@ -435,6 +467,42 @@ def _is_context_limit_error(data: dict | None = None, body: str = "") -> bool:
         or "too many tokens" in text
         or ("requested" in text and "tokens" in text and "prompt" in text)
     )
+def _is_region_error(data: dict | None = None, body: str = "") -> bool:
+    """Recognize geo-restriction errors that depend on the proxy's exit country.
+
+    Unlike context/rate errors, a ``RegionError`` is proxy-specific: the same
+    request routed through a proxy in an allowed country succeeds. It must be
+    treated as a proxy failure (blacklist + rotate), not a terminal upstream
+    error that repeats identically on every proxy.
+    """
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        error = {}
+    etype = str(error.get("type") or "").lower()
+    if "region" in etype:
+        return True
+    text = " ".join(
+        str(v) for v in (error.get("message"), body) if v is not None
+    ).lower()
+    return "not available in your country" in text
+
+
+def _is_promotion_ended_error(data: dict | None = None, body: str = "") -> bool:
+    """Recognize entitlement errors for a model whose free promotion ended.
+
+    Observed as ``{"type":"ModelError","message":"Free promotion has ended
+    for ... Free"}`` (HTTP 401). This repeats identically on every proxy and
+    every retry — it is account/entitlement level, not transport level — so
+    retrying is pure waste. The model is dead until upstream re-lists it.
+    """
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        error = {}
+    etype = str(error.get("type") or "").strip().lower()
+    text = " ".join(
+        str(v) for v in (error.get("message"), body) if v is not None
+    ).lower()
+    return "promotion has ended" in text or etype == "modelerror"
 
 
 def _blocks_text(content) -> str:
@@ -1213,12 +1281,34 @@ async def _zen_request_with_retry(
         if resp.status_code >= 400:
             err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
             is_context_exceeded = _is_context_limit_error(data, body_text)
-            _log(f"[zen] Error {resp.status_code}: {err_msg}")
-            # Not a proxy failure: 4xx/5xx are upstream or request errors that
-            # repeat identically on every proxy, so never blacklist for them.
-            if is_context_exceeded:
-                _log("[zen] Context limit error; not retrying on another proxy")
-            if not is_context_exceeded and attempt < attempts:
+            is_region_blocked = _is_region_error(data, body_text)
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Error {resp.status_code}: {err_msg} tools={'yes' if req_body.get('tools') else 'no'} stream={req_body.get('stream')} body={body_text[:300]!r}")
+            if resp.status_code == 400:
+                _log_reasoning_diag(req_body)
+                _dump_400_body(req_body, body_text, proxy_addr)
+            if is_region_blocked:
+                # Geo-restriction is proxy-specific: blacklist this proxy and
+                # rotate to a different one on the next attempt.
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.report_region_block(proxy_addr)
+                _log(f"[zen] Region-blocked via {proxy_addr}; rotating proxy")
+                if attempt < attempts:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content={"error": {"message": err_msg, "type": "upstream_error"}},
+                )
+            # Not a proxy failure in general — a 503 "Endpoint is
+            # unavailable" from the Console is upstream capacity-shaped and
+            # observed to clear on retry, sometimes only after several
+            # attempts through the SAME exit (streaks up to 14). Keep the
+            # current proxy (sticky selection) so retries reuse the healthy
+            # path instead of hopping between exits; never blacklist.
+            # Retry only 5xx (transient upstream). 4xx are request problems:
+            # a rejected body ([1210] Invalid API parameter) never heals via
+            # backoff or proxy rotation, so fail fast like context-limit.
+            if resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
                 await _backoff(attempt)
                 continue
             return JSONResponse(
@@ -1243,6 +1333,7 @@ async def _zen_request_with_retry(
                 _msg["content"] if isinstance(_msg["content"], str) else "",
                 _msg.get("reasoning_content") or _msg.get("reasoning") or "",
             )
+        _log(f"[zen] OK [{model}|{proxy_addr or 'direct'}] response complete")
         return data
 
     if last_error:
@@ -1269,8 +1360,18 @@ async def _zen_stream_with_retry(
     """Streaming Zen API call with proxy pool retry on 429/403 and ReadError recovery."""
     last_error = None
     attempts = MAX_RETRIES if max_retries is None else max_retries
+    finish_delivered = False  # True once a finish_reason chunk was forwarded
+    tool_streamed = False  # True once a tool-call fragment was forwarded
+    continuations = 0  # mid-stream resume attempts (see MAX_STREAM_CONTINUATIONS)
 
-    for attempt in range(attempts + 1):
+    attempt = 0
+    while True:
+        # Total work cap: plain retries (attempts) + mid-stream continuations
+        # (MAX_STREAM_CONTINUATIONS) share one counter, so 4 torn-stream resumes
+        # consume attempt slots and can starve a subsequent connect retry.
+        # This is intentional — documents bounded total work (attempts+1 + 4 max).
+        if attempt > attempts + MAX_STREAM_CONTINUATIONS:
+            break
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
@@ -1301,19 +1402,51 @@ async def _zen_stream_with_retry(
             client = _stream_default_client
             proxy_addr = None
 
+        if client is None:
+            err = RuntimeError(
+                f"no http client (model={model} proxy={proxy_addr or 'direct'} "
+                f"pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'} "
+                f"attempt={attempt})"
+            )
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream client is None: {_exc_desc(err)}")
+            err.__cause__ = last_error
+            last_error = err
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.report_failure(proxy_addr, hard=True)
+            # Force a fresh selection next loop; also try direct fallback immediately
+            if PROXY_POOL_ENABLED:
+                proxy_pool.current = None
+            client = _stream_default_client
+            proxy_addr = None
+            if client is None:
+                yield _openai_stream_error(f"Stream client unavailable: {_exc_desc(err)}", "upstream_error", "transport_error")
+                return
+            _log(f"[zen] Retrying with direct client after None client (attempt {attempt})")
         try:
             upstream_request = client.build_request(
                 "POST", "/zen/v1/chat/completions", json=req_body, headers=headers
             )
             resp = await client.send(upstream_request, stream=True)
         except Exception as e:
-            _log(f"[zen] Stream request failed (attempt {attempt}): {_exc_desc(e)}")
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream request failed (attempt {attempt} pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'}): {_exc_desc(e)}")
             if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_failure(proxy_addr)
+                proxy_pool.report_failure(
+                    proxy_addr,
+                    hard=isinstance(
+                        e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError)
+                    ),
+                )
             last_error = e
             if attempt < attempts:
                 await _backoff(attempt)
-            continue
+                attempt += 1
+                continue
+            yield _openai_stream_error(
+                f"Stream request failed: {_exc_desc(e)}",
+                "upstream_error",
+                "transport_error",
+            )
+            return
 
         if resp.status_code == 429:
             try:
@@ -1330,10 +1463,11 @@ async def _zen_stream_with_retry(
                 await resp.aclose()
                 if attempt < attempts:
                     await _backoff(attempt)
+                    attempt += 1
                     continue
                 yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
                 return
-            _log(f"[zen] Stream 429 (attempt {attempt}): {err_msg}")
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream 429 (attempt {attempt}): {err_msg}")
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.report_ratelimit(proxy_addr)
             await resp.aclose()
@@ -1354,29 +1488,59 @@ async def _zen_stream_with_retry(
                 await resp.aclose()
                 if attempt < attempts:
                     await _backoff(attempt)
+                    attempt += 1
                     continue
                 yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
                 return
-            if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_success(proxy_addr)
             body_text = raw.decode("utf-8", errors="replace")
+            body_preview = raw[:2000] if raw else b"<empty body>"
+            if not raw:
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream error {resp.status_code}: empty body (headers try to diagnose proxy vs upstream)")
             try:
                 data = json.loads(body_text)
             except (json.JSONDecodeError, TypeError, ValueError):
                 data = {}
-            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}" + ("" if body_text.strip() else " (empty body)")
             is_context_exceeded = _is_context_limit_error(data, body_text)
-            _log(f"[zen] Stream error {resp.status_code}: {raw[:500]}")
+            is_region_blocked = _is_region_error(data, body_text)
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream error {resp.status_code}: {body_preview!r} len={len(raw)}")
             if resp.status_code == 400:
                 _log_reasoning_diag(req_body)
 
-            # Not a proxy failure: 4xx/5xx are upstream or request errors that
-            # repeat identically on every proxy, so never blacklist for them.
+            if is_region_blocked:
+                # Geo-restriction is proxy-specific: this proxy's exit country is
+                # blocked for the model. Blacklist it and rotate to a different
+                # proxy instead of retrying through the same (or another) blocked
+                # region. Never record it as a success.
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.report_region_block(proxy_addr)
+                _log(f"[zen] Region-blocked via {proxy_addr}; rotating proxy")
+                await resp.aclose()
+                if attempt < attempts:
+                    await _backoff(attempt)
+                    attempt += 1
+                    continue
+                yield _openai_stream_error(err_msg, "upstream_error", "region_blocked")
+                return
+
+            # Not a proxy failure: 4xx/5xx are upstream or request errors
+            # that repeat identically on every proxy, so never blacklist for
+            # them. A 503 is upstream capacity: keep the current exit and let
+            # the retry below ride it out (no report_success — it was not
+            # healthy for this call).
+            if _is_promotion_ended_error(data, body_text):
+                # Entitlement error: identical on every proxy/retry. Retire
+                # the model and terminate the stream immediately.
+                await resp.aclose()
+                _mark_model_dead(model)
+                yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
+                return
             if is_context_exceeded:
                 _log("[zen] Context limit error; not retrying on another proxy")
             await resp.aclose()
-            if not is_context_exceeded and attempt < attempts:
+            if resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
                 await _backoff(attempt)
+                attempt += 1
                 continue
             yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
             return
@@ -1414,6 +1578,7 @@ async def _zen_stream_with_retry(
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_success(proxy_addr)
                         stream_completed = True
+                        _log(f"[zen] OK [{model}|{proxy_addr or 'direct'}] stream complete")
                         if session_id and _reason_buf and _content_buf:
                             _remember_reasoning(session_id, _content_buf, _reason_buf)
                         yield line + "\n\n"
@@ -1467,6 +1632,10 @@ async def _zen_stream_with_retry(
                                 "rate_limit_exceeded",
                             )
                             return
+                        if _is_promotion_ended_error(piece, line):
+                            _mark_model_dead(model)
+                            yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
+                            return
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
                             break
@@ -1474,7 +1643,7 @@ async def _zen_stream_with_retry(
                         return
 
                     # Capture emitted reasoning_content for re-injection on later turns
-                    if session_id and '"delta"' in line:
+                    if '"delta"' in line:
                         choices = piece.get("choices")
                         first_choice = choices[0] if isinstance(choices, list) and choices else {}
                         if not isinstance(first_choice, dict):
@@ -1486,9 +1655,14 @@ async def _zen_stream_with_retry(
                             _reason_buf += d["reasoning_content"]
                         if d.get("content"):
                             _content_buf += d["content"]
+                        if d.get("tool_calls"):
+                            tool_streamed = True
                         fr = first_choice.get("finish_reason")
                         if fr:
-                            if _reason_buf and _content_buf:
+                            if fr == "tool_calls":
+                                tool_streamed = True
+                            finish_delivered = True
+                            if session_id and _reason_buf and _content_buf:
                                 _remember_reasoning(session_id, _content_buf, _reason_buf)
                             _reason_buf = ""
                             _content_buf = ""
@@ -1504,17 +1678,48 @@ async def _zen_stream_with_retry(
                                 u.get("prompt_cache_miss_tokens") or 0,
                             )
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
-                _log(f"[zen] Stream interrupted: {_exc_desc(e)}")
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream interrupted: {_exc_desc(e)}")
                 last_error = e
-                # A torn-down tunnel is a proxy failure: let the first retry
-                # reconnect through this proxy; a second failure makes
-                # report_failure clear self.current and rotate away from it.
+                # A torn-down tunnel cannot carry this stream further; rotate
+                # away immediately rather than giving the same proxy another
+                # chance.
                 if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_failure(proxy_addr)
-                # Never retry once bytes have already been sent to the client; a
-                # fresh request would replay the whole stream and corrupt output.
-                if not streamed_any and attempt < attempts and not await _client_gone(request):
+                    proxy_pool.report_stream_failure(proxy_addr)
+                if finish_delivered:
+                    # The client already saw finish_reason; the turn completed.
+                    # Just terminate the stream cleanly instead of failing it.
+                    yield "data: [DONE]\n\n"
+                    return
+                if (
+                    (not streamed_any or (not _content_buf and not tool_streamed))
+                    and attempt < attempts
+                    and not await _client_gone(request)
+                ):
+                    # Nothing was delivered, or only transient thinking — no
+                    # answer text or tool fragments reached the client:
+                    # replaying the request is safe and the model restarts
+                    # cleanly.
                     retry_stream = True
+                elif (
+                    continuations < MAX_STREAM_CONTINUATIONS
+                    and not tool_streamed
+                    and _content_buf
+                    and not await _client_gone(request)
+                ):
+                    # Resume: replay the request with the partial assistant
+                    # output appended so the model continues from the cutoff
+                    # instead of replaying the whole turn. Requires real
+                    # content: upstream rejects assistant messages where
+                    # content and tool_calls are both unset.
+                    continuations += 1
+                    req_body = _continuation_body(req_body, _content_buf, _reason_buf)
+                    _content_buf = ""
+                    _reason_buf = ""
+                    retry_stream = True
+                    _log(
+                        f"[zen] Continuing stream (attempt {attempt + 1}, "
+                        f"continuation {continuations})"
+                    )
                 else:
                     yield _openai_stream_error(
                         f"Stream interrupted: {_exc_desc(e)}",
@@ -1529,15 +1734,53 @@ async def _zen_stream_with_retry(
                 pass
         if retry_stream:
             await _backoff(attempt)
+            attempt += 1
             continue
         if not stream_completed:
-            err = ValueError("upstream stream ended before [DONE]")
-            _log(f"[zen] {_exc_desc(err)} (attempt {attempt})")
-            if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_failure(proxy_addr)
+            preview = (_content_buf[:120] + "…") if len(_content_buf) > 120 else _content_buf
+            preview = preview.replace("\n", " ")
+            detail = (
+                f"streamed_any={streamed_any} "
+                f"content_len={len(_content_buf)} reason_len={len(_reason_buf)} "
+                f"tool_streamed={tool_streamed} finish_delivered={finish_delivered} "
+                f"stream_completed={stream_completed} preview={preview!r}"
+            )
+            err = ValueError(f"upstream stream ended before [DONE] ({detail})")
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] {_exc_desc(err)} (attempt {attempt} pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'})")
+            # Graceful upstream close after bytes were delivered is not a
+            # proxy/transport failure — the model truncated the turn (often
+            # mid-tool-call). Blacklisting the exit burns good proxies.
+            # Only hard-blacklist when nothing was delivered at all.
+            if PROXY_POOL_ENABLED and proxy_addr and not streamed_any:
+                proxy_pool.report_stream_failure(proxy_addr)
+            elif PROXY_POOL_ENABLED and proxy_addr and streamed_any:
+                # Rotate away from this connection without poisoning the pool
+                try:
+                    proxy_pool._evict_client(proxy_addr)
+                except Exception:
+                    pass
+                if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
+                    proxy_pool.current = None
             last_error = err
-            if not streamed_any and attempt < attempts:
+            if finish_delivered:
+                yield "data: [DONE]\n\n"
+                return
+            if (not streamed_any or (not _content_buf and not tool_streamed)) and attempt < attempts:
                 await _backoff(attempt)
+                attempt += 1
+                continue
+            if (
+                continuations < MAX_STREAM_CONTINUATIONS
+                and not tool_streamed
+                and _content_buf
+                and not await _client_gone(request)
+            ):
+                continuations += 1
+                req_body = _continuation_body(req_body, _content_buf, _reason_buf)
+                _content_buf = ""
+                _reason_buf = ""
+                await _backoff(attempt)
+                attempt += 1
                 continue
             yield _openai_stream_error(str(err), "upstream_error", "incomplete_stream")
         return
@@ -1561,7 +1804,7 @@ async def _zen_stream_anthropic_with_retry(
     session_id: str = None,
     max_retries: int = None,
 ):
-    """Anthropic-format streaming with proxy pool retry on 429."""
+    """Anthropic-format streaming with proxy pool retry on 429 and ReadError recovery."""
     msg_id = oc_id("msg")
     content_idx = 0
     tool_idx = -1
@@ -1573,6 +1816,9 @@ async def _zen_stream_anthropic_with_retry(
     _reason_buf = ""
     _content_buf = ""
     attempts = MAX_RETRIES if max_retries is None else max_retries
+    continuations = 0  # mid-stream resume attempts (see MAX_STREAM_CONTINUATIONS)
+    finish_delivered = False  # True once the terminal finish_reason chunk was emitted
+    tool_streamed = False  # True once an input_json_delta / tool block was emitted
 
     def send_sse(event: str, data: dict) -> str:
         nonlocal streamed_any
@@ -1589,7 +1835,12 @@ async def _zen_stream_anthropic_with_retry(
             idx.append(i + offset)
         return idx
 
-    for attempt in range(attempts + 1):
+    attempt = 0
+    while True:
+        # Total work cap: plain retries (attempts) + continuations share one counter.
+        # It's intentional — see _zen_stream_with_retry.
+        if attempt > attempts + MAX_STREAM_CONTINUATIONS:
+            break
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
@@ -1644,13 +1895,30 @@ async def _zen_stream_anthropic_with_retry(
                         data = {}
                     err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
                     is_context_exceeded = _is_context_limit_error(data, body_text)
+                    is_region_blocked = _is_region_error(data, body_text)
                     _log(f"[zen] Anthropic stream error {resp.status_code}: {raw[:300]}")
+                    if is_region_blocked:
+                        # Geo-restriction is proxy-specific: blacklist and rotate.
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.report_region_block(proxy_addr)
+                        _log(f"[zen] Region-blocked via {proxy_addr}; rotating proxy")
+                        if attempt < attempts:
+                            await _backoff(attempt)
+                            attempt += 1
+                            continue
+                        yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
+                        return
                     # Not a proxy failure: 4xx/5xx are upstream or request
                     # errors that repeat identically on every proxy.
+                    if _is_promotion_ended_error(data, body_text):
+                        _mark_model_dead(model)
+                        yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"{model} is no longer available: {err_msg}"}})
+                        return
                     if is_context_exceeded:
                         _log("[zen] Context limit error; not retrying on another proxy")
-                    if not is_context_exceeded and attempt < attempts:
+                    if resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
                         await _backoff(attempt)
+                        attempt += 1
                         continue
                     yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                     return
@@ -1669,6 +1937,14 @@ async def _zen_stream_anthropic_with_retry(
                             if is_rate_limit:
                                 yield send_sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err_msg + " (free model rate limit)"}})
                                 return
+                            try:
+                                _piece = json.loads(raw_line.strip()[6:] if raw_line.strip().startswith("data: ") else raw_line)
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                _piece = {}
+                            if _is_promotion_ended_error(_piece, raw_line):
+                                _mark_model_dead(model)
+                                yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"{model} is no longer available: {err_msg}"}})
+                                return
                             if attempt < attempts:
                                 break
                             yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
@@ -1677,16 +1953,16 @@ async def _zen_stream_anthropic_with_retry(
                     if raw_line.startswith("data: "):
                         payload = raw_line[6:].strip()
                         if payload == "[DONE]":
-                            for i in close_indices():
-                                yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
-                            yield send_sse("message_delta", {
-                                "type": "message_delta",
-                                "delta": {"stop_reason": "end_turn"},
-                                "usage": {"output_tokens": output_tokens},
-                            })
+                            if not finish_delivered:
+                                for i in close_indices():
+                                    yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
+                                yield send_sse("message_delta", {
+                                    "type": "message_delta",
+                                    "delta": {"stop_reason": "end_turn"},
+                                    "usage": {"output_tokens": output_tokens},
+                                })
                             yield send_sse("message_stop", {"type": "message_stop"})
                             return
-
                         try:
                             parsed = json.loads(payload)
                         except json.JSONDecodeError:
@@ -1706,18 +1982,15 @@ async def _zen_stream_anthropic_with_retry(
                             continue
 
                         # Capture upstream reasoning for re-injection in this session
-                        if session_id and (
-                            delta.get("reasoning_content") or ((parsed.get("choices") or [{}])[0].get("finish_reason"))
-                        ):
-                            if delta.get("reasoning_content"):
-                                _reason_buf += delta["reasoning_content"]
-                            if delta.get("content"):
-                                _content_buf += delta["content"]
-                            if (parsed.get("choices") or [{}])[0].get("finish_reason"):
-                                if _reason_buf and _content_buf:
-                                    _remember_reasoning(session_id, _content_buf, _reason_buf)
-                                _reason_buf = ""
-                                _content_buf = ""
+                        if delta.get("reasoning_content"):
+                            _reason_buf += delta["reasoning_content"]
+                        if delta.get("content"):
+                            _content_buf += delta["content"]
+                        if (parsed.get("choices") or [{}])[0].get("finish_reason"):
+                            if session_id and _reason_buf and _content_buf:
+                                _remember_reasoning(session_id, _content_buf, _reason_buf)
+                            _reason_buf = ""
+                            _content_buf = ""
 
                         if not headers_sent:
                             headers_sent = True
@@ -1743,6 +2016,7 @@ async def _zen_stream_anthropic_with_retry(
                         for tc in delta.get("tool_calls", []):
                             idx = tc.get("index", 0)
                             if idx > tool_idx:
+                                tool_streamed = True
                                 if tool_idx == -1 and content_idx > 0:
                                     yield send_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
                                     text_closed = True
@@ -1763,6 +2037,9 @@ async def _zen_stream_anthropic_with_retry(
 
                         finish_reason = (parsed.get("choices") or [{}])[0].get("finish_reason")
                         if finish_reason:
+                            if finish_reason == "tool_calls":
+                                tool_streamed = True
+                            finish_delivered = True
                             for i in close_indices():
                                 yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
 
@@ -1777,13 +2054,59 @@ async def _zen_stream_anthropic_with_retry(
                                 "delta": {"stop_reason": stop_reason},
                                 "usage": {"output_tokens": output_tokens},
                             })
-                            yield send_sse("message_stop", {"type": "message_stop"})
-                            return
-
-                # If we broke out before emitting headers, retry with another proxy.
+                # If we broke out before emitting headers (e.g. an in-body
+                # upstream error), replay on a fresh attempt without touching
+                # the pool: application errors are not proxy failures.
                 if not headers_sent and attempt < attempts and not await _client_gone(request):
                     await _backoff(attempt)
+                    attempt += 1
                     continue
+                # The upstream stream ended without a finish_reason.
+                preview = (_content_buf[:120] + "…") if len(_content_buf) > 120 else _content_buf
+                preview = preview.replace("\n", " ")
+                detail = (
+                    f"headers_sent={headers_sent} streamed_any={streamed_any} "
+                    f"content_len={len(_content_buf)} reason_len={len(_reason_buf)} "
+                    f"tool_streamed={tool_streamed} finish_delivered={finish_delivered} preview={preview!r}"
+                )
+                _log(f"[zen] Anthropic stream incomplete (attempt {attempt} proxy={proxy_addr or 'direct'} pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'} {detail})")
+                last_error = ValueError(f"upstream stream closed before finish_reason ({detail})")
+                if PROXY_POOL_ENABLED and proxy_addr and not streamed_any:
+                    proxy_pool.report_stream_failure(proxy_addr)
+                elif PROXY_POOL_ENABLED and proxy_addr and streamed_any:
+                    try:
+                        proxy_pool._evict_client(proxy_addr)
+                    except Exception:
+                        pass
+                    if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
+                        proxy_pool.current = None
+                if finish_delivered:
+                    # Terminal finish_reason was already delivered; nothing
+                    # more to emit.
+                    return
+                if (
+                    continuations < MAX_STREAM_CONTINUATIONS
+                    and not tool_streamed
+                    and _content_buf
+                    and not await _client_gone(request)
+                ):
+                    continuations += 1
+                    req_body = _continuation_body(req_body, _content_buf, _reason_buf)
+                    _content_buf = ""
+                    _reason_buf = ""
+                    _log(
+                        f"[zen] Continuing anthropic stream (attempt {attempt + 1}, "
+                        f"continuation {continuations})"
+                    )
+                    await _backoff(attempt)
+                    attempt += 1
+                    continue
+                if headers_sent:
+                    # Message started but did not finish: close open blocks
+                    # and emit a clean error event.
+                    for i in close_indices():
+                        yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
+                yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": "Stream interrupted: upstream closed the connection before completing the message"}})
                 return
 
         except Exception as e:
@@ -1791,12 +2114,43 @@ async def _zen_stream_anthropic_with_retry(
             # Only transport-level failures are proxy failures; a bug in our
             # translation code must not blacklist a healthy proxy.
             if PROXY_POOL_ENABLED and proxy_addr and isinstance(e, httpx.HTTPError):
-                proxy_pool.report_failure(proxy_addr)
+                proxy_pool.report_stream_failure(proxy_addr)
             last_error = e
-            # Never retry once bytes have already been sent to the client; a
-            # fresh request would replay the whole stream and corrupt output.
-            if not streamed_any and attempt < attempts and not await _client_gone(request):
+            if headers_sent and finish_delivered:
+                # Terminal finish_reason already delivered; stop cleanly.
+                return
+            # Never replay once answer bytes reached the client; but if only
+            # thinking was streamed (no content, no tool fragments), a fresh
+            # request is safe.
+            if (
+                (not streamed_any or (not _content_buf and not tool_streamed))
+                and attempt < attempts
+                and not await _client_gone(request)
+            ):
                 await _backoff(attempt)
+                attempt += 1
+                continue
+            if (
+                headers_sent
+                and continuations < MAX_STREAM_CONTINUATIONS
+                and not tool_streamed
+                and _content_buf
+                and not await _client_gone(request)
+            ):
+                # Resume: replay with partial output appended so the model
+                # continues instead of replaying the whole turn. Requires
+                # real content: upstream rejects assistant messages where
+                # content and tool_calls are both unset.
+                continuations += 1
+                req_body = _continuation_body(req_body, _content_buf, _reason_buf)
+                _content_buf = ""
+                _reason_buf = ""
+                _log(
+                    f"[zen] Continuing anthropic stream (attempt {attempt + 1}, "
+                    f"continuation {continuations}); {_exc_desc(e)}"
+                )
+                await _backoff(attempt)
+                attempt += 1
                 continue
             if not streamed_any:
                 yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": _exc_desc(e)}})
@@ -1805,7 +2159,7 @@ async def _zen_stream_anthropic_with_retry(
                 # the aborted attempt and terminate the message cleanly.
                 for i in close_indices():
                     yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
-                yield send_sse("message_stop", {"type": "message_stop"})
+                yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": "Stream interrupted: upstream closed the connection before completing the message"}})
             return
 
     if not headers_sent:
