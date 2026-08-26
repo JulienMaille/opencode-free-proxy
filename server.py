@@ -6,6 +6,7 @@ import os
 import random
 import secrets
 import sys
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -133,7 +134,11 @@ def auth(request: Request) -> str | None:
 
 def _log(*a):
     msg = f"[{time.strftime('%H:%M:%S')}] " + " ".join(str(x) for x in a)
-    if "[zen]" in msg:
+    if "[zen] OK" in msg or "buffered fallback" in msg:
+        print(f"\x1b[32m{msg}\x1b[0m", flush=True)
+    elif "Stream error 400" in msg or "400 diag" in msg:
+        print(f"\x1b[33m{msg}\x1b[0m", flush=True)
+    elif "[zen]" in msg:
         print(f"\x1b[31m{msg}\x1b[0m", flush=True)
     elif "[pool]" in msg:
         print(f"\x1b[33m{msg}\x1b[0m", flush=True)
@@ -293,17 +298,55 @@ _load_reasoning()
 
 
 def _exc_desc(e: Exception | None) -> str:
-    """Human-readable exception for logs: type name always, message when present."""
+    """Human-readable exception for logs: type chain + messages + repr fallback."""
     if e is None:
         return "unknown"
-    desc = type(e).__name__
-    if str(e):
-        desc += f": {e}"
-    cause = getattr(e, "__cause__", None)
-    if cause is not None and cause is not e:
-        desc += f" (caused by {_exc_desc(cause)})"
-    return desc
-
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = e
+    depth = 0
+    while cur is not None and id(cur) not in seen and depth < 4:
+        seen.add(id(cur))
+        t = type(cur).__name__
+        msg = str(cur).strip()
+        # httpx often wraps an empty ConnectError around an OS-level error; str() may be "".
+        # Fall back to args/repr so the log is not just "ConnectError (caused by ConnectError)".
+        if not msg:
+            if getattr(cur, "args", None):
+                try:
+                    msg = repr(cur.args[0]) if len(cur.args) == 1 else repr(cur.args)
+                except Exception:
+                    msg = ""
+            if not msg or msg in ("()", "''", '""'):
+                try:
+                    msg = repr(cur)
+                except Exception:
+                    msg = ""
+                # Trim verbose httpx repr to the first line
+                if "\n" in msg:
+                    msg = msg.splitlines()[0]
+                if len(msg) > 400:
+                    msg = msg[:400] + "…"
+        seg = t if not msg else f"{t}: {msg}"
+        # Attach request URL if httpx error carries it (ConnectError.request etc.)
+        req = getattr(cur, "request", None)
+        if req is not None:
+            try:
+                url = getattr(req, "url", None)
+                if url:
+                    seg += f" req={url}"
+            except Exception:
+                pass
+        parts.append(seg)
+        nxt = getattr(cur, "__cause__", None)
+        if nxt is None:
+            nxt = getattr(cur, "__context__", None)
+        # Avoid infinite loop on self-referential context
+        if nxt is cur:
+            break
+        cur = nxt
+        depth += 1
+    return " (caused by ".join(parts) + ")" * (len(parts) - 1) if len(parts) > 1 else parts[0]
 
 def _first_chunk_error(raw_line: str) -> tuple[str, bool] | None:
     """Classify an SSE chunk that is an upstream error payload.
@@ -1446,6 +1489,43 @@ def _prune_dangling_tools(messages: list[dict]) -> list[dict]:
     return out
 
 
+_400_DUMP_DIR = _BASE_DIR / "diag"
+_400_DUMP_MAX_PER_MODEL = 3
+
+
+def _dump_400_body(req_body: dict, upstream_body: str, proxy_addr: str | None):
+    """Persist a rejected 400 request body for offline diagnosis.
+
+    The [1210] "Invalid API parameter" rejection is deterministic per body
+    (same session fails on every proxy while others succeed), so the payload
+    itself must be inspected. Bounded: at most _400_DUMP_MAX_PER_MODEL files
+    per model, then it stops writing — enough to capture one full episode.
+    """
+    try:
+        model = str(req_body.get("model") or "unknown")
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", model)
+        model_dir = _400_DUMP_DIR / safe
+        model_dir.mkdir(parents=True, exist_ok=True)
+        existing = list(model_dir.glob("*.json"))
+        if len(existing) >= _400_DUMP_MAX_PER_MODEL:
+            return
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        payload = {
+            "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "proxy": proxy_addr,
+            "upstream_error": upstream_body[:2000],
+            "request": req_body,
+        }
+        path = model_dir / f"req_{stamp}_{secrets.token_hex(3)}.json"
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+        _log(f"[zen] 400 body dumped: {path.name} ({len(existing) + 1}/{_400_DUMP_MAX_PER_MODEL})")
+    except Exception as e:
+        _log(f"[zen] 400 body dump failed: {_exc_desc(e)}")
+
+
 def _log_reasoning_diag(req_body: dict):
     """Dump the ordered message layout (roles + tool/reasoning detail) whenever the
     upstream rejects a 400, to diagnose context/ordering problems on session switch."""
@@ -1832,10 +1912,5 @@ if __name__ == "__main__":
     print("  Anthropic: POST /v1/messages")
     print("  Models:    GET  /v1/models")
     print("  Health:    GET  /health")
-    print(f"  Models: {', '.join(_models_cache)}")
-    if API_KEY:
-        print(f"  API key:   {API_KEY[:8]}...")
-    else:
-        print("  API key:   (none - open access)")
 
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
