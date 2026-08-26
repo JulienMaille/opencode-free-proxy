@@ -53,10 +53,11 @@ HOT_MIN = 5
 HOT_TTL = 600
 RATE_LIMIT_TTL = 30 * 60
 BLACKLIST_TTL = 120 * 60
-# Retries after the first attempt: 3 -> 4 total attempts, worst-case backoff
-# 1+2+4 = 7s. Each retry rotates to a fresh verified proxy, so more attempts
-# mostly add latency (up to ~94s at 10) for marginal recovery.
-MAX_RETRIES = 3
+# Retries after the first attempt: 5 -> 6 total attempts. Each retry rotates
+# to a fresh verified proxy; hard transport errors (connect timeout / proxy
+# unreachable) blacklist the exit immediately instead of consuming a second
+# attempt on it.
+MAX_RETRIES = 5
 EXHAUSTED_FORCE_REFRESH_INTERVAL = 30
 REQUEST_CONNECT_TIMEOUT = 5
 REQUEST_READ_TIMEOUT = 120
@@ -497,38 +498,95 @@ class ProxyPool:
         if self.current and self.current["address"] == target:
             self.current = None
 
-    def report_failure(self, addr: str | None = None):
+    def rotate_without_blacklist(self, addr: str | None = None):
+        """Drop sticky selection for ``addr`` WITHOUT blacklisting it.
+
+        For upstream capacity errors (503 "Endpoint is unavailable"): the same
+        proxy succeeds seconds later, so blacklisting would only shrink the
+        pool. Clearing ``current`` makes the next select() prefer a different
+        exit while this one stays eligible via the hot buffer.
+        """
+        target = addr or (self.current and self.current["address"])
+        if not target:
+            return
+        if self.current and self.current["address"] == target:
+            self.current = None
+
+    def report_failure(self, addr: str | None = None, hard: bool = False):
+        """Record a transport-level failure for ``addr``.
+
+        Soft failures (e.g. a single ReadError) get one grace retry on the
+        same exit; ``hard`` failures (connect timeout, proxy unreachable)
+        blacklist immediately — an exit that refuses connections is dead for
+        the rest of this request anyway.
+        """
         target = addr or (self.current and self.current["address"])
         if not target:
             return
         failures = self.transport_failures.get(target, 0) + 1
         self.transport_failures[target] = failures
         self._evict_client(target)
-        if failures < 2:
+        if not hard and failures < 2:
             _log(f"Transport failure {target} ({failures}/2); retrying same proxy")
             return
         self.blacklist[target] = time.time() + BLACKLIST_TTL
         self.transport_failures.pop(target, None)
-        _log(f"Blacklisted {target} after {failures} transport failures for {BLACKLIST_TTL // 60}m")
+        reason = "hard transport failure" if hard else f"{failures} transport failures"
+        _log(f"Blacklisted {target} after {reason} for {BLACKLIST_TTL // 60}m")
         if self.current and self.current["address"] == target:
             self.current = None
 
+    def _blacklist_and_rotate(self, addr: str | None, reason_tag: str):
+        """Shared: blacklist ``addr`` for BLACKLIST_TTL and clear sticky current."""
+        target = addr or (self.current and self.current["address"])
+        if not target:
+            return None
+        self.transport_failures.pop(target, None)
+        self.blacklist[target] = time.time() + BLACKLIST_TTL
+        self._evict_client(target)
+        _log(f"{reason_tag} {target}; blacklisted for {BLACKLIST_TTL // 60}m; rotating")
+        if self.current and self.current["address"] == target:
+            self.current = None
+        return target
+
+    def report_stream_failure(self, addr: str | None = None):
+        """A stream died mid-body (torn tunnel / incomplete chunked read)."""
+        self._blacklist_and_rotate(addr, "Stream failure; blacklisted")
+
+    def report_region_block(self, addr: str | None = None):
+        """A proxy returned a geo-restriction (RegionError) for the model."""
+        self._blacklist_and_rotate(addr, "Region-blocked")
+
     def report_success(self, addr: str | None = None):
         target = addr or (self.current and self.current["address"])
-        if target:
-            self.transport_failures.pop(target, None)
+        if not target:
+            return
+        had_failure = self.transport_failures.pop(target, None)
+        if had_failure and self.current and self.current["address"] == target:
+            # This request only succeeded after a transport failure on the
+            # same proxy (e.g. a stale keep-alive tunnel or a flaky SOCKS
+            # CONNECT). Don't keep it sticky for the next request: the 1/2
+            # strike never escalates because this success clears it, so the
+            # proxy would otherwise pay a ConnectError + retry on every
+            # subsequent request. Rotate so the next request starts on a
+            # fresh verified proxy; the flaky one stays in the hot buffer
+            # and still gets selected occasionally.
+            self.current = None
 
     def _evict_client(self, addr: str):
-        """Drop the pooled AsyncClient for a proxy that just failed, releasing
-        its connection pool (and any half-dead keep-alive sockets) and keeping
-        self._clients from growing without bound as proxies rotate."""
-        for clients in (self._clients, self._stream_clients):
-            c = clients.pop(f"socks5://{addr}", None)
-            if c is not None:
-                try:
-                    asyncio.ensure_future(c.aclose())
-                except Exception:
-                    pass
+        """Drop the pooled AsyncClient for a proxy that just failed.
+
+        The client is only removed from the selection dicts — it is NOT
+        closed here. Closing it would cancel every in-flight stream riding
+        the same exit (observed as sibling streams on other models dying at
+        the same second when one request tripped the blacklist). In-flight
+        responses hold their own transport references and finish naturally;
+        garbage collection reclaims the client once its last stream ends.
+        Bound by MAX_POOL_SIZE (≤5000 distinct proxy URLs → ≤10k clients).
+        Future: add LRU idle-close after HOT_TTL for idle clients.
+        """
+        self._clients.pop(f"socks5://{addr}", None)
+        self._stream_clients.pop(f"socks5://{addr}", None)
 
     def get_pool_state(self) -> str:
         now = time.time()
