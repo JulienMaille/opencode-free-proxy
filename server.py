@@ -446,18 +446,12 @@ def _blocks_text(content) -> str:
     return str(content) if content is not None else ""
 
 
-# Dynamically discovered free models from Zen API (fallback if fetch fails)
-_MODELS_FALLBACK = [
-    "deepseek-v4-flash-free",
-    "mimo-v2.5-free",
-    "ling-3.0-flash-free",
-    "nemotron-3-ultra-free",
-    "north-mini-code-free",
-    "laguna-s-2.1-free",
-]
-_models_cache: list[str] = list(_MODELS_FALLBACK)
+# Free models are always discovered live from the Zen API — no hardcoded
+# fallback list. The cache starts empty and fills within moments of startup.
+_models_cache: list[str] = []
 _models_meta: dict[str, dict] = {}  # model_id -> {name, limit, modalities}
-_MODELS_REFRESH_SECS = 18000  # refresh every 5 hours
+_dead_models: set[str] = set()  # ids rejected upstream (free promotion ended); excluded from rediscovery
+_MODELS_REFRESH_SECS = 43200  # safety-net refresh every 12h; unknown models trigger on-demand
 
 
 async def _fetch_free_models():
@@ -476,7 +470,7 @@ async def _fetch_free_models():
                 return
             data = r.json()
             all_models = [m["id"] for m in data.get("data", []) if isinstance(m, dict)]
-            free = [m for m in all_models if "free" in m.lower()]
+            free = [m for m in all_models if "free" in m.lower() and m not in _dead_models]
             if not free:
                 _log("[models] No free models found in Zen API, keeping cached")
                 return
@@ -507,17 +501,71 @@ async def _fetch_free_models():
         _log(f"[models] Fetch failed: {e}, keeping cached models")
 
 
+
+
+
+
 async def _periodic_model_refresh():
-    """Periodically refresh the free model list from Zen API."""
+    """Refresh the free model list on a slow cadence as a safety net.
+
+    Primary discovery happens at startup and on demand when a request names
+    an unknown model; this timer only catches models that appear and are
+    never requested.
+    """
     await _fetch_free_models()
     while True:
         await asyncio.sleep(_MODELS_REFRESH_SECS)
         await _fetch_free_models()
 
+async def _ensure_model_known(model: str) -> bool:
+    """Return True once ``model`` is in the discovered free list.
+
+    Unknown ids trigger an immediate discovery pass so a freshly published
+    free model is usable on the very next request instead of waiting for the
+    periodic refresh.
+    """
+    if model in _dead_models:
+        return False
+    if model in _models_cache:
+        return True
+    await _fetch_free_models()
+    return model in _models_cache
+
+
+def _mark_model_dead(model: str | None) -> bool:
+    """Drop a model the upstream refuses with a promotion-ended ModelError.
+
+    Removes it from the served list so clients get an immediate, clear
+    "Unknown model" instead of per-request 401s, and keeps it out of future
+    discovery passes. Returns True if this call retired it.
+    """
+    global _models_cache, _models_meta
+    if not model or model in _dead_models:
+        return False
+    _dead_models.add(model)
+    if model in _models_cache:
+        _models_cache = [m for m in _models_cache if m != model]
+        _models_meta.pop(model, None)
+    _log(f"[models] Retired {model} (upstream: free promotion ended)")
+    return True
+
 
 def _normalize_model(model: str) -> str:
-    """Strip ocf- prefix if present (backward compat)."""
-    return model[4:] if model.startswith("ocf-") else model
+    """Normalize a client model id to the bare Zen upstream id.
+
+    opencode sends ids like `opencode-local/muse-spark-1.2-contributor-free:high`:
+    `opencode-local/` is the provider prefix and `:high` is the reasoning-effort
+    suffix. Both are stripped, as is the legacy `ocf-` prefix.
+    """
+    if not model:
+        return model
+    if "/" in model:
+        model = model.rsplit("/", 1)[-1]
+    if ":" in model:
+        model = model.split(":", 1)[0]
+    if model.startswith("ocf-"):
+        model = model[4:]
+    return model
 
 
 def _normalize_role(role: str) -> str:
@@ -1694,6 +1742,8 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
 # ── Routes: OpenAI format ─────────────────────────────────────────
 
 async def list_models(request: Request):
+    if not _models_cache:
+        await _fetch_free_models()
     data = []
     for m in _models_cache:
         entry = {"id": m, "object": "model", "created": 1779000000, "owned_by": "opencode-free"}
@@ -1720,7 +1770,7 @@ async def chat_completions(request: Request):
     tool_choice = body.get("tool_choice")
 
     model = _normalize_model(model)
-    if model not in _models_cache:
+    if not await _ensure_model_known(model):
         return JSONResponse(
             status_code=400,
             content={"error": {"message": f"Unknown model: {model}. Available: {', '.join(_models_cache)}"}},
@@ -1766,7 +1816,7 @@ async def messages(request: Request):
 
     model = _normalize_model(model)
 
-    if model not in _models_cache:
+    if not await _ensure_model_known(model):
         return JSONResponse(
             status_code=400,
             content={"type": "error", "error": {"type": "invalid_request_error", "message": f"Unknown model: {model}. Available: {', '.join(_models_cache)}"}},
