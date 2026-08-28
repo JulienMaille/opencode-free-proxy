@@ -16,6 +16,7 @@ diag/
 .omp/
 .pi/
 .tmp*
+icon.ico
 icon_preview.png
 nvidia-api-keys.txt
 
