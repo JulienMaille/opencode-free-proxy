@@ -119,7 +119,66 @@ Your tool (opencode CLI, Cursor, curl, etc.)
   opencode.ai/zen/v1/       ← free tier API
 ```
 
-- **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
+> **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
+
+## NVIDIA NIM models
+
+In addition to the free Zen-tier models, the proxy can serve models directly
+from [NVIDIA NIM](https://integrate.api.nvidia.com). Address an NVIDIA model with
+the `nvidia/` (or `nvimin/`) prefix, e.g. `nvidia/deepseek-v4-pro-0813`.
+
+This requires `nvidia-api-keys.txt` in the same folder as `server.py` — one
+`nvapi-...` key per line. Add your own keys there (the file ships with a set of
+free-tier keys that are validated and cleaned periodically). The proxy auto-rotates
+that file on each request.
+
+```bash
+curl http://localhost:6446/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "nvidia/deepseek-v4-pro-0813",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+Supported model aliases (also work as `nvidia/<alias>`):
+
+- `nvidia/deepseek-v4-pro-0813`
+- `nvidia/deepseek-v4-flash-0731`
+- `nvidia/llama-3.2-11b-vision-instruct` (also exposed to the Anthropic
+  `POST /v1/messages` endpoint, with OpenAI↔Anthropic conversions applied)
+
+Any model id that already contains a `/` after the prefix (e.g.
+`nvidia/deepseek-ai/deepseek-v4-pro-0813`) is passed through to the NIM slug
+verbatim, so the full catalog of 80+ NIM models is usable.
+
+### NVIDIA key rotation
+
+NVIDIA free-tier `nvapi-*` keys are capped at ~40 RPM/account and are gated
+per-model on the free tier. The proxy rotates keys automatically:
+
+- Keys are handed out round-robin from `nvidia-api-keys.txt`.
+- A request that hits a **rate limit (429 / `FreeUsageLimitError`)** is retried with
+  the next key. A key that hits a rate limit **twice in a row** is rotated away and
+  put on a 60-second cooldown before reuse.
+- A per-key **404** (this key is not entitled to the model) advances to the next
+  key immediately so the whole pool is tried before failing.
+- `POST /v1/messages` (Anthropic) is supported: the proxy converts to OpenAI
+  format, calls NIM, and converts the result back to Anthropic SSE.
+
+Check key status with:
+
+```
+curl http://localhost:6446/health   # nvidia_keys: <count>, nvidia_models: [...]
+curl http://localhost:6446/v1/models # nvidia/* entries list available NIM routes
+```
+
+> Free-tier NIM keys have tight per-model quotas; for heavy/long-thinking
+> models a 404 may mean quota exhaustion for that model on that key, in which
+> case a different key in the file is used. Replace `nvidia-api-keys.txt` with
+> your own paid-tier keys for higher limits.
+
 - **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy gets one transport retry, then is blacklisted after its second transport failure; `429` responses temporarily skip the current proxy so the caller can retry through another IP.
 - **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
 
@@ -131,6 +190,101 @@ x-opencode-project: global
 x-opencode-request: msg_<unique_id>
 x-opencode-session: ses_<unique_id>
 ```
+
+## Client configuration
+
+Point any OpenAI/Anthropic-compatible tool at `http://127.0.0.1:6446/v1` (OpenAI)
+or `http://127.0.0.1:6446` (Anthropic `/v1/messages`). No auth is required
+unless you set an API key (see env vars above).
+
+### opencode
+
+Add a custom provider to `~/.config/opencode/opencode.jsonc` (or a project
+`opencode.jsonc`). Use `@ai-sdk/openai-compatible` and declare modalities per
+model so opencode knows which accept images — the `capabilities` key is
+**not** read by opencode; use `modalities` (+ `attachment: true` for image
+models):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local-openai/big-pickle",
+  "provider": {
+    "local-openai": {
+      "name": "Local OpenAI",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:6446/v1" },
+      "models": {
+        "big-pickle": {
+          "name": "Big Pickle",
+          "id": "big-pickle",
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 200000, "output": 32000 }
+        },
+        "mimo-v2.5-free": {
+          "name": "Mimo v2.5",
+          "id": "mimo-v2.5-free",
+          "reasoning": true,
+          "attachment": true,
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+          "limit": { "context": 200000, "output": 32000 }
+        },
+        "nvidia/kimi-k3": {
+          "name": "Kimi K3 (NVIDIA)",
+          "id": "nvidia/kimi-k3",
+          "reasoning": true,
+          "attachment": true,
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+          "limit": { "context": 131072, "output": 32768 }
+        }
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- The `id` must match the model the proxy serves (Zen free slugs like
+  `big-pickle`, or `nvidia/<alias>` for NIM models). The picker key is
+  `local-openai/<id>`.
+- `modalities.input` with `"image"` (plus `attachment: true`) is what makes
+  opencode allow image attachments; models without it are text-only and opencode
+  will refuse images for them.
+- Config is read **once at startup** — restart opencode after editing it.
+- select the model with `/models`.
+
+### oh-my-pi (omp)
+
+Full step-by-step config (provider + models in `~/.omp/agent/models.yml`,
+per-role thinking levels in `~/.omp/agent/config.yml`, verify commands) lives in
+[`docs/omp.md`](docs/omp.md). In short, reference the proxy's models as:
+
+```yaml
+providers:
+  opencode-local:
+    baseUrl: http://127.0.0.1:6446/v1
+    auth: none
+    api: openai-completions
+    # ... compat knobs (see docs/omp.md) ...
+    models:
+      - id: deepseek-v4-flash-free
+        reasoning: true
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 200000
+        maxTokens: 128000
+```
+
+then point roles at models with a `:low`/`:high`/`:max` reasoning suffix:
+
+```yaml
+modelRoles:
+  default: opencode-local/deepseek-v4-flash-free:high
+  vision: opencode-local/mimo-v2.5-free:high
+```
+
+NVIDIA models ride the same provider (`opencode-local/nvidia/kimi-k3:high`).
 
 ## License
 

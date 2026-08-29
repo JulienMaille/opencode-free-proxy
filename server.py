@@ -27,6 +27,9 @@ from proxy_pool import (
     STREAM_READ_TIMEOUT,
 )
 
+from nvidia_pool import pool as nvidia_keys
+from nvidia_proxy import is_nvidia_model, nvidia_model_id
+
 _BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
 # ── CLI args ───────────────────────────────────────────────────────
@@ -433,6 +436,15 @@ def _openai_stream_error(
     )
 
 
+def _transport_error_message(exc: BaseException) -> str:
+    """Build a mid-stream transport-failure message that harnesses (oh-my-pi)
+    auto-retry on transient errors. Its classifier regex-matches the message
+    text (e.g. ``connection.?error``), so prefix the raw cause with a standard
+    transient phrase; otherwise a dropped proxy connection reads as terminal
+    and the harness kills the session instead of retrying."""
+    return f"connection error: proxy dropped the upstream stream: {_exc_desc(exc)}"
+
+
 def _stream_preview(value: str, limit: int = 160) -> str:
     """Return a bounded, escaped preview suitable for diagnostics."""
     return repr(value[:limit])
@@ -519,6 +531,9 @@ def _blocks_text(content) -> str:
 _models_cache: list[str] = []
 _models_meta: dict[str, dict] = {}  # model_id -> {name, limit, modalities}
 _dead_models: set[str] = set()  # ids rejected upstream (free promotion ended); excluded from rediscovery
+# Free-tier ids whose name does not carry a "free" tag (models.dev cost == 0),
+# kept alongside name-tagged models so discovery doesn't drop them.
+_FREE_MODEL_EXTRA: set[str] = {"big-pickle"}
 _MODELS_REFRESH_SECS = 43200  # safety-net refresh every 12h; unknown models trigger on-demand
 
 
@@ -538,7 +553,7 @@ async def _fetch_free_models():
                 return
             data = r.json()
             all_models = [m["id"] for m in data.get("data", []) if isinstance(m, dict)]
-            free = [m for m in all_models if "free" in m.lower() and m not in _dead_models]
+            free = [m for m in all_models if ("free" in m.lower() or m in _FREE_MODEL_EXTRA) and m not in _dead_models]
             if not free:
                 _log("[models] No free models found in Zen API, keeping cached")
                 return
@@ -954,13 +969,28 @@ def _sampling_from(body: dict) -> dict:
     return {k: body[k] for k in _SAMPLING_KEYS if body.get(k) is not None}
 
 
+_NVIDIA_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
+
+
+def _nvidia_sampling_from(body: dict) -> dict:
+    """NVIDIA NIM also accepts reasoning_effort (low/medium/high) on reasoning models."""
+    return {k: body[k] for k in _NVIDIA_SAMPLING_KEYS if body.get(k) is not None}
+
+
 def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tokens=None, max_completion_tokens=None, sampling: dict | None = None):
     model = _normalize_model(model)
     req_body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
     if tools:
         req_body["tools"] = tools
     if tool_choice:
-        req_body["tool_choice"] = tool_choice
+        # Zen thinking mode rejects forced tool_choice (e.g. {"type":"function",
+        # "function":{"name":"..."}} or "none"). Downgrade to "auto" so the
+        # request passes thinking-mode validation; the model will still call
+        # the right tool based on context.
+        if tool_choice == "auto" or tool_choice == "none":
+            req_body["tool_choice"] = tool_choice
+        else:
+            req_body["tool_choice"] = "auto"
     if max_tokens is not None:
         req_body["max_tokens"] = max_tokens
     if max_completion_tokens is not None:
@@ -1209,21 +1239,21 @@ async def _zen_request_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            if not await proxy_pool.select():
+            p = await proxy_pool.select()
+            if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), "
                      f"forcing refresh")
                 await proxy_pool.force_refresh()
-                if not await proxy_pool.select():
+                p = await proxy_pool.select()
+                if p is None:
                     _log("[pool] Still no proxy after refresh, falling back to direct")
                     client = _default_client
                     proxy_addr = None
                 else:
-                    p = proxy_pool.current
                     proxy_addr = p["address"]
                     client = proxy_pool.get_client(f"socks5://{proxy_addr}")
                     _log(f"[pool] Retry {attempt}: using proxy {proxy_addr}")
             else:
-                p = proxy_pool.current
                 proxy_addr = p["address"]
                 client = proxy_pool.get_client(f"socks5://{proxy_addr}")
 
@@ -1232,109 +1262,90 @@ async def _zen_request_with_retry(
             proxy_addr = None
 
         try:
-            resp = await client.post(
-                "/zen/v1/chat/completions",
-                json=req_body,
-                headers=headers,
-            )
-        except Exception as e:
-            _log(f"[zen] Request failed (attempt {attempt}): {_exc_desc(e)}")
-            if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_failure(proxy_addr)
-            last_error = e
-            if attempt < attempts:
-                await _backoff(attempt)
-            continue
-
-        try:
-            body_bytes = await resp.aread()
-        except Exception as e:
-            _log(f"[zen] Response read failed (attempt {attempt}): {_exc_desc(e)}")
-            if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_failure(proxy_addr)
-            last_error = e
-            if attempt < attempts:
-                await _backoff(attempt)
-                continue
-            return JSONResponse(
-                status_code=502,
-                content={"error": {"message": f"Upstream response read failed: {_exc_desc(e)}", "type": "upstream_error"}},
-            )
-        if PROXY_POOL_ENABLED and proxy_addr:
-            proxy_pool.report_success(proxy_addr)
-        body_text = body_bytes.decode("utf-8", errors="replace")
-        try:
-            data = json.loads(body_bytes)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            data = {}
-
-        is_429 = resp.status_code == 429
-        is_rate_limit = is_429 or "FreeUsageLimitError" in body_text
-
-        if is_rate_limit:
-            err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
-            _log(f"[zen] 429 (attempt {attempt}): {err_msg}")
-            if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_ratelimit(proxy_addr)
-            return _local_rate_limit_response(err_msg + " (free model rate limit)")
-
-        if resp.status_code >= 400:
-            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-            is_context_exceeded = _is_context_limit_error(data, body_text)
-            is_region_blocked = _is_region_error(data, body_text)
-            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Error {resp.status_code}: {err_msg} tools={'yes' if req_body.get('tools') else 'no'} stream={req_body.get('stream')} body={body_text[:300]!r}")
-            if resp.status_code == 400:
-                _log_reasoning_diag(req_body)
-                _dump_400_body(req_body, body_text, proxy_addr)
-            if is_region_blocked:
-                # Geo-restriction is proxy-specific: blacklist this proxy and
-                # rotate to a different one on the next attempt.
+            try:
+                resp = await client.post(
+                    "/zen/v1/chat/completions",
+                    json=req_body,
+                    headers=headers,
+                )
+            except Exception as e:
+                _log(f"[zen] Request failed (attempt {attempt}): {_exc_desc(e)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_region_block(proxy_addr)
-                _log(f"[zen] Region-blocked via {proxy_addr}; rotating proxy")
+                    proxy_pool.report_failure(proxy_addr)
+                last_error = e
                 if attempt < attempts:
+                    await _backoff(attempt)
+                continue
+
+            try:
+                body_bytes = await resp.aread()
+            except Exception as e:
+                _log(f"[zen] Response read failed (attempt {attempt}): {_exc_desc(e)}")
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.report_failure(proxy_addr)
+                last_error = e
+                if attempt < attempts:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": f"Upstream response read failed: {_exc_desc(e)}", "type": "upstream_error"}},
+                )
+            body_text = body_bytes.decode("utf-8", errors="replace")
+            try:
+                data = json.loads(body_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+
+            is_429 = resp.status_code == 429
+            is_rate_limit = is_429 or "FreeUsageLimitError" in body_text
+
+            if is_rate_limit:
+                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                _log(f"[zen] 429 (attempt {attempt}): {err_msg}")
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.report_ratelimit(proxy_addr)
+                return _local_rate_limit_response(err_msg + " (free model rate limit)")
+
+            if resp.status_code >= 400:
+                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                is_context_exceeded = _is_context_limit_error(data, body_text)
+                _log(f"[zen] Error {resp.status_code}: {err_msg}")
+                # Not a proxy failure: 4xx/5xx are upstream or request errors that
+                # repeat identically on every proxy, so never blacklist for them.
+                if is_context_exceeded:
+                    _log("[zen] Context limit error; not retrying on another proxy")
+                if not is_context_exceeded and attempt < attempts:
                     await _backoff(attempt)
                     continue
                 return JSONResponse(
                     status_code=resp.status_code,
                     content={"error": {"message": err_msg, "type": "upstream_error"}},
                 )
-            # Not a proxy failure in general — a 503 "Endpoint is
-            # unavailable" from the Console is upstream capacity-shaped and
-            # observed to clear on retry, sometimes only after several
-            # attempts through the SAME exit (streaks up to 14). Keep the
-            # current proxy (sticky selection) so retries reuse the healthy
-            # path instead of hopping between exits; never blacklist.
-            # Retry only 5xx (transient upstream). 4xx are request problems:
-            # a rejected body ([1210] Invalid API parameter) never heals via
-            # backoff or proxy rotation, so fail fast like context-limit.
-            if resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
-                await _backoff(attempt)
-                continue
-            return JSONResponse(
-                status_code=resp.status_code,
-                content={"error": {"message": err_msg, "type": "upstream_error"}},
-            )
 
-        usage = (data.get("usage") or {})
-        if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
-            _add_tokens(model,
-                usage.get("prompt_tokens") or 0,
-                usage.get("completion_tokens") or 0,
-                usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                usage.get("prompt_cache_miss_tokens") or 0,
-            )
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.report_success(proxy_addr)
+            usage = (data.get("usage") or {})
+            if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
+                _add_tokens(model,
+                    usage.get("prompt_tokens") or 0,
+                    usage.get("completion_tokens") or 0,
+                    usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                    usage.get("prompt_cache_miss_tokens") or 0,
+                )
 
-        # Remember emitted reasoning for future turns of this session
-        _msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
-        if session_id and _msg.get("content") and (_msg.get("reasoning_content") or _msg.get("reasoning")):
-            _remember_reasoning(
-                session_id,
-                _msg["content"] if isinstance(_msg["content"], str) else "",
-                _msg.get("reasoning_content") or _msg.get("reasoning") or "",
-            )
-        _log(f"[zen] OK [{model}|{proxy_addr or 'direct'}] response complete")
-        return data
+            # Remember emitted reasoning for future turns of this session
+            _msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+            if session_id and _msg.get("content") and (_msg.get("reasoning_content") or _msg.get("reasoning")):
+                _remember_reasoning(
+                    session_id,
+                    _msg["content"] if isinstance(_msg["content"], str) else "",
+                    _msg.get("reasoning_content") or _msg.get("reasoning") or "",
+                )
+            return data
+        finally:
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
 
     if last_error:
         return JSONResponse(
@@ -1379,21 +1390,21 @@ async def _zen_stream_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            if not await proxy_pool.select():
+            p = await proxy_pool.select()
+            if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
                 await proxy_pool.force_refresh()
-                if not await proxy_pool.select():
+                p = await proxy_pool.select()
+                if p is None:
                     _log("[pool] Still no proxy after refresh, falling back to direct")
                     client = _stream_default_client
                     proxy_addr = None
                 else:
-                    p = proxy_pool.current
                     proxy_addr = p["address"]
                     client = proxy_pool.get_client(
                         f"socks5://{proxy_addr}", streaming=True
                     )
             else:
-                p = proxy_pool.current
                 proxy_addr = p["address"]
                 client = proxy_pool.get_client(
                     f"socks5://{proxy_addr}", streaming=True
@@ -1436,6 +1447,8 @@ async def _zen_stream_with_retry(
                         e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError)
                     ),
                 )
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
             last_error = e
             if attempt < attempts:
                 await _backoff(attempt)
@@ -1460,6 +1473,8 @@ async def _zen_stream_with_retry(
                 _log(f"[zen] Stream 429 read failed (attempt {attempt}): {_exc_desc(e)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_failure(proxy_addr)
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.release(proxy_addr)
                 await resp.aclose()
                 if attempt < attempts:
                     await _backoff(attempt)
@@ -1470,6 +1485,8 @@ async def _zen_stream_with_retry(
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream 429 (attempt {attempt}): {err_msg}")
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.report_ratelimit(proxy_addr)
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
             await resp.aclose()
             yield _openai_stream_error(
                 err_msg + " (free model rate limit)",
@@ -1485,6 +1502,8 @@ async def _zen_stream_with_retry(
                 _log(f"[zen] Stream error body read failed (attempt {attempt}): {_exc_desc(e)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_failure(proxy_addr)
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.release(proxy_addr)
                 await resp.aclose()
                 if attempt < attempts:
                     await _backoff(attempt)
@@ -1492,6 +1511,8 @@ async def _zen_stream_with_retry(
                     continue
                 yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
                 return
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
             body_text = raw.decode("utf-8", errors="replace")
             body_preview = raw[:2000] if raw else b"<empty body>"
             if not raw:
@@ -1722,7 +1743,7 @@ async def _zen_stream_with_retry(
                     )
                 else:
                     yield _openai_stream_error(
-                        f"Stream interrupted: {_exc_desc(e)}",
+                        _transport_error_message(e),
                         "upstream_error",
                         "transport_error",
                     )
@@ -1732,6 +1753,8 @@ async def _zen_stream_with_retry(
                 await resp.aclose()
             except Exception:
                 pass
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
         if retry_stream:
             await _backoff(attempt)
             attempt += 1
@@ -1782,12 +1805,14 @@ async def _zen_stream_with_retry(
                 await _backoff(attempt)
                 attempt += 1
                 continue
-            yield _openai_stream_error(str(err), "upstream_error", "incomplete_stream")
+            yield _openai_stream_error(
+                _transport_error_message(err), "upstream_error", "incomplete_stream"
+            )
         return
 
     # All retries exhausted
     yield _openai_stream_error(
-        f"Stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}",
+        f"connection error: stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}",
         "upstream_error",
         "transport_error",
     )
@@ -1848,21 +1873,21 @@ async def _zen_stream_anthropic_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            if not await proxy_pool.select():
+            p = await proxy_pool.select()
+            if p is None:
                 _log(f"[pool] No proxy ({proxy_pool.get_pool_state()}), forcing refresh")
                 await proxy_pool.force_refresh()
-                if not await proxy_pool.select():
+                p = await proxy_pool.select()
+                if p is None:
                     _log("[pool] Fallback to direct")
                     client = _stream_default_client
                     proxy_addr = None
                 else:
-                    p = proxy_pool.current
                     proxy_addr = p["address"]
                     client = proxy_pool.get_client(
                         f"socks5://{proxy_addr}", streaming=True
                     )
             else:
-                p = proxy_pool.current
                 proxy_addr = p["address"]
                 client = proxy_pool.get_client(
                     f"socks5://{proxy_addr}", streaming=True
@@ -2161,9 +2186,380 @@ async def _zen_stream_anthropic_with_retry(
                     yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
                 yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": "Stream interrupted: upstream closed the connection before completing the message"}})
             return
+        finally:
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
 
     if not headers_sent:
-        yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"Stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}"}})
+        yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"connection error: stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}"}})
+
+
+# ── NVIDIA NIM direct transport (key rotation on 2x consecutive 429) ──
+
+def nvidia_request_body(model, messages, stream, tools, tool_choice, max_tokens=None, max_completion_tokens=None, sampling=None):
+    """Build a standard OpenAI-compatible body for the NVIDIA NIM endpoint.
+
+    Unlike the Zen thinking-mode upstream, NIM accepts normal OpenAI messages;
+    we only normalize roles and don't inject any reasoning_content.
+    """
+    body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
+    if tools:
+        body["tools"] = tools
+    if tool_choice:
+        if tool_choice in ("auto", "none"):
+            body["tool_choice"] = tool_choice
+        else:
+            body["tool_choice"] = "auto"
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    if max_completion_tokens is not None:
+        body["max_completion_tokens"] = max_completion_tokens
+    if sampling:
+        body.update(sampling)
+    return body
+
+
+def _nvidia_headers(key: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+    }
+
+
+def _nvidia_client(streaming: bool):
+    from nvidia_pool import (
+        NVIDIA_CONNECT_TIMEOUT,
+        NVIDIA_READ_TIMEOUT,
+        NVIDIA_STREAM_READ_TIMEOUT,
+    )
+    # trust_env=False: NVIDIA calls must go directly to integrate.api.nvidia.com
+    # and must NOT be routed through the SOCKS proxy pool / system HTTP proxy,
+    # otherwise heavy (long-thinking) models get mishandled (e.g. proxied 404s).
+    return httpx.AsyncClient(
+        base_url="https://integrate.api.nvidia.com",
+        timeout=httpx.Timeout(
+            connect=NVIDIA_CONNECT_TIMEOUT,
+            read=NVIDIA_STREAM_READ_TIMEOUT if streaming else NVIDIA_READ_TIMEOUT,
+            write=NVIDIA_STREAM_READ_TIMEOUT if streaming else NVIDIA_READ_TIMEOUT,
+            pool=NVIDIA_CONNECT_TIMEOUT,
+        ),
+        proxy=None,
+        trust_env=False,
+    )
+
+
+def _nvidia_rate_limit_response(err_msg: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": err_msg + " (nvidia key rate limit)",
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded",
+            }
+        },
+    )
+
+
+async def nvidia_request_with_retry(
+    req_body: dict,
+    user: str,
+    model: str,
+    max_retries: int = None,
+):
+    """Buffered NVIDIA NIM call with key rotation on consecutive 429s.
+
+    Keys rotate when one hits a rate limit twice in a row (nvidia_keys
+    enforces the cooldown). Returns the parsed OpenAI completion dict, a
+    JSONResponse error, or None if the client gave up.
+    """
+    attempts = max_retries if max_retries is not None else MAX_RETRIES
+    last_error = None
+    last_key = None
+    last_status = None
+    last_body = ""
+    key_limit = len(nvidia_keys.keys) or 1
+    # Sweep the whole pool: each iteration picks the next usable key (the pool
+    # advances internally), so a model that 404s for some keys (key lacks
+    # access) but works for another eventually succeeds. Rate limits rotate and
+    # cool down the offending key.
+    for attempt in range(key_limit + attempts):
+        key = nvidia_keys.select()
+        if key is None:
+            return _nvidia_rate_limit_response("all NVIDIA keys are in rate-limit cooldown")
+        client = _nvidia_client(streaming=False)
+        headers = _nvidia_headers(key)
+        try:
+            try:
+                resp = await client.post(
+                    "/v1/chat/completions", json=req_body, headers=headers
+                )
+            except Exception as e:
+                last_error = e
+                _log(f"[nvidia] Request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": f"NVIDIA request failed: {_exc_desc(e)}", "type": "upstream_error"}},
+                )
+
+            body_bytes = await resp.aread()
+            body_text = body_bytes.decode("utf-8", errors="replace")
+            last_key = key
+            last_status = resp.status_code
+            last_body = body_text
+            try:
+                data = json.loads(body_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+
+            is_429 = resp.status_code == 429
+            is_rate_limit = is_429 or "FreeUsageLimitError" in body_text or (
+                "erate" in body_text and "429" in body_text
+            )
+            if is_rate_limit:
+                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                rotated = nvidia_keys.report_rate_limit(key)
+                _log(f"[nvidia] 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
+                # Two consecutive 429s rotate the key to cooldown; keep trying
+                # other keys. Fewer than two → short backoff + retry same key.
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return _nvidia_rate_limit_response(err_msg)
+
+            if resp.status_code >= 400:
+                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                is_context = _is_context_limit_error(data, body_text)
+                _log(f"[nvidia] Error {resp.status_code} (key {key[-8:]}): {err_msg} body={body_text[:200]!r}")
+                if resp.status_code in (401, 403):
+                    # Bad/revoked key — rotate away (not rate-limit but unusable).
+                    nvidia_keys.report_rate_limit(key)
+                if is_context:
+                    # Context window exhaustion is per-model/request, not key.
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg, "type": "context_window_error"}},
+                    )
+                # 404 (model not authorized for this key) → advance to the next
+                # key with no delay; a different key may have access.
+                if resp.status_code < 500 and attempt < key_limit + attempts - 1:
+                    continue
+                # 5xx → transient: short backoff then retry.
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content={"error": {"message": err_msg, "type": "upstream_error"}},
+                )
+
+            nvidia_keys.report_success(key)
+            usage = data.get("usage") or {}
+            if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
+                _add_tokens(model,
+                    usage.get("prompt_tokens") or 0,
+                    usage.get("completion_tokens") or 0,
+                    usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                    usage.get("prompt_cache_miss_tokens") or 0,
+                )
+            return data
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    last_err = f"NVIDIA error after retries (last key {last_key[-8:] if last_key else 'none'}: HTTP {last_status})"
+    if last_error:
+        last_err += f": {_exc_desc(last_error)}"
+    return JSONResponse(
+        status_code=last_status or 502,
+        content={"error": {"message": last_err, "type": "upstream_error"}},
+    )
+
+
+async def nvidia_stream_with_retry(
+    req_body: dict,
+    user: str,
+    model: str,
+    max_retries: int = None,
+):
+    """Streaming NVIDIA NIM call with key rotation on consecutive 429s.
+
+    Yields OpenAI SSE lines. A key that 429s twice consecutively rotates away
+    (cooldown) and the request is retried with the next key.
+    """
+    attempts = max_retries if max_retries is not None else MAX_RETRIES
+    last_error = None
+    key_limit = len(nvidia_keys.keys) or 1
+    used_keys_in_request = 0
+    # Track stream throughput so we don't replay once bytes reached the client.
+    streamed_any = False
+
+    attempt = 0
+    while attempt <= attempts + key_limit * 2:
+        key = nvidia_keys.select()
+        if key is None:
+            yield _openai_stream_error(
+                "all NVIDIA keys are in rate-limit cooldown",
+                "rate_limit_error", "rate_limit_exceeded",
+            )
+            return
+        used_keys_in_request += 1
+        client = _nvidia_client(streaming=True)
+        try:
+            upstream_request = client.build_request(
+                "POST", "/v1/chat/completions", json=req_body,
+                headers=_nvidia_headers(key),
+            )
+            resp = await client.send(upstream_request, stream=True)
+        except Exception as e:
+            last_error = e
+            _log(f"[nvidia] Stream request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
+            await client.aclose()
+            if attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error(f"Stream request failed: {_exc_desc(e)}", "upstream_error", "transport_error")
+            return
+
+        if resp.status_code == 429:
+            try:
+                raw = await resp.aread()
+                try:
+                    data = json.loads(raw)
+                    err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                except Exception:
+                    err_msg = "Rate limit exceeded"
+            except Exception as e:
+                err_msg = f"Rate limit ({_exc_desc(e)})"
+            rotated = nvidia_keys.report_rate_limit(key)
+            _log(f"[nvidia] Stream 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
+            await resp.aclose()
+            await client.aclose()
+            if rotated and used_keys_in_request < key_limit:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            if attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
+            return
+
+        if resp.status_code >= 400:
+            try:
+                raw = await resp.aread()
+            except Exception:
+                raw = b""
+            try:
+                data = json.loads(body_text) if body_text else {}
+            except Exception:
+                data = {}
+            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            body_text = raw.decode("utf-8", errors="replace")
+            _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): {err_msg}")
+            if resp.status_code in (401, 403):
+                nvidia_keys.report_rate_limit(key)
+            await resp.aclose()
+            await client.aclose()
+            # No bytes have streamed yet -> safe to try another key. A 404 means
+            # this key lacks the model; a 5xx may be transient. Sweep the pool.
+            if resp.status_code < 500 and attempt < attempts + key_limit:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            if resp.status_code >= 500 and attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+            return
+
+        # Success — stream it through
+        nvidia_keys.report_success(key)
+        stream_completed = False
+        try:
+            try:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        stream_completed = True
+                        yield line + "\n\n"
+                        streamed_any = True
+                        break
+                    try:
+                        piece = json.loads(payload)
+                    except Exception:
+                        piece = {}
+                    if not isinstance(piece, dict):
+                        continue
+                    # In-stream error (e.g. rate limit surfaced mid-body)
+                    ev = _first_chunk_error(line)
+                    if ev:
+                        err_msg, is_rate_limit = ev
+                        if is_rate_limit:
+                            rotated = nvidia_keys.report_rate_limit(key)
+                            _log(f"[nvidia] Stream body rate-limit on key {key[-8:]}: {err_msg} rotated={rotated}")
+                            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
+                        else:
+                            yield _openai_stream_error(err_msg)
+                        return
+                    if '"usage"' in line:
+                        u = piece.get("usage") or {}
+                        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                            _add_tokens(model,
+                                u.get("prompt_tokens") or 0,
+                                u.get("completion_tokens") or 0,
+                                u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                                u.get("prompt_cache_miss_tokens") or 0,
+                            )
+                    yield line + "\n\n"
+                    streamed_any = True
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
+                _log(f"[nvidia] Stream interrupted (key {key[-8:]}): {_exc_desc(e)}")
+                last_error = e
+                if not streamed_any and attempt < attempts + key_limit * 2:
+                    attempt += 1
+                    await _backoff(attempt)
+                    continue
+                yield _openai_stream_error(_transport_error_message(e), "upstream_error", "transport_error")
+                return
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+        if not stream_completed:
+            _log(f"[nvidia] Stream ended before [DONE] on key {key[-8:]}")
+            if not streamed_any and attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error("NVIDIA stream ended before completion", "upstream_error", "incomplete_stream")
+            return
+        return
+
+    yield _openai_stream_error(
+        f"connection error: NVIDIA stream failed after retries: {_exc_desc(last_error)}",
+        "upstream_error", "transport_error",
+    )
 
 
 # ── Anthropic Messages → OpenAI conversion ────────────────────────
@@ -2436,6 +2832,10 @@ async def list_models(request: Request):
             if meta.get("modalities"):
                 entry["modalities"] = meta["modalities"]
         data.append(entry)
+    # NVIDIA NIM models exposed behind the nvidia/ (and nvimin/) prefix.
+    if nvidia_keys.ready:
+        for alias in ("kimi-k3", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-coder"):
+            data.append({"id": f"nvidia/{alias}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
     return {"object": "list", "data": data}
 
 
@@ -2450,6 +2850,34 @@ async def chat_completions(request: Request):
     stream = body.get("stream")
     tools = body.get("tools")
     tool_choice = body.get("tool_choice")
+
+    # NVIDIA NIM direct route: models addressed with nvidia/ or nvimin/ prefix
+    if is_nvidia_model(model):
+        if not nvidia_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": "No NVIDIA API keys loaded (nvidia-api-keys.txt empty/missing)", "type": "upstream_error"}},
+            )
+        nim_model = nvidia_model_id(model)
+        norm_messages = _normalize_messages(messages) or []
+        req_body = nvidia_request_body(
+            nim_model, norm_messages, stream, tools, tool_choice,
+            body.get("max_tokens"), body.get("max_completion_tokens"), _nvidia_sampling_from(body),
+        )
+        if stream:
+            return StreamingResponse(
+                nvidia_stream_with_retry(req_body, user, nim_model),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        data = await nvidia_request_with_retry(req_body, user, nim_model)
+        if isinstance(data, JSONResponse):
+            return data
+        if data is None:
+            return JSONResponse(status_code=502, content={"error": {"message": "Client disconnected", "type": "upstream_error"}})
+        if not data.get("choices"):
+            return JSONResponse(status_code=502, content={"error": {"message": "Invalid upstream response", "type": "upstream_error"}})
+        return data
 
     model = _normalize_model(model)
     if not await _ensure_model_known(model):
@@ -2522,6 +2950,59 @@ async def messages(request: Request):
     body = await request.json()
     model = body.get("model")
     stream = body.get("stream")
+
+    # NVIDIA NIM direct route (Anthropic format): convert to OpenAI, call NIM,
+    # convert the completion back to Anthropic. Streams are bridged through the
+    # buffered path (same guarantee as the Zen muse-spark fallback).
+    if is_nvidia_model(model):
+        if not nvidia_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "No NVIDIA API keys loaded"}},
+            )
+        nim_model = nvidia_model_id(model)
+        oai_nv_messages, nv_tools = anthropic_to_openai(body)
+        input_tokens = len(json.dumps(oai_nv_messages)) // 4
+        nv_req_body = nvidia_request_body(
+            nim_model, oai_nv_messages, False, nv_tools, None,
+            body.get("max_tokens"), body.get("max_completion_tokens"), _nvidia_sampling_from(body),
+        )
+        nv_data = await nvidia_request_with_retry(nv_req_body, user, nim_model)
+        if isinstance(nv_data, JSONResponse):
+            return nv_data
+        if nv_data is None:
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
+            )
+        if not nv_data.get("choices"):
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Invalid upstream response"}},
+            )
+        anth = openai_to_anthropic(nv_data, nim_model, input_tokens)
+        if stream:
+            async def _nv_anthropic_sse():
+                # Stream the already-complete buffered Anthropic conversion.
+                start_payload = json.dumps({"type": "message_start", "message": anth})
+                yield f"event: message_start\ndata: {start_payload}\n\n"
+                content = anth.get("content", [])
+                for idx, block in enumerate(content):
+                    cbs_payload = json.dumps({"type": "content_block_start", "index": idx, "content_block": block})
+                    yield f"event: content_block_start\ndata: {cbs_payload}\n\n"
+                    if block.get("type") == "text":
+                        delta_payload = json.dumps({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}})
+                        yield f"event: content_block_delta\ndata: {delta_payload}\n\n"
+                    cbstop_payload = json.dumps({"type": "content_block_stop", "index": idx})
+                    yield f"event: content_block_stop\ndata: {cbstop_payload}\n\n"
+                stop_payload = json.dumps({"type": "message_stop"})
+                yield f"event: message_stop\ndata: {stop_payload}\n\n"
+            return StreamingResponse(
+                _nv_anthropic_sse(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        return anth
 
     model = _normalize_model(model)
 
@@ -2968,6 +3449,8 @@ async def health(request: Request):
         "pool_state": pool_state,
         "pool_size": len(proxy_pool.hot) if PROXY_POOL_ENABLED else None,
         "tokens": dict(_tokens),
+        "nvidia_keys": len(nvidia_keys.keys) if nvidia_keys.ready else 0,
+        "nvidia_models": ["nvidia/deepseek-v4-pro-0813"] if nvidia_keys.ready else [],
         "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
     }
 
