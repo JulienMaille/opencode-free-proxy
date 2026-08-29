@@ -58,6 +58,10 @@ BLACKLIST_TTL = 120 * 60
 # unreachable) blacklist the exit immediately instead of consuming a second
 # attempt on it.
 MAX_RETRIES = 5
+# Max simultaneous streams per proxy. A single sticky proxy handles normal
+# sequential requests, but bursts of concurrent requests (omp subagent spawns)
+# spill across a few verified proxies so one proxy isn't overloaded / 429'd.
+MAX_PER_PROXY = 2
 EXHAUSTED_FORCE_REFRESH_INTERVAL = 30
 REQUEST_CONNECT_TIMEOUT = 5
 REQUEST_READ_TIMEOUT = 120
@@ -130,6 +134,8 @@ class ProxyPool:
         self._stream_no_proxy_client: httpx.AsyncClient | None = None
         self._verify_sem = asyncio.Semaphore(25)
         self._select_lock = asyncio.Lock()
+        self._inflight: dict[str, int] = {}
+        self._inflight_at: dict[str, float] = {}
         self._try_load_cache()
 
     def _try_load_cache(self) -> bool:
@@ -358,36 +364,85 @@ class ProxyPool:
                 break
         return batch
 
-    async def select(self) -> bool:
+    async def select(self) -> dict | None:
         """Get the next usable proxy. Checks hot buffer first, then verifies one on-the-fly.
 
         Serialized with a lock so concurrent requests share one verification
         pass instead of each blacklisting its own failed batch.
+
+        Returns the selected proxy entry (callers read the address off it and
+        MUST pair each successful select with a release() when the request
+        attempt finishes). Returns None if nothing usable is available.
         """
         async with self._select_lock:
             return await self._select_unlocked()
 
-    async def _select_unlocked(self) -> bool:
-        """select() body; callers must hold _select_lock."""
+    async def _select_unlocked(self) -> dict | None:
+        """select() body; callers must hold _select_lock.
+
+        Sticky by default: reuse the current proxy while it is healthy and
+        under its per-proxy concurrency cap. When the cap is reached (a burst
+        of concurrent requests, e.g. omp subagent spawns), spill to the
+        least-loaded verified hot proxy instead of overloading the single one.
+        """
         if self.current:
-            if not self._is_bad(self.current["address"]):
-                return True
-            self.current = None
+            addr = self.current["address"]
+            if not self._is_bad(addr):
+                if self._load(addr) < MAX_PER_PROXY:
+                    self._inflight[addr] = self._inflight.get(addr, 0) + 1
+                    self._inflight_at[addr] = time.time()
+                    return self.current
+                # current is at capacity — fall through to spread the load
+                overloaded_current = addr
+            else:
+                self.current = None
+                overloaded_current = None
+        else:
+            overloaded_current = None
 
         if not self.candidates and self._source_task:
             await self._source_task
 
-        # 1. Hot buffer — verified and ready
-        while self.hot:
-            p = self.hot.pop(0)
+        # 1. Hot buffer — least-loaded verified proxy with spare capacity,
+        #    skipping the overloaded current so it isn't hit even harder.
+        #    Prune stale/bad entries first so dead weight doesn't accumulate
+        #    and block the background refill from topping the buffer up.
+        now = time.time()
+        self.hot = [
+            p for p in self.hot
+            if (now - float(p.get("verified_at", 0))) <= HOT_TTL
+            and not self._is_bad(p["address"])
+        ]
+        best = None
+        best_load = MAX_PER_PROXY
+        for p in self.hot:
             verified_at = float(p.get("verified_at", 0))
-            if time.time() - verified_at > HOT_TTL:
+            if now - verified_at > HOT_TTL:
                 continue
-            if not self._is_bad(p["address"]):
-                self.current = p
-                _log(f"Selected from hot: {p['address']}")
-                self._trigger_refill()
-                return True
+            if self._is_bad(p["address"]):
+                continue
+            if p["address"] == overloaded_current:
+                continue
+            load = self._load(p["address"])
+            if load < best_load:
+                best = p
+                best_load = load
+                if load == 0:
+                    break
+        if best is not None:
+            self.current = best
+            self._inflight[best["address"]] = self._inflight.get(best["address"], 0) + 1
+            self._inflight_at[best["address"]] = time.time()
+            _log(f"Selected from hot: {best['address']}")
+            self._trigger_refill()
+            return best
+
+        # Current at capacity and no spare verified proxy: reuse it rather than
+        # pay a full on-the-fly verification pass.
+        if overloaded_current:
+            self._inflight[overloaded_current] = self._inflight.get(overloaded_current, 0) + 1
+            self._inflight_at[overloaded_current] = time.time()
+            return self.current
 
         # 2. On-the-fly: verify a batch of candidates in parallel
         batch = self._take_verification_batch(VERIFY_BATCH_SIZE)
@@ -414,13 +469,15 @@ class ProxyPool:
                             for f in pending:
                                 f.cancel()
                             self.current = p
+                            self._inflight[addr] = self._inflight.get(addr, 0) + 1
+                            self._inflight_at[addr] = time.time()
                             _log(f"Selected after on-the-fly verify: {addr}")
                             self._trigger_refill()
-                            return True
+                            return p
                         self.blacklist[addr] = time.time() + BLACKLIST_TTL
                 # All failed
                 _log(f"No usable proxy ({self.get_pool_state()})")
-                return False
+                return None
             finally:
                 # Cancel stragglers (success path or caller cancellation) and
                 # always release the in-flight markers, even if the request
@@ -434,7 +491,37 @@ class ProxyPool:
 
         # 3. Nothing usable
         _log(f"No usable proxy ({self.get_pool_state()})")
-        return False
+        return None
+
+    def release(self, addr: str | None = None):
+        """Release the per-proxy concurrency slot reserved by a prior select().
+
+        Callers MUST pair every successful select() with a release() once the
+        request attempt finishes (success, failure, rate-limit or cancellation).
+        """
+        target = addr or (self.current and self.current["address"])
+        if not target:
+            return
+        n = self._inflight.get(target, 0)
+        if n > 1:
+            self._inflight[target] = n - 1
+        else:
+            self._inflight.pop(target, None)
+            self._inflight_at.pop(target, None)
+
+    def _load(self, addr: str) -> int:
+        """In-flight request count for a proxy, self-healing any slots that
+        were never released (e.g. a stream cancelled before its finally ran).
+        A stale slot beyond the max stream duration is treated as free."""
+        n = self._inflight.get(addr, 0)
+        if n == 0:
+            return 0
+        at = self._inflight_at.get(addr, 0)
+        if time.time() - at > STREAM_READ_TIMEOUT:
+            self._inflight.pop(addr, None)
+            self._inflight_at.pop(addr, None)
+            return 0
+        return n
 
     def _trigger_refill(self):
         """Ensure background refill is running to keep hot buffer full."""
@@ -526,6 +613,13 @@ class ProxyPool:
         failures = self.transport_failures.get(target, 0) + 1
         self.transport_failures[target] = failures
         self._evict_client(target)
+        # Drop the proxy from the hot buffer on ANY transport failure so the
+        # next select() doesn't hand it to concurrent requests; it can only
+        # come back after passing a brand-new full verification in a later
+        # refill. Hard failures (connect timeout, proxy unreachable) blacklist
+        # immediately; soft failures (<2) get one grace retry on the same exit
+        # before it is blacklisted.
+        self.hot = [p for p in self.hot if p["address"] != target]
         if not hard and failures < 2:
             _log(f"Transport failure {target} ({failures}/2); retrying same proxy")
             return
