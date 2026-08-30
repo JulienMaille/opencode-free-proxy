@@ -29,6 +29,11 @@ def _slug(mid: str) -> str:
     return mid.lower().replace("_", "").replace(" ", "").replace("-", "")
 
 
+def nvidia_models() -> list[str]:
+    """Distinct NVIDIA NIM slugs the proxy is configured to route to."""
+    return sorted({v for v in _NVIDIA_ALIASES.values()})
+
+
 def is_nvidia_model(raw_model: str | None) -> bool:
     """True if the client addressed the model with an NVIDIA routing prefix."""
     if not raw_model:
