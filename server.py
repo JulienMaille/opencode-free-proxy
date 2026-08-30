@@ -28,7 +28,7 @@ from proxy_pool import (
 )
 
 from nvidia_pool import pool as nvidia_keys
-from nvidia_proxy import is_nvidia_model, nvidia_model_id
+from nvidia_proxy import is_nvidia_model, nvidia_model_id, nvidia_models
 
 _BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -2196,6 +2196,13 @@ async def _zen_stream_anthropic_with_retry(
 
 # ── NVIDIA NIM direct transport (key rotation on 2x consecutive 429) ──
 
+# Fail-fast: if this many *consecutive* 429s happen without a single key
+# succeeding, the whole pool is saturated with rate limits. Returning a clear
+# 429 to the client beats silently looping every key with backoff for minutes
+# (which looks like "thinking" to the client). A "consecutive" run is broken by
+# any success OR any non-429 (e.g. a socket error that still tries the pool).
+NVIDIA_POOL_429_FAILFAST = 12
+
 def nvidia_request_body(model, messages, stream, tools, tool_choice, max_tokens=None, max_completion_tokens=None, sampling=None):
     """Build a standard OpenAI-compatible body for the NVIDIA NIM endpoint.
 
@@ -2279,6 +2286,10 @@ async def nvidia_request_with_retry(
     last_status = None
     last_body = ""
     key_limit = len(nvidia_keys.keys) or 1
+    # Consecutive pool-wide 429s (not broken by a success or non-429). When this
+    # reaches NVIDIA_POOL_429_FAILFAST the whole pool is saturated → fail fast
+    # instead of looping every key with backoff for minutes ("thinking").
+    consecutive_429 = 0
     # Sweep the whole pool: each iteration picks the next usable key (the pool
     # advances internally), so a model that 404s for some keys (key lacks
     # access) but works for another eventually succeeds. Rate limits rotate and
@@ -2323,6 +2334,14 @@ async def nvidia_request_with_retry(
                 err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
                 rotated = nvidia_keys.report_rate_limit(key)
                 _log(f"[nvidia] 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
+                consecutive_429 += 1
+                # Whole pool saturated with rate limits → fail fast with a clear
+                # 429 rather than silently looping every key for minutes.
+                if consecutive_429 >= NVIDIA_POOL_429_FAILFAST:
+                    _log(f"[nvidia] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+                    return _nvidia_rate_limit_response(
+                        f"NVIDIA pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment"
+                    )
                 # Two consecutive 429s rotate the key to cooldown; keep trying
                 # other keys. Fewer than two → short backoff + retry same key.
                 if attempt < key_limit + attempts - 1:
@@ -2331,6 +2350,7 @@ async def nvidia_request_with_retry(
                 return _nvidia_rate_limit_response(err_msg)
 
             if resp.status_code >= 400:
+                consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
                 err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
                 is_context = _is_context_limit_error(data, body_text)
                 _log(f"[nvidia] Error {resp.status_code} (key {key[-8:]}): {err_msg} body={body_text[:200]!r}")
@@ -2357,6 +2377,7 @@ async def nvidia_request_with_retry(
                 )
 
             nvidia_keys.report_success(key)
+            consecutive_429 = 0
             usage = data.get("usage") or {}
             if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
                 _add_tokens(model,
@@ -2396,6 +2417,8 @@ async def nvidia_stream_with_retry(
     last_error = None
     key_limit = len(nvidia_keys.keys) or 1
     used_keys_in_request = 0
+    # Consecutive pool-wide 429s → fail fast when the whole pool is saturated.
+    consecutive_429 = 0
     # Track stream throughput so we don't replay once bytes reached the client.
     streamed_any = False
 
@@ -2441,6 +2464,16 @@ async def nvidia_stream_with_retry(
             _log(f"[nvidia] Stream 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
             await resp.aclose()
             await client.aclose()
+            consecutive_429 += 1
+            # Whole pool saturated → fail fast with a clear 429 instead of
+            # silently looping every key for minutes (looks like "thinking").
+            if consecutive_429 >= NVIDIA_POOL_429_FAILFAST:
+                _log(f"[nvidia] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+                yield _openai_stream_error(
+                    f"NVIDIA pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment",
+                    "rate_limit_error", "rate_limit_exceeded",
+                )
+                return
             if rotated and used_keys_in_request < key_limit:
                 attempt += 1
                 await _backoff(attempt)
@@ -2463,6 +2496,7 @@ async def nvidia_stream_with_retry(
                 data = {}
             err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
             body_text = raw.decode("utf-8", errors="replace")
+            consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
             _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): {err_msg}")
             if resp.status_code in (401, 403):
                 nvidia_keys.report_rate_limit(key)
@@ -2483,6 +2517,7 @@ async def nvidia_stream_with_retry(
 
         # Success — stream it through
         nvidia_keys.report_success(key)
+        consecutive_429 = 0
         stream_completed = False
         try:
             try:
@@ -3450,7 +3485,7 @@ async def health(request: Request):
         "pool_size": len(proxy_pool.hot) if PROXY_POOL_ENABLED else None,
         "tokens": dict(_tokens),
         "nvidia_keys": len(nvidia_keys.keys) if nvidia_keys.ready else 0,
-        "nvidia_models": ["nvidia/deepseek-v4-pro-0813"] if nvidia_keys.ready else [],
+        "nvidia_models": [f"nvidia/{m}" for m in nvidia_models()] if nvidia_keys.ready else [],
         "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
     }
 

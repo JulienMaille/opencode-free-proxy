@@ -159,11 +159,21 @@ NVIDIA free-tier `nvapi-*` keys are capped at ~40 RPM/account and are gated
 per-model on the free tier. The proxy rotates keys automatically:
 
 - Keys are handed out round-robin from `nvidia-api-keys.txt`.
-- A request that hits a **rate limit (429 / `FreeUsageLimitError`)** is retried with
-  the next key. A key that hits a rate limit **twice in a row** is rotated away and
-  put on a 60-second cooldown before reuse.
+- Only well-formed keys load: NVIDIA `nvapi-*` keys are a **fixed 70 characters**
+  (the `nvapi-` prefix plus a 64-char body of `[A-Za-z0-9_-]`). Anything shorter
+  or longer is skipped at load time and rejected by the key hunter's validator.
+- A request that hits a **rate limit (429 / `FreeUsageLimitError`)** immediately
+  cools that key down. The cooldown grows **exponentially per key**
+  (60s → 120s → 240s → … capped at 10 minutes), so a key that keeps getting
+  rate-limited backs off progressively and stops being offered, letting the
+  rest of the pool stay usable.
+- If **12 consecutive 429s** happen (the whole pool is saturated by the shared
+  free-tier quota), the proxy fails fast with a clear `rate limit exceeded`
+  error instead of silently looping every key with backoff for minutes.
 - A per-key **404** (this key is not entitled to the model) advances to the next
   key immediately so the whole pool is tried before failing.
+- NVIDIA read/stream timeouts are generous (600s) so long-thinking models
+  (deepseek-v4-pro / -flash) that stay silent for minutes aren't killed mid-reasoning.
 - `POST /v1/messages` (Anthropic) is supported: the proxy converts to OpenAI
   format, calls NIM, and converts the result back to Anthropic SSE.
 
