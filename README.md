@@ -49,17 +49,20 @@ python server.py --port 8080 --proxy socks5://127.0.0.1:9150
 The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/models`) and enriched with context limits / modalities from `models.dev`. It refreshes every 5 hours. Typical free models:
 
 - `muse-spark-1.3-contributor-free` / `muse-spark-1.2-contributor-free` (routed to `/zen/v1/responses` — Zen does not serve Muse Spark on chat/completions; requests are translated to the Responses API and translated back)
-- `deepseek-v4-flash-free`
+- `nemotron-3.5-lightning-free`
 - `mimo-v2.5-free` (only one that also accepts image/audio/video input)
 - `nemotron-3-ultra-free`
 - `laguna-s-2.1-free`
 - `longcat-2.0-free`
+- `big-pickle` (reasoning model, text-only)
 
 > Removed from the curated set (still auto-discovered if the Zen API lists them):
+> `deepseek-v4-flash-free` — listed by the Zen API but currently returns
+> `Error from provider (Console): Upstream request failed: Model is unavailable.`;
 > `north-mini-code-free` — opaque `400 Provider returned error` on multi-turn
 > tool calls; and `ling-3.0-flash-free` — no longer on the free tier upstream
 > (404: "use this slug instead: inclusionai/ling-3.0-flash"). If your client
-> configures models by hand, drop both; the proxy itself serves whatever the
+> configures models by hand, drop them; the proxy itself serves whatever the
 > Zen API returns.
 
 ## API
@@ -71,7 +74,7 @@ curl http://localhost:6446/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash-free",
+    "model": "big-pickle",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
@@ -89,7 +92,7 @@ curl http://localhost:6446/v1/messages \
   -H "x-api-key: YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash-free",
+    "model": "big-pickle",
     "system": "You are helpful.",
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 1024,
@@ -229,6 +232,7 @@ models):
         "big-pickle": {
           "name": "Big Pickle",
           "id": "big-pickle",
+          "reasoning": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 200000, "output": 32000 }
         },
@@ -279,11 +283,11 @@ providers:
     api: openai-completions
     # ... compat knobs (see docs/omp.md) ...
     models:
-      - id: deepseek-v4-flash-free
+      - id: nemotron-3.5-lightning-free
         reasoning: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        contextWindow: 200000
+        contextWindow: 1000000
         maxTokens: 128000
 ```
 
@@ -291,7 +295,7 @@ then point roles at models with a `:low`/`:high`/`:max` reasoning suffix:
 
 ```yaml
 modelRoles:
-  default: opencode-local/deepseek-v4-flash-free:high
+  default: opencode-local/nemotron-3.5-lightning-free:high
   vision: opencode-local/mimo-v2.5-free:high
 ```
 

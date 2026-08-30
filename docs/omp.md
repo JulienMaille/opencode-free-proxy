@@ -40,12 +40,19 @@ providers:
       requiresReasoningContentForToolCalls: true
       allowsSyntheticReasoningContentForToolCalls: false
     models:
-      - id: deepseek-v4-flash-free
-        name: DeepSeek V4 Flash Free
+      - id: big-pickle
+        name: Big Pickle
         reasoning: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 200000
+        maxTokens: 32000
+      - id: nemotron-3.5-lightning-free
+        name: Nemotron 3.5 Lightning Free
+        reasoning: true
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 1000000
         maxTokens: 128000
       - id: mimo-v2.5-free
         name: MiMo V2.5 Free
@@ -81,7 +88,7 @@ Notes on the `compat` knobs (validated against the Zen gateway behavior the prox
 
 - `auth: none` — the proxy doesn't validate client auth, so omp resolves to its keyless sentinel and sends no `Authorization` header. Don't set `apiKey` here.
 - `supportsDeveloperRole: false` — the upstream rejects the newer `developer` role (only `system`/`user`/`assistant`/`tool`). omp sends `system` directly; the proxy also rewrites `developer` → `system` as a safety net.
-- `reasoningContentField: reasoning_content` + `requiresReasoningContentForToolCalls: true` + `allowsSyntheticReasoningContentForToolCalls: false` — opencode-zen 400s follow-up requests when a prior assistant tool-call turn lacks exact `reasoning_content`; DeepSeek-family and MiMo reject synthetic placeholder values, hence the false.
+- `reasoningContentField: reasoning_content` + `requiresReasoningContentForToolCalls: true` + `allowsSyntheticReasoningContentForToolCalls: false` — opencode-zen 400s follow-up requests when a prior assistant tool-call turn lacks exact `reasoning_content`; Big Pickle, DeepSeek-family and MiMo reject synthetic placeholder values, hence the false.
 - `supportsForcedToolChoice: false` — any model in thinking mode rejects forced `tool_choice` (`Thinking mode does not support this tool_choice`, upstream 400). Tell omp not to hard-force a single tool.
 - `supportsUsageInStreaming: false` — the proxy ignores `stream_options.include_usage`; don't ask for streamed usage.
 - `maxTokensField: max_tokens` — the proxy accepts both, `max_tokens` is the safest.
@@ -89,20 +96,20 @@ Notes on the `compat` knobs (validated against the Zen gateway behavior the prox
 
 ## 2. Default model roles — `~/.omp/agent/config.yml`
 
-Only DeepSeek V4 Flash is trusted end-to-end, so every role points at it with a per-role reasoning level (`low`/`high`/`max`). DeepSeek is always-thinking, so there is no `off` — `low` is the floor for lightweight roles. `vision` is the exception: DeepSeek is text-only, so it uses the image-capable MiMo.
+Only Big Pickle is trusted end-to-end, so every role points at it with a per-role reasoning level (`low`/`high`/`max`). Big Pickle is always-thinking, so there is no `off` — `low` is the floor for lightweight roles. `vision` is the exception: Big Pickle is text-only, so it uses the image-capable MiMo.
 
 ```yaml
 modelRoles:
-  default: opencode-local/deepseek-v4-flash-free:high
-  smol: opencode-local/deepseek-v4-flash-free:low
-  slow: opencode-local/deepseek-v4-flash-free:max
-  plan: opencode-local/deepseek-v4-flash-free:max
+  default: opencode-local/big-pickle:high
+  smol: opencode-local/big-pickle:low
+  slow: opencode-local/big-pickle:max
+  plan: opencode-local/big-pickle:max
   vision: opencode-local/mimo-v2.5-free:high
-  designer: opencode-local/deepseek-v4-flash-free:high
-  commit: opencode-local/deepseek-v4-flash-free:low
-  tiny: opencode-local/deepseek-v4-flash-free:low
-  task: opencode-local/deepseek-v4-flash-free:high
-  advisor: opencode-local/deepseek-v4-flash-free:high
+  designer: opencode-local/big-pickle:high
+  commit: opencode-local/big-pickle:low
+  tiny: opencode-local/big-pickle:low
+  task: opencode-local/big-pickle:high
+  advisor: opencode-local/big-pickle:high
 cycleOrder:
   - smol
   - default
@@ -120,11 +127,11 @@ Pre-assigning every role avoids oh-my-pi's first-run model picker. The `:low`/`:
 ## 3. Verify
 
 ```powershell
-# list models (should show opencode-local with 5 entries)
+# list models (should show opencode-local with 6 entries)
 omp models
 
 # one-shot prompt through the proxy
-omp -p --model "opencode-local/deepseek-v4-flash-free" "hello"
+omp -p --model "opencode-local/big-pickle" "hello"
 ```
 
 Start the proxy on `http://127.0.0.1:6446` before using omp.
