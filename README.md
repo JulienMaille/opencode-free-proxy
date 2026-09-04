@@ -48,6 +48,7 @@ python server.py --port 8080 --proxy socks5://127.0.0.1:9150
 
 The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/models`) and enriched with context limits / modalities from `models.dev`. It refreshes every 5 hours. Typical free models:
 
+- `muse-spark-1.3-contributor-free` / `muse-spark-1.2-contributor-free` (routed to `/zen/v1/responses` — Zen does not serve Muse Spark on chat/completions; requests are translated to the Responses API and translated back)
 - `deepseek-v4-flash-free`
 - `mimo-v2.5-free` (only one that also accepts image/audio/video input)
 - `nemotron-3-ultra-free`
