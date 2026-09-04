@@ -1096,6 +1096,47 @@ def _model_suffix_effort(model: str | None) -> str | None:
     return _muse_effort(m.split(":", 1)[1])
 
 
+def _resolve_muse_effort(model_id: str | None, body: dict | None = None) -> str | None:
+    """Resolve the muse reasoning effort with the Responses xhigh clamp.
+
+    Precedence: ``:suffix`` on the model id > ``reasoning.effort`` >
+    ``reasoning_effort``. Without this, a Chat-style ``reasoning_effort``
+    (e.g. "max") falls through the ``if eff:`` gate as None and the request
+    goes out with no ``reasoning`` block at all (same normalization 9router
+    does at its executor boundary).
+    """
+    eff = _model_suffix_effort(model_id)
+    if eff:
+        return eff
+    if isinstance(body, dict):
+        r = body.get("reasoning")
+        if isinstance(r, dict):
+            eff = _muse_effort(r.get("effort"))
+            if eff:
+                return eff
+        eff = _muse_effort(body.get("reasoning_effort"))
+        if eff:
+            return eff
+    return None
+
+
+# Floor for tool-free Responses requests: below this the model can burn the
+# whole budget on reasoning and emit zero events (deterministic empty-EOF).
+_RESPONSES_MIN_OUTPUT_TOKENS = 128
+
+
+_RESPONSES_SAMPLING_KEYS = ("temperature", "top_p")
+
+
+def _responses_sampling_from(body: dict) -> dict:
+    """Sampling params the Responses API accepts.
+
+    ``stop`` is a Chat Completions field: blindly merging it into the
+    Responses body risks a 400 or silent ignore, so it stays Chat-only.
+    """
+    return {k: body[k] for k in _RESPONSES_SAMPLING_KEYS if body.get(k) is not None}
+
+
 def _responses_content_parts(content, assistant: bool = False) -> list:
     """Chat content → Responses content parts (images supported for muse)."""
     text_type = "output_text" if assistant else "input_text"
@@ -1215,6 +1256,12 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
         body["tool_choice"] = "auto"
     mt = max_completion_tokens if max_completion_tokens is not None else max_tokens
     if mt is not None:
+        # Micro-requests (title/summary gens with max_tokens~20) spend their
+        # whole output budget thinking and the upstream closes the stream with
+        # zero events — a deterministic empty-EOF no retry can fix (observed
+        # direct, no proxy involved). Floor the budget so the turn can emit.
+        if not tools and mt < _RESPONSES_MIN_OUTPUT_TOKENS:
+            mt = _RESPONSES_MIN_OUTPUT_TOKENS
         body["max_output_tokens"] = mt
     eff = _muse_effort(effort)
     if eff:
@@ -1222,6 +1269,25 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
     if sampling:
         body.update(sampling)
     return body
+
+
+def _responses_diag(resp_body: dict) -> str:
+    """One-line digest of the Responses request body for empty-EOF correlation.
+
+    Direct-mode runs prove the zero-event EOF comes from upstream, not the
+    proxy — so the next question is *which* requests come back empty.
+    """
+    try:
+        inp = resp_body.get("input") or []
+        chars = sum(len(json.dumps(i, ensure_ascii=False)) for i in inp)
+        tools = resp_body.get("tools") or []
+        return (
+            f"reasoning={resp_body.get('reasoning')!r} "
+            f"tools={len(tools)} input_items={len(inp)} "
+            f"input_chars~{chars} max_out={resp_body.get('max_output_tokens')!r}"
+        )
+    except Exception:
+        return "?"
 
 
 def _responses_usage_to_chat(usage: dict | None) -> dict | None:
@@ -1299,10 +1365,14 @@ async def _zen_responses_stream_with_retry(
         except Exception as e:
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses request failed (attempt {attempt}): {_exc_desc(e)}")
             if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_failure(
-                    proxy_addr,
-                    hard=isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError, httpx.RemoteProtocolError)),
-                )
+                # Setup failure = the tunnel never established (SOCKS
+                # handshake / connect / TLS died before any HTTP bytes).
+                # Always hard: retrying the same exit just burns another
+                # attempt on it. Note the allowlist approach misses
+                # socksio's raw ProtocolError("Malformed reply") — it escapes
+                # httpx unwrapped (no req= URL in the log), so it fell into
+                # the soft 1/2 grace path and was retried on the dead exit.
+                proxy_pool.report_failure(proxy_addr, hard=True)
                 proxy_pool.release(proxy_addr)
             last_error = e
             if attempt < attempts:
@@ -1371,6 +1441,8 @@ async def _zen_responses_stream_with_retry(
         _reason_buf = ""
         _content_buf = ""
         finish_reason = None
+        saw_error_event = False
+        transport_reported = False
         try:
             try:
                 async for line in resp.aiter_lines():
@@ -1402,6 +1474,8 @@ async def _zen_responses_stream_with_retry(
                         err_msg = (err.get("message") if isinstance(err, dict) else None) or piece.get("message") or "Upstream error"
                         _log(f"[zen] Responses stream error (attempt {attempt}): {err_msg}")
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
+                            saw_error_event = True
+                            last_error = ValueError(err_msg)
                             break  # retry below
                         yield _openai_stream_error(err_msg)
                         return
@@ -1447,10 +1521,32 @@ async def _zen_responses_stream_with_retry(
                             "function": {"arguments": piece.get("delta") or ""},
                         }]})
                         streamed_any = True
-                    elif ptype == "response.completed" or (ptype.startswith("response.") and piece.get("response", {}).get("status") == "completed"):
+                    elif ptype in ("response.completed", "response.incomplete", "response.failed") or (
+                        ptype.startswith("response.")
+                        and isinstance(piece.get("response"), dict)
+                        and piece.get("response", {}).get("status") in ("completed", "incomplete", "failed")
+                    ):
                         response_obj = piece.get("response") or {}
+                        status = response_obj.get("status") or ""
+                        if status == "failed":
+                            ferr = response_obj.get("error") or {}
+                            fmsg = (ferr.get("message") if isinstance(ferr, dict) else None) or "Upstream error"
+                            _log(f"[zen] Responses {status} (attempt {attempt}): {fmsg}")
+                            if not streamed_any and attempt < attempts and not await _client_gone(request):
+                                saw_error_event = True
+                                last_error = ValueError(fmsg)
+                                break  # retry below
+                            yield _openai_stream_error(fmsg)
+                            return
                         usage = _responses_usage_to_chat(response_obj.get("usage"))
-                        finish_reason = "tool_calls" if tool_count else "stop"
+                        if status == "incomplete":
+                            # Deterministic budget exhaustion (e.g. max_output_tokens
+                            # hit on a micro-request): retrying the identical
+                            # request just burns attempts. Translate to a
+                            # length finish immediately, never retry.
+                            finish_reason = "length"
+                        else:
+                            finish_reason = "tool_calls" if tool_count else "stop"
                         yield _chunk({}, finish_reason)
                         if usage:
                             yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model or '', 'choices': [], 'usage': usage})}\n\n"
@@ -1474,6 +1570,7 @@ async def _zen_responses_stream_with_retry(
                 last_error = e
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_stream_failure(proxy_addr)
+                    transport_reported = True
                 if not streamed_any and attempt < attempts and not await _client_gone(request):
                     pass  # retry below
                 else:
@@ -1490,11 +1587,34 @@ async def _zen_responses_stream_with_retry(
         if stream_completed:
             return
         if not streamed_any and attempt < attempts and not await _client_gone(request):
+            # Empty graceful EOF: the tunnel accepted the request but delivered
+            # zero events. Same class as a torn stream — blacklist and rotate
+            # so the retry (and the next request) does not stick to the same
+            # dead exit. Mirrors the chat-completions empty-stream path.
+            if (
+                PROXY_POOL_ENABLED and proxy_addr
+                and not saw_error_event and not transport_reported
+            ):
+                proxy_pool.report_stream_failure(proxy_addr)
+            if not transport_reported and not saw_error_event:
+                last_error = ValueError(f"responses stream ended before completion (streamed_any={streamed_any} content_len={len(_content_buf)})")
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] empty responses EOF (attempt {attempt}); req={_responses_diag(resp_body)}")
             await _backoff(attempt)
             attempt += 1
             continue
+        if PROXY_POOL_ENABLED and proxy_addr:
+            if not streamed_any and not saw_error_event and not transport_reported:
+                proxy_pool.report_stream_failure(proxy_addr)
+            elif streamed_any:
+                # Partial then graceful EOF: rotate without poisoning the pool.
+                try:
+                    proxy_pool._evict_client(proxy_addr)
+                except Exception:
+                    pass
+                if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
+                    proxy_pool.current = None
         err = ValueError(f"responses stream ended before completion (streamed_any={streamed_any} content_len={len(_content_buf)})")
-        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] {_exc_desc(err)}")
+        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] {_exc_desc(err)}; req={_responses_diag(resp_body)}")
         yield _openai_stream_error(_transport_error_message(last_error or err), "upstream_error", "incomplete_stream")
         return
 
@@ -1947,12 +2067,10 @@ async def _zen_stream_with_retry(
         except Exception as e:
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream request failed (attempt {attempt} pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'}): {_exc_desc(e)}")
             if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_failure(
-                    proxy_addr,
-                    hard=isinstance(
-                        e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError, httpx.RemoteProtocolError)
-                    ),
-                )
+                # Same as the responses setup path: a setup failure means the
+                # tunnel never established, so rotate immediately instead of
+                # spending the soft-grace retry on the same dead exit.
+                proxy_pool.report_failure(proxy_addr, hard=True)
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             last_error = e
@@ -3466,10 +3584,10 @@ async def chat_completions(request: Request):
         # its SSE events back into chat chunks.
         resp_body = _zen_responses_body(
             model, up_messages, tools,
-            effort=_model_suffix_effort(body.get("model")),
+            effort=_resolve_muse_effort(body.get("model"), body),
             max_tokens=body.get("max_tokens"),
             max_completion_tokens=body.get("max_completion_tokens"),
-            sampling=_sampling_from(body),
+            sampling=_responses_sampling_from(body),
         )
         if stream:
             return StreamingResponse(
@@ -3620,10 +3738,10 @@ async def messages(request: Request):
         _, headers = zen_request(model, up_messages, True, tools, None, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
         resp_body = _zen_responses_body(
             model, up_messages, tools,
-            effort=_model_suffix_effort(body.get("model")),
+            effort=_resolve_muse_effort(body.get("model"), body),
             max_tokens=body.get("max_tokens"),
             max_completion_tokens=body.get("max_completion_tokens"),
-            sampling=_sampling_from(body),
+            sampling=_responses_sampling_from(body),
         )
         data = await _aggregate_upstream_completion(
             request, resp_body, headers, user, oai_messages, session_id, model,
@@ -3951,10 +4069,10 @@ async def handle_responses(request: Request):
             # natively, then map the events to client Responses events as usual.
             resp_body = _zen_responses_body(
                 zen_model, up_messages, tools,
-                effort=_model_suffix_effort(model),
+                effort=_resolve_muse_effort(model, body),
                 max_tokens=body.get("max_tokens"),
                 max_completion_tokens=body.get("max_completion_tokens"),
-                sampling=_sampling_from(body),
+                sampling=_responses_sampling_from(body),
             )
             gen = _zen_responses_stream_with_retry(request, resp_body, headers, user, messages, session_id, zen_model)
             if stream:
