@@ -1124,10 +1124,18 @@ def _responses_content_parts(content, assistant: bool = False) -> list:
 
 
 def _chat_to_responses_input(messages: list[dict]) -> list:
-    """Convert chat.completions messages to Responses input items."""
+    """Convert chat.completions messages to Responses input items.
+
+    Clients (opencode) reuse tool-call ids across turns (e.g. ``bash:0`` for
+    every bash call in a session). The Responses API rejects a second
+    ``function_call_output`` for the same ``call_id``, so repeats are
+    renumbered in call order (``bash:0`` → ``bash:0__fc1`` …) and each output
+    pairs with the oldest unmatched call of its id. Pairing state resets at
+    every assistant message so interrupted turns can't mis-pair later ones.
+    """
     items = []
-    seen_calls: set[str] = set()  # function_call ids already emitted
-    seen_outputs: set[str] = set()  # function_call_output call_ids emitted
+    counters: dict[str, int] = {}  # orig call_id -> emitted function_call count
+    pending: dict[str, list] = {}  # orig call_id -> queue of new ids awaiting an output
     for m in messages or []:
         if not isinstance(m, dict):
             continue
@@ -1137,45 +1145,49 @@ def _chat_to_responses_input(messages: list[dict]) -> list:
             if parts:
                 items.append({"role": role, "content": parts})
         elif role == "assistant":
+            pending = {}  # turn boundary: an unmatched call must not pair a later turn's output
             parts = _responses_content_parts(m.get("content"), assistant=True)
             if parts:
                 items.append({"role": "assistant", "content": parts})
             for tc in m.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
-                # Retried/echoed turns can repeat the same call: the Responses
-                # API requires exactly one function_call per call_id.
-                cid = tc.get("id") or None
-                if cid and cid in seen_calls:
-                    continue
-                if cid:
-                    seen_calls.add(cid)
                 fn = tc.get("function") or {}
                 args = fn.get("arguments") or ""
                 if not isinstance(args, str):
                     args = json.dumps(args, ensure_ascii=False)
+                orig = tc.get("id") or "call"
+                n = counters.get(orig, 0)
+                counters[orig] = n + 1
+                new_id = orig if n == 0 else f"{orig}__fc{n}"
+                pending.setdefault(orig, []).append(new_id)
                 items.append({
                     "type": "function_call",
-                    "call_id": cid or oc_id("call"),
+                    "call_id": new_id,
                     "name": fn.get("name") or "",
                     "arguments": args,
                 })
         elif role == "tool":
-            # Duplicate tool results for one call_id (retry/echo artifacts)
-            # 400 upstream: each call must have exactly one output. Keep the
-            # first. Empty ids are passed through — they are distinct
-            # anonymous results, not duplicates.
-            tcid = m.get("tool_call_id") or None
-            if tcid and tcid in seen_outputs:
-                continue
-            if tcid:
-                seen_outputs.add(tcid)
             out = m.get("content")
             if not isinstance(out, str):
                 out = json.dumps(out, ensure_ascii=False) if out is not None else ""
+            orig = m.get("tool_call_id") or "call"
+            q = pending.get(orig)
+            if q:
+                call_id = q.pop(0)
+            elif orig in counters:
+                # The real pair was already emitted in-window; this is a
+                # re-echoed duplicate — drop it rather than minting a second
+                # output that would 400 or dangle unattached.
+                continue
+            else:
+                # No call with this id anywhere in the window (history was
+                # truncated mid-turn): keep the result under a unique id
+                # rather than deleting evidence or duplicating an id.
+                call_id = f"{orig}__orphan0"
             items.append({
                 "type": "function_call_output",
-                "call_id": tcid or "",
+                "call_id": call_id,
                 "output": out,
             })
     return items
