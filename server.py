@@ -479,6 +479,34 @@ def _is_context_limit_error(data: dict | None = None, body: str = "") -> bool:
         or "too many tokens" in text
         or ("requested" in text and "tokens" in text and "prompt" in text)
     )
+def _is_degraded_error(data: dict | None = None, body: str = "") -> bool:
+    """Recognize NVIDIA NIM 'DEGRADED function cannot be invoked' 400s.
+
+    NVIDIA returns this when a model deployment is temporarily degraded (often
+    a ``{"status":400,"title":"Bad Request","detail":"...DEGRADED..."}`` body).
+    It is deployment-level, NOT key-dependent: every key in the pool returns
+    the same 400, so retrying/rotating keys only burns the whole pool on
+    backoff. It must fail fast and terminal instead.
+    """
+    error = data.get("error") if isinstance(data, dict) else None
+    text = "".join(
+        str(value)
+        for value in (
+            error.get("message") if isinstance(error, dict) else error,
+            error.get("detail") if isinstance(error, dict) else None,
+            data.get("detail") if isinstance(data, dict) else None,
+            data.get("title") if isinstance(data, dict) else None,
+            body,
+        )
+        if value is not None
+    ).lower()
+    return (
+        "degraded function" in text
+        or "cannot be invoked" in text
+        or ("degraded" in text and "function" in text)
+    )
+
+
 def _is_region_error(data: dict | None = None, body: str = "") -> bool:
     """Recognize geo-restriction errors that depend on the proxy's exit country.
 
@@ -1444,7 +1472,7 @@ async def _zen_stream_with_retry(
                 proxy_pool.report_failure(
                     proxy_addr,
                     hard=isinstance(
-                        e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError)
+                        e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError, httpx.RemoteProtocolError)
                     ),
                 )
             if PROXY_POOL_ENABLED and proxy_addr:
@@ -2363,6 +2391,17 @@ async def nvidia_request_with_retry(
                         status_code=resp.status_code,
                         content={"error": {"message": err_msg, "type": "context_window_error"}},
                     )
+                if _is_degraded_error(data, body_text):
+                    # NVIDIA NIM deployment is DEGRADED: every key returns the same
+                    # 400. Fail fast instead of sweeping the whole pool on backoff.
+                    _log(f"[nvidia] Model deployment DEGRADED (key {key[-8:]}): {err_msg}")
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": {
+                            "message": f"NVIDIA model temporarily unavailable (degraded): {err_msg}",
+                            "type": "upstream_error",
+                        }},
+                    )
                 # 404 (model not authorized for this key) → advance to the next
                 # key with no delay; a different key may have access.
                 if resp.status_code < 500 and attempt < key_limit + attempts - 1:
@@ -2498,6 +2537,17 @@ async def nvidia_stream_with_retry(
             body_text = raw.decode("utf-8", errors="replace")
             consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
             _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): {err_msg}")
+            if _is_degraded_error(data, body_text):
+                # NVIDIA NIM deployment DEGRADED → every key returns the same
+                # 400; fail fast rather than sweeping the whole pool on backoff.
+                await resp.aclose()
+                await client.aclose()
+                _log(f"[nvidia] Model deployment DEGRADED (key {key[-8:]}): {err_msg}")
+                yield _openai_stream_error(
+                    f"NVIDIA model temporarily unavailable (degraded): {err_msg}",
+                    "upstream_error", str(resp.status_code),
+                )
+                return
             if resp.status_code in (401, 403):
                 nvidia_keys.report_rate_limit(key)
             await resp.aclose()
