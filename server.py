@@ -479,6 +479,25 @@ def _is_context_limit_error(data: dict | None = None, body: str = "") -> bool:
         or "too many tokens" in text
         or ("requested" in text and "tokens" in text and "prompt" in text)
     )
+def _is_bare_internal_error(status_code: int, data: dict | None = None, body: str = "") -> bool:
+    """Recognize the deterministic model-down 500: bare ``Internal server error``.
+
+    Zen returns exactly ``{"type":"error","error":{"type":"error","message":
+    "Internal server error"}}`` with no detail when the model deployment itself
+    is down (observed for muse-spark-1.3: identical on direct connections and
+    on every proxy exit, while other models succeed on the same proxies).
+    Retrying it across proxies only burns every attempt with backoff and delays
+    the caller, so it must fail fast with a clear hint instead.
+    """
+    if status_code != 500:
+        return False
+    error = data.get("error") if isinstance(data, dict) else None
+    msg = (error.get("message") if isinstance(error, dict) else None) or ""
+    if str(msg).strip().lower() != "internal server error":
+        return False
+    return len((body or "").strip()) < 200
+
+
 def _is_degraded_error(data: dict | None = None, body: str = "") -> bool:
     """Recognize NVIDIA NIM 'DEGRADED function cannot be invoked' 400s.
 
@@ -898,10 +917,8 @@ def _needs_buffered_fallback(model: str | None, tools, stream) -> bool:
     if not stream:
         return False
     m = (model or "").lower()
-    # Gate: muse-spark only when tools are present (stream:true+tools matrix);
-    # x-preview-f truncates even on plain reasoning turns, so buffer it whenever streaming.
-    if "muse-spark" in m or "muse_spark" in m:
-        return bool(tools)
+    # muse-spark streams through /zen/v1/responses (see _is_muse_spark) and does
+    # not use the chat/completions fallback at all.
     if "x-preview" in m or "x_preview" in m:
         return True
     return False
@@ -1039,6 +1056,443 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tok
     return req_body, headers
 
 
+# ── Muse Spark via /zen/v1/responses ─────────────────────────────
+# Muse Spark models (muse-spark-1.2/1.3-contributor-free, future versions) are
+# NOT served by /zen/v1/chat/completions — that route returns a deterministic
+# bare 500 "Internal server error", which previously presented as a flood of
+# retries. They are only served by the Responses endpoint. Requests addressed
+# at these models are translated to the Responses shape (input items,
+# max_output_tokens, reasoning:{effort,summary}) and streamed from
+# /zen/v1/responses, then translated back into chat.completion.chunk SSE so
+# every downstream client keeps speaking plain chat-completions.
+# (Same fix as 9router ab044e6/acb5c34.)
+
+_MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+
+
+def _is_muse_spark(model: str | None) -> bool:
+    m = (model or "").lower()
+    return "muse-spark" in m or "muse_spark" in m
+
+
+def _muse_effort(effort) -> str | None:
+    if not effort:
+        return None
+    e = str(effort).lower().strip()
+    if e in ("max", "ultra"):
+        return "xhigh"  # muse tops out at xhigh
+    return e if e in _MUSE_EFFORTS else None
+
+
+def _model_suffix_effort(model: str | None) -> str | None:
+    """Extract the reasoning-effort suffix from a client model id (…:high)."""
+    if not model:
+        return None
+    m = str(model)
+    if "/" in m:
+        m = m.rsplit("/", 1)[-1]
+    if ":" not in m:
+        return None
+    return _muse_effort(m.split(":", 1)[1])
+
+
+def _responses_content_parts(content, assistant: bool = False) -> list:
+    """Chat content → Responses content parts (images supported for muse)."""
+    text_type = "output_text" if assistant else "input_text"
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": text_type, "text": content}] if content else []
+    parts = []
+    for b in content if isinstance(content, list) else [content]:
+        if not isinstance(b, dict):
+            parts.append({"type": text_type, "text": str(b)})
+            continue
+        bt = (b.get("type") or "").lower()
+        if bt == "text":
+            t = b.get("text") or ""
+            if t:
+                parts.append({"type": text_type, "text": t})
+        elif bt == "image_url":
+            iu = b.get("image_url")
+            url = iu.get("url") if isinstance(iu, dict) else iu
+            if url:
+                parts.append({"type": "input_image", "image_url": url})
+        # reasoning/thinking blocks are dropped: the upstream derives its own
+        # thinking from the conversation and does not accept prior reasoning.
+    return parts
+
+
+def _chat_to_responses_input(messages: list[dict]) -> list:
+    """Convert chat.completions messages to Responses input items."""
+    items = []
+    seen_calls: set[str] = set()  # function_call ids already emitted
+    seen_outputs: set[str] = set()  # function_call_output call_ids emitted
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role in ("system", "user"):
+            parts = _responses_content_parts(m.get("content"))
+            if parts:
+                items.append({"role": role, "content": parts})
+        elif role == "assistant":
+            parts = _responses_content_parts(m.get("content"), assistant=True)
+            if parts:
+                items.append({"role": "assistant", "content": parts})
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                # Retried/echoed turns can repeat the same call: the Responses
+                # API requires exactly one function_call per call_id.
+                cid = tc.get("id") or None
+                if cid and cid in seen_calls:
+                    continue
+                if cid:
+                    seen_calls.add(cid)
+                fn = tc.get("function") or {}
+                args = fn.get("arguments") or ""
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
+                items.append({
+                    "type": "function_call",
+                    "call_id": cid or oc_id("call"),
+                    "name": fn.get("name") or "",
+                    "arguments": args,
+                })
+        elif role == "tool":
+            # Duplicate tool results for one call_id (retry/echo artifacts)
+            # 400 upstream: each call must have exactly one output. Keep the
+            # first. Empty ids are passed through — they are distinct
+            # anonymous results, not duplicates.
+            tcid = m.get("tool_call_id") or None
+            if tcid and tcid in seen_outputs:
+                continue
+            if tcid:
+                seen_outputs.add(tcid)
+            out = m.get("content")
+            if not isinstance(out, str):
+                out = json.dumps(out, ensure_ascii=False) if out is not None else ""
+            items.append({
+                "type": "function_call_output",
+                "call_id": tcid or "",
+                "output": out,
+            })
+    return items
+
+
+def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
+                        max_completion_tokens=None, sampling: dict | None = None) -> dict:
+    """Build the /zen/v1/responses request body from chat-style parameters."""
+    body: dict = {
+        "model": model,
+        "input": _chat_to_responses_input(messages),
+        "stream": True,
+    }
+    if tools:
+        body["tools"] = [
+            {
+                "type": "function",
+                "name": (t.get("function") or {}).get("name") or "",
+                "description": (t.get("function") or {}).get("description") or "",
+                "parameters": (t.get("function") or {}).get("parameters") or {},
+            }
+            for t in tools
+            if isinstance(t, dict)
+        ]
+        body["tool_choice"] = "auto"
+    mt = max_completion_tokens if max_completion_tokens is not None else max_tokens
+    if mt is not None:
+        body["max_output_tokens"] = mt
+    eff = _muse_effort(effort)
+    if eff:
+        body["reasoning"] = {"effort": eff, "summary": "auto"}
+    if sampling:
+        body.update(sampling)
+    return body
+
+
+def _responses_usage_to_chat(usage: dict | None) -> dict | None:
+    if not isinstance(usage, dict):
+        return None
+    prompt = usage.get("input_tokens") or 0
+    completion = usage.get("output_tokens") or 0
+    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": usage.get("total_tokens") or (prompt + completion),
+        "prompt_cache_hit_tokens": cached,
+    }
+
+
+async def _zen_responses_stream_with_retry(
+    request: Request,
+    resp_body: dict,
+    headers: dict,
+    user: str,
+    messages: list[dict],
+    session_id: str = None,
+    model: str = None,
+    max_retries: int = None,
+):
+    """Stream /zen/v1/responses as OpenAI chat.completion.chunk SSE with proxy retry.
+
+    Response events are folded back into chat chunks: output_text deltas →
+    content, reasoning deltas → reasoning_content, function_call items →
+    tool_calls, response.completed → finish chunk + usage + [DONE].
+    """
+    last_error = None
+    attempts = MAX_RETRIES if max_retries is None else max_retries
+    cid = oc_id("chatcmpl")
+    created = int(time.time())
+
+    def _chunk(delta: dict, finish: str | None = None) -> str:
+        return f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model or '', 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]})}\n\n"
+
+    attempt = 0
+    while True:
+        if attempt > attempts:
+            break
+        if await _client_gone(request):
+            _log("[zen] Client disconnected; aborting retries")
+            return
+        if PROXY_POOL_ENABLED:
+            if not proxy_pool.ready:
+                await proxy_pool.load()
+            p = await proxy_pool.select()
+            if p is None:
+                _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
+                await proxy_pool.force_refresh()
+                p = await proxy_pool.select()
+                if p is None:
+                    _log("[pool] Still no proxy after refresh, falling back to direct")
+                    client = _stream_default_client
+                    proxy_addr = None
+                else:
+                    proxy_addr = p["address"]
+                    client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
+            else:
+                proxy_addr = p["address"]
+                client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
+        else:
+            client = _stream_default_client
+            proxy_addr = None
+
+        try:
+            upstream_request = client.build_request(
+                "POST", "/zen/v1/responses", json=resp_body, headers=headers
+            )
+            resp = await client.send(upstream_request, stream=True)
+        except Exception as e:
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses request failed (attempt {attempt}): {_exc_desc(e)}")
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.report_failure(
+                    proxy_addr,
+                    hard=isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.ProxyError, httpx.RemoteProtocolError)),
+                )
+                proxy_pool.release(proxy_addr)
+            last_error = e
+            if attempt < attempts:
+                await _backoff(attempt)
+                attempt += 1
+                continue
+            yield _openai_stream_error(f"Stream request failed: {_exc_desc(e)}", "upstream_error", "transport_error")
+            return
+
+        if resp.status_code == 429:
+            try:
+                raw = await resp.aread()
+                data = json.loads(raw)
+                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+            except Exception:
+                err_msg = "Rate limit exceeded"
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses 429 (attempt {attempt}): {err_msg}")
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.report_ratelimit(proxy_addr)
+                proxy_pool.release(proxy_addr)
+            await resp.aclose()
+            if attempt < attempts:
+                await _backoff(attempt)
+                attempt += 1
+                continue
+            yield _openai_stream_error(err_msg + " (free model rate limit)", "rate_limit_error", "rate_limit_exceeded")
+            return
+
+        if resp.status_code >= 400:
+            try:
+                raw = await resp.aread()
+            except Exception:
+                raw = b""
+            body_text = raw.decode("utf-8", errors="replace")
+            try:
+                data = json.loads(body_text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                data = {}
+            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses error {resp.status_code}: {raw[:400]!r}")
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
+            if _is_region_error(data, body_text):
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.report_region_block(proxy_addr)
+                if attempt < attempts:
+                    await _backoff(attempt)
+                    attempt += 1
+                    continue
+                yield _openai_stream_error(err_msg, "upstream_error", "region_blocked")
+                return
+            await resp.aclose()
+            if resp.status_code >= 500 and attempt < attempts:
+                await _backoff(attempt)
+                attempt += 1
+                continue
+            yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+            return
+
+        # Success — translate response.* events into chat chunks
+        streamed_any = False
+        stream_completed = False
+        role_sent = False
+        tool_idx: dict[str, int] = {}
+        tool_count = 0
+        _reason_buf = ""
+        _content_buf = ""
+        finish_reason = None
+        try:
+            try:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data"):
+                        continue
+                    payload = line[4:].strip()
+                    if payload.startswith(":"):
+                        payload = payload[1:].strip()
+                    if not payload or payload == "[DONE]":
+                        if payload == "[DONE]":
+                            stream_completed = True
+                            yield "data: [DONE]\n\n"
+                            break
+                        continue
+                    try:
+                        piece = json.loads(payload)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        continue
+                    if not isinstance(piece, dict):
+                        continue
+                    ptype = piece.get("type") or ""
+
+                    if ptype in ("error", "response.failed", "response.incomplete") and not piece.get("response"):
+                        err = piece.get("error") or {}
+                        err_msg = (err.get("message") if isinstance(err, dict) else None) or piece.get("message") or "Upstream error"
+                        _log(f"[zen] Responses stream error (attempt {attempt}): {err_msg}")
+                        if not streamed_any and attempt < attempts and not await _client_gone(request):
+                            break  # retry below
+                        yield _openai_stream_error(err_msg)
+                        return
+
+                    if ptype == "response.output_text.delta":
+                        d = piece.get("delta") or ""
+                        if not role_sent:
+                            role_sent = True
+                            yield _chunk({"role": "assistant", "content": ""})
+                        yield _chunk({"content": d})
+                        _content_buf += d
+                        streamed_any = True
+                    elif ptype in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
+                        d = piece.get("delta") or ""
+                        if not role_sent:
+                            role_sent = True
+                            yield _chunk({"role": "assistant", "content": ""})
+                        yield _chunk({"reasoning_content": d})
+                        _reason_buf += d
+                        streamed_any = True
+                    elif ptype == "response.output_item.added":
+                        item = piece.get("item") or {}
+                        if item.get("type") == "function_call":
+                            idx = tool_count
+                            tool_count += 1
+                            iid = item.get("id") or item.get("call_id") or f"fc_{idx}"
+                            tool_idx[iid] = idx
+                            if not role_sent:
+                                role_sent = True
+                                yield _chunk({"role": "assistant", "content": ""})
+                            yield _chunk({"tool_calls": [{
+                                "index": idx,
+                                "id": item.get("call_id") or item.get("id") or oc_id("call"),
+                                "type": "function",
+                                "function": {"name": item.get("name") or "", "arguments": ""},
+                            }]})
+                            streamed_any = True
+                    elif ptype == "response.function_call_arguments.delta":
+                        iid = piece.get("item_id") or ""
+                        idx = tool_idx.get(iid, 0)
+                        yield _chunk({"tool_calls": [{
+                            "index": idx,
+                            "function": {"arguments": piece.get("delta") or ""},
+                        }]})
+                        streamed_any = True
+                    elif ptype == "response.completed" or (ptype.startswith("response.") and piece.get("response", {}).get("status") == "completed"):
+                        response_obj = piece.get("response") or {}
+                        usage = _responses_usage_to_chat(response_obj.get("usage"))
+                        finish_reason = "tool_calls" if tool_count else "stop"
+                        yield _chunk({}, finish_reason)
+                        if usage:
+                            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model or '', 'choices': [], 'usage': usage})}\n\n"
+                            _add_tokens(
+                                model or "unknown",
+                                usage.get("prompt_tokens") or 0,
+                                usage.get("completion_tokens") or 0,
+                                usage.get("prompt_cache_hit_tokens") or 0,
+                                0,
+                            )
+                        if session_id and _reason_buf and _content_buf:
+                            _remember_reasoning(session_id, _content_buf, _reason_buf)
+                        yield "data: [DONE]\n\n"
+                        stream_completed = True
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.report_success(proxy_addr)
+                        _log(f"[zen] OK [{model}|{proxy_addr or 'direct'}] responses stream complete")
+                        break
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses stream interrupted: {_exc_desc(e)}")
+                last_error = e
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.report_stream_failure(proxy_addr)
+                if not streamed_any and attempt < attempts and not await _client_gone(request):
+                    pass  # retry below
+                else:
+                    yield _openai_stream_error(_transport_error_message(e), "upstream_error", "transport_error")
+                    return
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            if PROXY_POOL_ENABLED and proxy_addr:
+                proxy_pool.release(proxy_addr)
+
+        if stream_completed:
+            return
+        if not streamed_any and attempt < attempts and not await _client_gone(request):
+            await _backoff(attempt)
+            attempt += 1
+            continue
+        err = ValueError(f"responses stream ended before completion (streamed_any={streamed_any} content_len={len(_content_buf)})")
+        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] {_exc_desc(err)}")
+        yield _openai_stream_error(_transport_error_message(last_error or err), "upstream_error", "incomplete_stream")
+        return
+
+    yield _openai_stream_error(
+        f"connection error: responses stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}",
+        "upstream_error",
+        "transport_error",
+    )
+
+
 # ── Proxy-aware Zen API calls ─────────────────────────────────────
 
 def _needs_stream_bridge(model: str | None) -> bool:
@@ -1066,13 +1520,15 @@ async def _aggregate_upstream_completion(
     session_id: str = None,
     model: str = None,
     max_retries: int = None,
+    gen=None,
 ):
     """Stream the upstream response and assemble a buffered chat.completion.
 
     Consumes ``_zen_stream_with_retry`` (which already owns proxy-pool
     selection, retries, torn-stream resume and terminal-error framing) and
     folds the emitted deltas into the same JSON object the non-streaming
-    transport would have returned.
+    transport would have returned. ``gen`` overrides the stream source (used by
+    the muse-spark Responses-API route, which emits the same chat chunks).
     """
     stream_body = dict(req_body)
     stream_body["stream"] = True
@@ -1086,9 +1542,10 @@ async def _aggregate_upstream_completion(
     usage: dict | None = None
     saw_error = None
 
-    gen = _zen_stream_with_retry(
-        request, stream_body, headers, user, messages, session_id, model, max_retries
-    )
+    if gen is None:
+        gen = _zen_stream_with_retry(
+            request, stream_body, headers, user, messages, session_id, model, max_retries
+        )
     got_any_chunk = False
     async for raw in gen:
         for block in str(raw).split("\n\n"):
@@ -1338,12 +1795,21 @@ async def _zen_request_with_retry(
             if resp.status_code >= 400:
                 err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
                 is_context_exceeded = _is_context_limit_error(data, body_text)
+                bare_500 = _is_bare_internal_error(resp.status_code, data, body_text)
                 _log(f"[zen] Error {resp.status_code}: {err_msg}")
                 # Not a proxy failure: 4xx/5xx are upstream or request errors that
                 # repeat identically on every proxy, so never blacklist for them.
+                # Fail fast on deterministic errors (all 4xx, and the bare 500
+                # "Internal server error" that means the model is down upstream):
+                # retrying them across proxies only multiplies one fast failure
+                # into ~6 slow ones with backoff. Only transient 5xx
+                # (502/503/504, detailed 500s) are worth another attempt.
                 if is_context_exceeded:
                     _log("[zen] Context limit error; not retrying on another proxy")
-                if not is_context_exceeded and attempt < attempts:
+                if bare_500:
+                    _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
+                    err_msg = f"{err_msg} (model appears down upstream; try another free model)"
+                elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
                     await _backoff(attempt)
                     continue
                 return JSONResponse(
@@ -1587,7 +2053,10 @@ async def _zen_stream_with_retry(
             if is_context_exceeded:
                 _log("[zen] Context limit error; not retrying on another proxy")
             await resp.aclose()
-            if resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
+            if _is_bare_internal_error(resp.status_code, data, body_text):
+                _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
+                err_msg = f"{err_msg} (model appears down upstream; try another free model)"
+            elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
                 await _backoff(attempt)
                 attempt += 1
                 continue
@@ -1969,7 +2438,10 @@ async def _zen_stream_anthropic_with_retry(
                         return
                     if is_context_exceeded:
                         _log("[zen] Context limit error; not retrying on another proxy")
-                    if resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
+                    if _is_bare_internal_error(resp.status_code, data, body_text):
+                        _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
+                        err_msg = f"{err_msg} (model appears down upstream; try another free model)"
+                    elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
                         await _backoff(attempt)
                         attempt += 1
                         continue
@@ -2976,6 +3448,33 @@ async def chat_completions(request: Request):
     up_messages = _prepare_upstream_messages(session_id, _normalize_messages(messages))
     req_body, headers = zen_request(model, up_messages, stream, tools, tool_choice, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
 
+    if _is_muse_spark(model):
+        # Muse Spark is only served by /zen/v1/responses; chat/completions
+        # returns a deterministic 500. Translate to Responses and translate
+        # its SSE events back into chat chunks.
+        resp_body = _zen_responses_body(
+            model, up_messages, tools,
+            effort=_model_suffix_effort(body.get("model")),
+            max_tokens=body.get("max_tokens"),
+            max_completion_tokens=body.get("max_completion_tokens"),
+            sampling=_sampling_from(body),
+        )
+        if stream:
+            return StreamingResponse(
+                _zen_responses_stream_with_retry(request, resp_body, headers, user, messages or [], session_id, model),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        data = await _aggregate_upstream_completion(
+            request, resp_body, headers, user, messages or [], session_id, model,
+            gen=_zen_responses_stream_with_retry(request, resp_body, headers, user, messages or [], session_id, model),
+        )
+        if isinstance(data, JSONResponse):
+            return data
+        if data is None:
+            return JSONResponse(status_code=502, content={"error": {"message": "Client disconnected", "type": "upstream_error"}})
+        return data
+
     if stream:
         if _needs_buffered_fallback(model, tools, stream):
             _log(f"[zen] buffered fallback: stream:true -> stream:false upstream (model={model})")
@@ -3102,6 +3601,40 @@ async def messages(request: Request):
     input_tokens = len(json.dumps(oai_messages)) // 4
 
     up_messages = _prepare_upstream_messages(session_id, oai_messages)
+
+    if _is_muse_spark(model):
+        # Muse Spark via /zen/v1/responses (see chat route); aggregate and
+        # reframe as Anthropic SSE (or a plain message when not streaming).
+        _, headers = zen_request(model, up_messages, True, tools, None, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
+        resp_body = _zen_responses_body(
+            model, up_messages, tools,
+            effort=_model_suffix_effort(body.get("model")),
+            max_tokens=body.get("max_tokens"),
+            max_completion_tokens=body.get("max_completion_tokens"),
+            sampling=_sampling_from(body),
+        )
+        data = await _aggregate_upstream_completion(
+            request, resp_body, headers, user, oai_messages, session_id, model,
+            gen=_zen_responses_stream_with_retry(request, resp_body, headers, user, oai_messages, session_id, model),
+        )
+        if isinstance(data, JSONResponse):
+            return data
+        if data is None:
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
+            )
+        if stream:
+            async def _muse_anthropic_sse():
+                for chunk in _buffered_to_anthropic_sse(data, model, input_tokens):
+                    yield chunk
+            return StreamingResponse(
+                _muse_anthropic_sse(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        return openai_to_anthropic(data, model, input_tokens)
+
     req_body, headers = zen_request(model, up_messages, stream, tools, None, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
 
     if stream:
@@ -3399,6 +3932,38 @@ async def handle_responses(request: Request):
         session_id = get_session(user, messages)
         up_messages = _prepare_upstream_messages(session_id, messages)
         req_body, headers = zen_request(zen_model, up_messages, stream, tools, tool_choice, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
+
+        if _is_muse_spark(zen_model):
+            # Client speaks Responses already, but the Zen upstream for muse is
+            # /zen/v1/responses, not chat/completions (which 500s). Stream there
+            # natively, then map the events to client Responses events as usual.
+            resp_body = _zen_responses_body(
+                zen_model, up_messages, tools,
+                effort=_model_suffix_effort(model),
+                max_tokens=body.get("max_tokens"),
+                max_completion_tokens=body.get("max_completion_tokens"),
+                sampling=_sampling_from(body),
+            )
+            gen = _zen_responses_stream_with_retry(request, resp_body, headers, user, messages, session_id, zen_model)
+            if stream:
+                return StreamingResponse(
+                    _stream_as_responses(gen, model, session_id),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+                )
+            data = await _aggregate_upstream_completion(
+                request, resp_body, headers, user, messages, session_id, zen_model,
+                gen=_zen_responses_stream_with_retry(request, resp_body, headers, user, messages, session_id, zen_model),
+            )
+            if isinstance(data, JSONResponse):
+                return data
+            if data is None:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": "Client disconnected", "type": "upstream_error"}},
+                )
+            return _chat_to_responses(data, model)
+
         if stream:
             # Known-truncating models: stream:true+tools (muse-spark) or stream:true reasoning (x-preview)
             # closes without finish_reason/[DONE]. Same buffered bridge as chat/messages.
