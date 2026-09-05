@@ -394,46 +394,25 @@ def _openai_stream_error(
     error_type: str = "upstream_error",
     code: str | None = None,
 ) -> str:
-    """Return a terminal OpenAI SSE sequence that always carries finish_reason.
+    """Return a terminal OpenAI SSE error sequence (no assistant content).
 
-    The wire error object is emitted first for compatibility, then a normal
-    assistant chunk carries ``message`` as content and closes with
-    ``finish_reason: "stop"`` followed by ``[DONE]``. Clients that hard-fail
-    when a stream ends without any finish_reason (observed as "OpenAI
-    completions stream closed before a finish_reason was received") instead
-    receive a completed turn whose text explains the failure.
+    Emits a single ``{"error": ...}`` event followed by ``[DONE]``. Never a
+    fake ``stop`` turn: strict clients ingest content chunks as successful
+    answers and stall silently on disguised errors.
     """
     error = {"message": message, "type": error_type}
     if code:
         error["code"] = code
-    cid = oc_id("chatcmpl")
-    now = int(time.time())
-    content_chunk = {
-        "id": cid,
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": "",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"role": "assistant", "content": f"[upstream error] {message}"},
-                "finish_reason": None,
-            }
-        ],
-    }
-    stop_chunk = {
-        "id": cid,
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": "",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    }
-    return (
-        f"data: {json.dumps({'error': error})}\n\n"
-        f"data: {json.dumps(content_chunk)}\n\n"
-        f"data: {json.dumps(stop_chunk)}\n\n"
-        "data: [DONE]\n\n"
-    )
+    # Terminal failure: emit a bare error event, NO assistant content chunk.
+    # The previous shape appended a "[upstream error] ..." content chunk with
+    # finish_reason "stop", which strict clients (opencode AI SDK:
+    # text-delta + finish-step stop) ingest as a *successful* turn whose text
+    # happens to be an error message — the agent then stalls silently instead
+    # of surfacing/ retrying a proper failure. A bare error event maps to the
+    # SDK's `error` branch (Effect.fail -> halt -> finish "error"), which is
+    # visible and retryable. Clients that need finish_reasoned turns only get
+    # them on success paths now.
+    return f"data: {json.dumps({'error': error})}\n\n" "data: [DONE]\n\n"
 
 
 def _transport_error_message(exc: BaseException) -> str:
@@ -1787,13 +1766,13 @@ async def _aggregate_upstream_completion(
 
     # Terminal failures: nothing usable was produced. Surface the upstream
     # error exactly like the buffered transport would (502 + error JSON).
-    # _openai_stream_error frames errors as literal "[upstream error] …"
-    # content; strip that framing so callers never see it as an answer.
-    if saw_error and not has_tool_calls and content.startswith("[upstream error]"):
-        msg = content[len("[upstream error] "):]
+    # _openai_stream_error emits a bare {"error": ...} event with no content
+    # chunks; saw_error carries its message. (Legacy "[upstream error] ..."
+    # content framing retired: strict clients ingest content as answers.)
+    if saw_error and not has_tool_calls and not content:
         return JSONResponse(
             status_code=502,
-            content={"error": {"message": msg, "type": "upstream_error"}},
+            content={"error": {"message": saw_error, "type": "upstream_error"}},
         )
     if not got_any_chunk:
         return JSONResponse(
