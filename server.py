@@ -1122,7 +1122,7 @@ def _resolve_muse_effort(model_id: str | None, body: dict | None = None) -> str 
 
 # Floor for tool-free Responses requests: below this the model can burn the
 # whole budget on reasoning and emit zero events (deterministic empty-EOF).
-_RESPONSES_MIN_OUTPUT_TOKENS = 128
+_RESPONSES_MIN_OUTPUT_TOKENS = 512
 
 
 _RESPONSES_SAMPLING_KEYS = ("temperature", "top_p")
@@ -1255,15 +1255,22 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
         ]
         body["tool_choice"] = "auto"
     mt = max_completion_tokens if max_completion_tokens is not None else max_tokens
+    # Muse's reasoning tokens count against the SAME budget as output
+    # (usage showed completion_tokens=128 with zero text at max_out=128),
+    # so a tool-free budget below the floor is raised to leave room for
+    # thinking AND text. Unset stays unset (upstream default, unlimited).
+    if mt is not None and not tools and mt < _RESPONSES_MIN_OUTPUT_TOKENS:
+        mt = _RESPONSES_MIN_OUTPUT_TOKENS
     if mt is not None:
-        # Micro-requests (title/summary gens with max_tokens~20) spend their
-        # whole output budget thinking and the upstream closes the stream with
-        # zero events — a deterministic empty-EOF no retry can fix (observed
-        # direct, no proxy involved). Floor the budget so the turn can emit.
-        if not tools and mt < _RESPONSES_MIN_OUTPUT_TOKENS:
-            mt = _RESPONSES_MIN_OUTPUT_TOKENS
         body["max_output_tokens"] = mt
     eff = _muse_effort(effort)
+    # No default effort cap: unset effort passes through with no reasoning
+    # block (upstream default, full quality). Only explicit high/xhigh/max/
+    # ultra on tool-free muse requests is downgraded to low — those levels
+    # deterministically burn a small output budget thinking.
+    if not tools and _is_muse_spark(model) and eff in ("high", "xhigh", "max", "ultra"):
+        eff = "low"
+        _log(f"[zen] [{model}|scan] downgrading reasoning {effort} to low (tool-free muse request)")
     if eff:
         body["reasoning"] = {"effort": eff, "summary": "auto"}
     if sampling:
@@ -1426,6 +1433,13 @@ async def _zen_responses_stream_with_retry(
                 return
             await resp.aclose()
             if resp.status_code >= 500 and attempt < attempts:
+                # 504 "Upstream response was not valid JSON" is the provider
+                # (Console) failing to parse the MODEL's raw output — the shape
+                # of our request (reasoning level, budget) influences whether
+                # the model emits parseable JSON. Log the request shape so the
+                # next occurrence is correlatable, then retry as before.
+                if resp.status_code == 504:
+                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] 504 detail (attempt {attempt}); req={_responses_diag(resp_body)}")
                 await _backoff(attempt)
                 attempt += 1
                 continue
@@ -1521,6 +1535,31 @@ async def _zen_responses_stream_with_retry(
                             "function": {"arguments": piece.get("delta") or ""},
                         }]})
                         streamed_any = True
+                    elif ptype == "response.output_text.done":
+                        txt = piece.get("text") or ""
+                        if txt and not _content_buf:
+                            if not role_sent:
+                                role_sent = True
+                                yield _chunk({"role": "assistant", "content": ""})
+                            yield _chunk({"content": txt})
+                            _content_buf += txt
+                            streamed_any = True
+                    elif ptype == "response.output_item.done":
+                        item = piece.get("item") or {}
+                        if isinstance(item, dict) and item.get("type") == "message":
+                            txts = []
+                            for part in item.get("content") or []:
+                                if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                                    if part.get("text"):
+                                        txts.append(part["text"])
+                            txt = "".join(txts)
+                            if txt and not _content_buf:
+                                if not role_sent:
+                                    role_sent = True
+                                    yield _chunk({"role": "assistant", "content": ""})
+                                yield _chunk({"content": txt})
+                                _content_buf += txt
+                                streamed_any = True
                     elif ptype in ("response.completed", "response.incomplete", "response.failed") or (
                         ptype.startswith("response.")
                         and isinstance(piece.get("response"), dict)
@@ -1538,6 +1577,24 @@ async def _zen_responses_stream_with_retry(
                                 break  # retry below
                             yield _openai_stream_error(fmsg)
                             return
+                        if not _content_buf:
+                            try:
+                                for oitem in response_obj.get("output") or []:
+                                    if not isinstance(oitem, dict):
+                                        continue
+                                    if oitem.get("type") == "message":
+                                        for part in oitem.get("content") or []:
+                                            if isinstance(part, dict) and part.get("type") in ("output_text", "text") and part.get("text"):
+                                                if not role_sent:
+                                                    role_sent = True
+                                                    yield _chunk({"role": "assistant", "content": ""})
+                                                yield _chunk({"content": part["text"]})
+                                                _content_buf += part["text"]
+                                                streamed_any = True
+                            except Exception:
+                                pass
+                            if _content_buf:
+                                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] recovered content from {status or 'completed'} snapshot ({len(_content_buf)} chars, no deltas)")
                         usage = _responses_usage_to_chat(response_obj.get("usage"))
                         if status == "incomplete":
                             # Deterministic budget exhaustion (e.g. max_output_tokens
