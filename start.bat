@@ -1,12 +1,15 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+set "FOUND="
 
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":6446" ^| findstr "LISTENING"') do (
-    echo Port 6446 is already in use by PID %%P.
-    echo Run stop.bat first, or use the existing server.
-    exit /b 1
+    set "FOUND=1"
+    echo Stopping process %%P on port 6446...
+    taskkill /PID %%P /F >nul 2>&1
 )
+
+if not defined FOUND echo No process is listening on port 6446.
+cd /d "%~dp0"
 
 set OPENCODE_ENABLE_EXA=1
 python server.py

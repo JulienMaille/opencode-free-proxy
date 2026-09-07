@@ -147,8 +147,30 @@ def _log(*a):
         print(f"\x1b[33m{msg}\x1b[0m", flush=True)
     else:
         print(msg, flush=True)
-    with open(_BASE_DIR / "proxy.log", "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
+    _append_log(_BASE_DIR / "proxy.log", msg)
+
+
+_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate proxy.log past 5 MB
+_LOG_KEEP_BYTES = 1 * 1024 * 1024  # ...keeping the last 1 MB
+
+
+def _append_log(path, msg: str):
+    """Append one line, rotating the file down to its tail past the cap."""
+    try:
+        if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
+            with open(path, "rb") as f:
+                f.seek(-_LOG_KEEP_BYTES, 2)
+                tail = f.read()
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1:]
+            with open(path, "wb") as f:
+                f.write(f"[... rotated, kept last {len(tail) // 1024} KB ...]\n".encode("utf-8"))
+                f.write(tail)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
 
 
 def oc_id(prefix: str) -> str:
@@ -237,8 +259,14 @@ _load_tokens()
 # lack it before re-forwarding them.
 _REASONING_CACHE_MAX = 200  # reasoning entries kept per session
 _REASONING_CACHE_MAX_SESSIONS = 500  # bound total sessions on disk
+# Entries older than this are dropped on save: a thinking-mode session that
+# has been idle for a full day is gone client-side anyway, so its cached
+# thinking is dead weight. Keeps reasoning_cache.json from growing to tens
+# of MB (each reasoning blob can be very large).
+_REASONING_ENTRY_TTL_SECS = 24 * 3600
 _reasoning_file = _BASE_DIR / "reasoning_cache.json"
-_reasoning_cache: dict[str, dict[str, str]] = {}
+# _reasoning_cache: session -> content-hash -> {"text", "at"}
+_reasoning_cache: dict[str, dict[str, dict]] = {}
 
 
 def _load_reasoning():
@@ -246,17 +274,70 @@ def _load_reasoning():
     try:
         with open(_reasoning_file, encoding="utf-8") as f:
             raw = json.load(f) or {}
-        _reasoning_cache = {k: dict(v) for k, v in raw.items() if isinstance(v, dict)}
     except Exception:
         _reasoning_cache = {}
+        return
+    now = time.time()
+    fresh: dict[str, dict[str, dict]] = {}
+    kept_sessions = kept_entries = 0
+    dropped_entries = 0
+    for sid, sack in raw.items():
+        if not isinstance(sack, dict):
+            continue
+        fsack: dict[str, dict] = {}
+        for key, val in sack.items():
+            # Accept the legacy flat shape {hash: text} and migrate it.
+            if isinstance(val, str):
+                val = {"text": val, "at": 0}
+            if (
+                isinstance(val, dict)
+                and isinstance(val.get("text"), str)
+                and now - float(val.get("at") or 0) <= _REASONING_ENTRY_TTL_SECS
+            ):
+                fsack[key] = val
+                kept_entries += 1
+            else:
+                dropped_entries += 1
+        if fsack:
+            fresh[sid] = fsack
+            kept_sessions += 1
+    _reasoning_cache = dict(list(fresh.items())[-_REASONING_CACHE_MAX_SESSIONS:])
+    if dropped_entries:
+        print(f"[reasoning] load: kept {kept_entries} entries in {kept_sessions} sessions, expired {dropped_entries}", flush=True)
+
+
+def _prune_reasoning(now: float | None = None) -> int:
+    """Drop expired entries and keep the session cap. Returns dropped count."""
+    now = time.time() if now is None else now
+    dropped = 0
+    for sack in _reasoning_cache.values():
+        if not isinstance(sack, dict):
+            continue
+        for key in list(sack):
+            val = sack.get(key)
+            if not isinstance(val, dict) or now - float(val.get("at") or 0) > _REASONING_ENTRY_TTL_SECS:
+                sack.pop(key, None)
+                dropped += 1
+    for sid in list(_reasoning_cache):
+        if not _reasoning_cache[sid]:
+            _reasoning_cache.pop(sid, None)
+    if len(_reasoning_cache) > _REASONING_CACHE_MAX_SESSIONS:
+        overflow = len(_reasoning_cache) - _REASONING_CACHE_MAX_SESSIONS
+        for sid in list(_reasoning_cache)[:overflow]:
+            _reasoning_cache.pop(sid, None)
+            dropped += 1
+    return dropped
 
 
 def _save_reasoning():
     """Persist the reasoning cache without blocking the event loop.
 
-    Snapshots the cache (so the writer thread never races live mutations) and
-    runs the JSON dump in a thread-pool executor; the write is fire-and-forget.
+    Prunes expired entries first (so the on-disk file stays small), then
+    snapshots the cache (so the writer thread never races live mutations)
+    and runs the JSON dump in a thread-pool executor; the write is
+    fire-and-forget.
     """
+    _prune_reasoning()
     body = {sid: dict(sack) for sid, sack in _reasoning_cache.items()}
 
     def _write():
@@ -284,7 +365,7 @@ def _remember_reasoning(session_id, content, reasoning):
     if not isinstance(sack, dict):
         sack = {}
         _reasoning_cache[session_id] = sack
-    sack[key] = reasoning
+    sack[key] = {"text": reasoning, "at": time.time()}
     if len(sack) > _REASONING_CACHE_MAX:
         for old in list(sack)[: len(sack) - _REASONING_CACHE_MAX]:
             sack.pop(old, None)
@@ -780,6 +861,8 @@ def _prepare_upstream_messages(session_id, messages: list[dict]) -> list[dict]:
         ):
             key = hashlib.sha256(content.encode("utf-8")).hexdigest()
             cached = _reasoning_cache.get(session_id, {}).get(key)
+            if isinstance(cached, dict):
+                cached = cached.get("text")
             if cached:
                 combined["reasoning_content"] = cached
 
@@ -1213,6 +1296,24 @@ def _chat_to_responses_input(messages: list[dict]) -> list:
     return items
 
 
+def _responses_continuation_body(resp_body: dict, content: str) -> dict:
+    """Clone a Responses body with the partial assistant output appended.
+
+    A mid-stream rate-limit or torn tunnel cuts muse answers off mid-work;
+    re-issuing with the partial output as an assistant item lets the model
+    continue from the cutoff instead of discarding the whole turn.
+    """
+    body = dict(resp_body)
+    items = list(body.get("input") or [])
+    if content:
+        items.append({
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}],
+        })
+    body["input"] = items
+    return body
+
+
 def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
                         max_completion_tokens=None, sampling: dict | None = None) -> dict:
     """Build the /zen/v1/responses request body from chat-style parameters."""
@@ -1310,13 +1411,63 @@ async def _zen_responses_stream_with_retry(
     attempts = MAX_RETRIES if max_retries is None else max_retries
     cid = oc_id("chatcmpl")
     created = int(time.time())
+    continuations = 0  # mid-stream resumes (partial content appended as context)
 
     def _chunk(delta: dict, finish: str | None = None) -> str:
         return f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model or '', 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]})}\n\n"
 
+    tool_idx: dict[str, int] = {}
+    tool_args: dict[int, str] = {}
+    tool_count_holder = [0]
+
+    def _fc_chunks(item: dict) -> list:
+        """Translate a full Responses function_call item into chat tool_call chunk(s).
+
+        Not every upstream announce carries the add→delta sequence: some
+        servers only emit the finished item. Without this fallback the call
+        was silently dropped — the classic "announces the action, executes
+        nothing, stops" turn. Only the not-yet-emitted suffix of arguments
+        is sent, so a done event repeating deltas never duplicates them.
+        """
+        nonlocal tool_streamed, role_sent
+        chunks: list = []
+        if not role_sent:
+            role_sent = True
+            chunks.append(_chunk({"role": "assistant", "content": ""}))
+        iid = item.get("id") or item.get("call_id") or ""
+        idx = tool_idx.get(iid)
+        head = None
+        if idx is None:
+            idx = tool_count_holder[0]
+            tool_count_holder[0] += 1
+            tool_idx[iid] = idx
+            tool_args[idx] = ""
+            head = {
+                "index": idx,
+                "id": item.get("call_id") or item.get("id") or oc_id("call"),
+                "type": "function",
+                "function": {"name": item.get("name") or "", "arguments": ""},
+            }
+        full = item.get("arguments") or ""
+        emitted = tool_args.get(idx, "")
+        suffix = full[len(emitted):] if isinstance(full, str) else ""
+        if head is not None:
+            head["function"]["arguments"] = suffix
+            tool_args[idx] = emitted + suffix
+            chunks.append(_chunk({"tool_calls": [head]}))
+            tool_streamed = True
+        elif suffix:
+            tool_args[idx] = emitted + suffix
+            chunks.append(_chunk({"tool_calls": [{
+                "index": idx,
+                "function": {"arguments": suffix},
+            }]}))
+            tool_streamed = True
+        return chunks
+
     attempt = 0
     while True:
-        if attempt > attempts:
+        if attempt > attempts + MAX_STREAM_CONTINUATIONS:
             break
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
@@ -1429,13 +1580,17 @@ async def _zen_responses_stream_with_retry(
         streamed_any = False
         stream_completed = False
         role_sent = False
-        tool_idx: dict[str, int] = {}
-        tool_count = 0
+        tool_streamed = False
         _reason_buf = ""
         _content_buf = ""
         finish_reason = None
         saw_error_event = False
         transport_reported = False
+        empty_turn_retry = False
+        tool_idx.clear()
+        tool_args.clear()
+        tool_count_holder[0] = 0
+        tool_count = 0
         try:
             try:
                 async for line in resp.aiter_lines():
@@ -1466,10 +1621,24 @@ async def _zen_responses_stream_with_retry(
                         err = piece.get("error") or {}
                         err_msg = (err.get("message") if isinstance(err, dict) else None) or piece.get("message") or "Upstream error"
                         _log(f"[zen] Responses stream error (attempt {attempt}): {err_msg}")
+                        last_error = ValueError(err_msg)
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
                             saw_error_event = True
-                            last_error = ValueError(err_msg)
                             break  # retry below
+                        if (
+                            streamed_any and _content_buf and not tool_streamed
+                            and continuations < MAX_STREAM_CONTINUATIONS
+                            and not await _client_gone(request)
+                        ):
+                            # Mid-stream in-body error (e.g. provider rate limit):
+                            # resume from the cutoff instead of truncating.
+                            saw_error_event = True
+                            continuations += 1
+                            resp_body = _responses_continuation_body(resp_body, _content_buf)
+                            _content_buf = ""
+                            _reason_buf = ""
+                            _log(f"[zen] Continuing responses stream after in-body error (continuation {continuations})")
+                            break  # retry below (streams away from the rate-limited exit)
                         yield _openai_stream_error(err_msg)
                         return
 
@@ -1492,27 +1661,21 @@ async def _zen_responses_stream_with_retry(
                     elif ptype == "response.output_item.added":
                         item = piece.get("item") or {}
                         if item.get("type") == "function_call":
-                            idx = tool_count
-                            tool_count += 1
-                            iid = item.get("id") or item.get("call_id") or f"fc_{idx}"
-                            tool_idx[iid] = idx
-                            if not role_sent:
-                                role_sent = True
-                                yield _chunk({"role": "assistant", "content": ""})
-                            yield _chunk({"tool_calls": [{
-                                "index": idx,
-                                "id": item.get("call_id") or item.get("id") or oc_id("call"),
-                                "type": "function",
-                                "function": {"name": item.get("name") or "", "arguments": ""},
-                            }]})
+                            for fc_chunk in _fc_chunks(item):
+                                yield fc_chunk
+                            tool_count = tool_count_holder[0]
                             streamed_any = True
                     elif ptype == "response.function_call_arguments.delta":
                         iid = piece.get("item_id") or ""
                         idx = tool_idx.get(iid, 0)
+                        frag = piece.get("delta") or ""
                         yield _chunk({"tool_calls": [{
                             "index": idx,
-                            "function": {"arguments": piece.get("delta") or ""},
+                            "function": {"arguments": frag},
                         }]})
+                        if idx not in tool_args:
+                            tool_args[idx] = ""
+                        tool_args[idx] += frag
                         streamed_any = True
                     elif ptype == "response.output_text.done":
                         txt = piece.get("text") or ""
@@ -1525,7 +1688,14 @@ async def _zen_responses_stream_with_retry(
                             streamed_any = True
                     elif ptype == "response.output_item.done":
                         item = piece.get("item") or {}
-                        if isinstance(item, dict) and item.get("type") == "message":
+                        if isinstance(item, dict) and item.get("type") == "function_call":
+                            # Upstream only announces the call once it is done
+                            # (no add/delta sequence): recover it here.
+                            for fc_chunk in _fc_chunks(item):
+                                yield fc_chunk
+                            tool_count = tool_count_holder[0]
+                            streamed_any = True
+                        elif isinstance(item, dict) and item.get("type") == "message":
                             txts = []
                             for part in item.get("content") or []:
                                 if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
@@ -1550,9 +1720,21 @@ async def _zen_responses_stream_with_retry(
                             ferr = response_obj.get("error") or {}
                             fmsg = (ferr.get("message") if isinstance(ferr, dict) else None) or "Upstream error"
                             _log(f"[zen] Responses {status} (attempt {attempt}): {fmsg}")
+                            last_error = ValueError(fmsg)
                             if not streamed_any and attempt < attempts and not await _client_gone(request):
                                 saw_error_event = True
-                                last_error = ValueError(fmsg)
+                                break  # retry below
+                            if (
+                                streamed_any and _content_buf and not tool_streamed
+                                and continuations < MAX_STREAM_CONTINUATIONS
+                                and not await _client_gone(request)
+                            ):
+                                saw_error_event = True
+                                continuations += 1
+                                resp_body = _responses_continuation_body(resp_body, _content_buf)
+                                _content_buf = ""
+                                _reason_buf = ""
+                                _log(f"[zen] Continuing responses stream after failed status (continuation {continuations})")
                                 break  # retry below
                             yield _openai_stream_error(fmsg)
                             return
@@ -1575,6 +1757,16 @@ async def _zen_responses_stream_with_retry(
                             if _content_buf:
                                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] recovered content from {status or 'completed'} snapshot ({len(_content_buf)} chars, no deltas)")
                         usage = _responses_usage_to_chat(response_obj.get("usage"))
+                        for fitem in response_obj.get("output") or []:
+                            # A completed envelope may be the ONLY carrier of
+                            # function calls (no add/delta sequence upstream):
+                            # recover each call so the turn is never empty of
+                            # the tool use the model decided.
+                            if isinstance(fitem, dict) and fitem.get("type") == "function_call":
+                                for fc_chunk in _fc_chunks(fitem):
+                                    yield fc_chunk
+                                tool_count = tool_count_holder[0]
+                                streamed_any = True
                         if status == "incomplete":
                             # Deterministic budget exhaustion (e.g. max_output_tokens
                             # hit on a micro-request): retrying the identical
@@ -1583,6 +1775,18 @@ async def _zen_responses_stream_with_retry(
                             finish_reason = "length"
                         else:
                             finish_reason = "tool_calls" if tool_count else "stop"
+                        if finish_reason == "stop" and not _content_buf:
+                            # Empty completed turn: the client sees finish=stop
+                            # with no text and no tool call and ends the agent
+                            # loop — the classic "stops silently, zero errors".
+                            # Retry on another exit instead; only surface the
+                            # empty turn when every attempt came back empty.
+                            _log(f"[zen] [{model}|{proxy_addr or 'direct'}] empty completed turn (reason_len={len(_reason_buf)}), retrying another exit (attempt {attempt})")
+                            saw_error_event = True
+                            last_error = ValueError("upstream returned an empty completed turn")
+                            if attempt < attempts and not await _client_gone(request):
+                                empty_turn_retry = True
+                                break  # retry below
                         yield _chunk({}, finish_reason)
                         if usage:
                             yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model or '', 'choices': [], 'usage': usage})}\n\n"
@@ -1599,7 +1803,7 @@ async def _zen_responses_stream_with_retry(
                         stream_completed = True
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_success(proxy_addr)
-                        _log(f"[zen] OK [{model}|{proxy_addr or 'direct'}] responses stream complete")
+                        _log(f"[zen] OK [{model}|{proxy_addr or 'direct'}] responses stream complete content={len(_content_buf)} reason={len(_reason_buf)} tools={tool_count} finish={finish_reason}")
                         break
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses stream interrupted: {_exc_desc(e)}")
@@ -1609,6 +1813,18 @@ async def _zen_responses_stream_with_retry(
                     transport_reported = True
                 if not streamed_any and attempt < attempts and not await _client_gone(request):
                     pass  # retry below
+                elif (
+                    _content_buf and not tool_streamed
+                    and continuations < MAX_STREAM_CONTINUATIONS
+                    and not await _client_gone(request)
+                ):
+                    # Torn stream after partial content: resume from the cutoff
+                    # on a fresh exit instead of truncating the turn.
+                    continuations += 1
+                    resp_body = _responses_continuation_body(resp_body, _content_buf)
+                    _content_buf = ""
+                    _reason_buf = ""
+                    _log(f"[zen] Continuing responses stream after transport cut (continuation {continuations})")
                 else:
                     yield _openai_stream_error(_transport_error_message(e), "upstream_error", "transport_error")
                     return
@@ -1622,6 +1838,19 @@ async def _zen_responses_stream_with_retry(
 
         if stream_completed:
             return
+        if empty_turn_retry and attempt < attempts and not await _client_gone(request):
+            # Last attempt came back `completed` with zero content — not a
+            # proxy or streamer fault, just a dud generation. A different exit
+            # gets a genuinely fresh roll, so rotate without blacklisting.
+            try:
+                proxy_pool._evict_client(proxy_addr)
+            except Exception:
+                pass
+            if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
+                proxy_pool.current = None
+            await _backoff(attempt)
+            attempt += 1
+            continue
         if not streamed_any and attempt < attempts and not await _client_gone(request):
             # Empty graceful EOF: the tunnel accepted the request but delivered
             # zero events. Same class as a torn stream — blacklist and rotate
@@ -1649,6 +1878,22 @@ async def _zen_responses_stream_with_retry(
                     pass
                 if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
                     proxy_pool.current = None
+        if (
+            streamed_any and _content_buf and not tool_streamed
+            and continuations < MAX_STREAM_CONTINUATIONS
+            and (attempt < attempts or continuations <= MAX_STREAM_CONTINUATIONS)
+            and not await _client_gone(request)
+        ):
+            # Graceful EOF after partial content, no finish event: resume from
+            # the cutoff instead of truncating the turn.
+            continuations += 1
+            resp_body = _responses_continuation_body(resp_body, _content_buf)
+            _log(f"[zen] Continuing responses stream after empty EOF (continuation {continuations})")
+            _content_buf = ""
+            _reason_buf = ""
+            await _backoff(attempt)
+            attempt += 1
+            continue
         err = ValueError(f"responses stream ended before completion (streamed_any={streamed_any} content_len={len(_content_buf)})")
         _log(f"[zen] [{model}|{proxy_addr or 'direct'}] {_exc_desc(err)}; req={_responses_diag(resp_body)}")
         yield _openai_stream_error(_transport_error_message(last_error or err), "upstream_error", "incomplete_stream")
@@ -1958,6 +2203,12 @@ async def _zen_request_with_retry(
                 _log(f"[zen] 429 (attempt {attempt}): {err_msg}")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_ratelimit(proxy_addr)
+                # A 429 is a per-IP quota burn: the next proxy in the pool has
+                # fresh quota. Rotate and retry instead of telling the client;
+                # only surface the error once every attempt is exhausted.
+                if attempt < attempts and not await _client_gone(request):
+                    await _backoff(attempt)
+                    continue
                 return _local_rate_limit_response(err_msg + " (free model rate limit)")
 
             if resp.status_code >= 400:
@@ -2148,6 +2399,12 @@ async def _zen_stream_with_retry(
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             await resp.aclose()
+            # Per-IP quota burn: the next proxy has fresh quota. Rotate and
+            # retry before ever telling the client about the rate limit.
+            if attempt < attempts and not await _client_gone(request):
+                await _backoff(attempt)
+                attempt += 1
+                continue
             yield _openai_stream_error(
                 err_msg + " (free model rate limit)",
                 "rate_limit_error",
@@ -2571,6 +2828,12 @@ async def _zen_stream_anthropic_with_retry(
                     _log(f"[zen] Anthropic stream 429 (attempt {attempt}): {err_msg}")
                     if PROXY_POOL_ENABLED and proxy_addr:
                         proxy_pool.report_ratelimit(proxy_addr)
+                    # Per-IP quota: rotate to a fresh exit before telling the
+                    # client we are rate-limited.
+                    if attempt < attempts and not await _client_gone(request):
+                        await _backoff(attempt)
+                        attempt += 1
+                        continue
                     yield send_sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err_msg + " (free model rate limit)"}})
                     return
 

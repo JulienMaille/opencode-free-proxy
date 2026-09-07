@@ -13,18 +13,38 @@ _base_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Pa
 _data_dir = _base_dir / "data"
 
 
+_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate proxy-pool.log past 5 MB
+_LOG_KEEP_BYTES = 1 * 1024 * 1024  # ...keeping the last 1 MB
+
+
+def _append_log(path: Path, msg: str):
+    """Append one line, rotating the file down to its tail past the cap."""
+    try:
+        if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
+            with open(path, "rb") as f:
+                f.seek(-_LOG_KEEP_BYTES, 2)
+                tail = f.read()
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1:]
+            with open(path, "wb") as f:
+                f.write(f"[... rotated, kept last {len(tail) // 1024} KB ...]\n".encode("utf-8"))
+                f.write(tail)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
 def _log(*a):
     msg = f"[{time.strftime('%H:%M:%S')}] [proxy-pool] " + " ".join(str(x) for x in a)
     print(f"\x1b[33m{msg}\x1b[0m", flush=True)
     global log_file
     if log_file is None:
         log_file = _data_dir / "proxy-pool.log"
-    try:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-    except OSError:
-        pass
+    _append_log(log_file, msg)
 
 
 SOCKS5_SOURCES = [
@@ -136,12 +156,70 @@ class ProxyPool:
         self._select_lock = asyncio.Lock()
         self._inflight: dict[str, int] = {}
         self._inflight_at: dict[str, float] = {}
+        # Per-address stability stats: {addr: {ok, fail, ema}}. Persisted with
+        # the candidate cache so proxies that survived yesterday get picked
+        # first today; a proxy list refresh never resets this history.
+        self.stats: dict[str, dict] = {}
+        self._stats_dirty = False
+        self._last_stats_save = 0.0
         self._try_load_cache()
+
+    # ── Stability stats ──────────────────────────────────────────────
+
+    _STATS_SAVE_INTERVAL = 60.0  # disk writes at most once/min
+
+    def _stat(self, addr: str) -> dict:
+        return self.stats.setdefault(addr, {"ok": 0, "fail": 0, "ema": 0.0})
+
+    def _mark_ok(self, addr: str):
+        s = self._stat(addr)
+        s["ok"] += 1
+        self._stats_dirty = True
+        self._maybe_save_stats()
+
+    def _mark_fail(self, addr: str):
+        s = self._stat(addr)
+        s["fail"] += 1
+        self._stats_dirty = True
+        self._maybe_save_stats()
+
+    def _record_latency(self, addr: str, seconds: float):
+        s = self._stat(addr)
+        s["ema"] = seconds if not s["ema"] else 0.7 * s["ema"] + 0.3 * seconds
+        self._stats_dirty = True
+
+    def _quality(self, addr: str) -> float:
+        """Lower is better: expected-seconds-per-success.
+
+        Combines measured latency (EWMA) with Laplace-smoothed reliability.
+        Unknowns sit mid-pack: a brand-new verified proxy gets a fair chance
+        but proven fast+reliable ones win the slot.
+        """
+        s = self.stats.get(addr)
+        if not s:
+            return VERIFY_TIMEOUT * 2
+        reliability = (s["ok"] + 1) / (s["ok"] + s["fail"] + 2)
+        ema = s["ema"] or VERIFY_TIMEOUT
+        return ema / max(reliability, 0.05)
+
+    def _maybe_save_stats(self):
+        now = time.time()
+        if self._stats_dirty and now - self._last_stats_save >= self._STATS_SAVE_INTERVAL:
+            self._last_stats_save = now
+            self._stats_dirty = False
+            self._save_cache()
 
     def _try_load_cache(self) -> bool:
         data = _load_json(CACHE_FILE, {})
         if isinstance(data, dict):
             saved_at = float(data.get("saved_at", 0))
+            saved_stats = data.get("stats")
+            if isinstance(saved_stats, dict):
+                self.stats = {
+                    a: {"ok": int(s.get("ok", 0)), "fail": int(s.get("fail", 0)), "ema": float(s.get("ema", 0.0))}
+                    for a, s in saved_stats.items()
+                    if isinstance(a, str) and isinstance(s, dict)
+                }
             candidates = data.get("candidates")
             age = time.time() - saved_at
             has_sources = (
@@ -156,7 +234,7 @@ class ProxyPool:
                 if candidates:
                     self.candidates = candidates
                     self.last_refresh = saved_at
-                    _log(f"Loaded {len(candidates)} cached candidates ({age:.0f}s old)")
+                    _log(f"Loaded {len(candidates)} cached candidates ({age:.0f}s old, {len(self.stats)} stability stats)")
                     return True
                 _log("Ignored cached candidates: none use an allowed proxy port")
             if candidates and isinstance(candidates, list) and not has_sources:
@@ -169,6 +247,7 @@ class ProxyPool:
         _save_json(CACHE_FILE, {
             "saved_at": time.time(),
             "candidates": self.candidates,
+            "stats": self.stats,
         })
 
     @staticmethod
@@ -301,6 +380,7 @@ class ProxyPool:
 
         async def _check() -> bool:
             timeout = httpx.Timeout(VERIFY_TIMEOUT)
+            started = time.monotonic()
             async with httpx.AsyncClient(proxy=url, verify=False, timeout=timeout) as c:
                 r = await c.get(
                     "https://opencode.ai/zen/v1/models",
@@ -309,7 +389,10 @@ class ProxyPool:
                         "x-opencode-client": "cli",
                     },
                 )
-                return 200 <= r.status_code < 300
+                if 200 <= r.status_code < 300:
+                    self._record_latency(addr, time.monotonic() - started)
+                    return True
+                return False
 
         async with self._verify_sem:
             try:
@@ -414,7 +497,7 @@ class ProxyPool:
             and not self._is_bad(p["address"])
         ]
         best = None
-        best_load = MAX_PER_PROXY
+        best_score = None
         for p in self.hot:
             verified_at = float(p.get("verified_at", 0))
             if now - verified_at > HOT_TTL:
@@ -424,11 +507,15 @@ class ProxyPool:
             if p["address"] == overloaded_current:
                 continue
             load = self._load(p["address"])
-            if load < best_load:
+            if load >= MAX_PER_PROXY:
+                continue
+            # Rank by stability: latency EWMA discounted by reliability
+            # (Laplace-smoothed ok/fail), with a mild penalty per extra
+            # in-flight request so bursts still spread across exits.
+            score = self._quality(p["address"]) * (1 + load)
+            if best is None or score < best_score:
                 best = p
-                best_load = load
-                if load == 0:
-                    break
+                best_score = score
         if best is not None:
             self.current = best
             self._inflight[best["address"]] = self._inflight.get(best["address"], 0) + 1
@@ -612,6 +699,7 @@ class ProxyPool:
             return
         failures = self.transport_failures.get(target, 0) + 1
         self.transport_failures[target] = failures
+        self._mark_fail(target)
         self._evict_client(target)
         # Drop the proxy from the hot buffer on ANY transport failure so the
         # next select() doesn't hand it to concurrent requests; it can only
@@ -637,6 +725,7 @@ class ProxyPool:
             return None
         self.transport_failures.pop(target, None)
         self.blacklist[target] = time.time() + BLACKLIST_TTL
+        self._mark_fail(target)
         self._evict_client(target)
         _log(f"{reason_tag} {target}; blacklisted for {BLACKLIST_TTL // 60}m; rotating")
         if self.current and self.current["address"] == target:
@@ -655,6 +744,7 @@ class ProxyPool:
         target = addr or (self.current and self.current["address"])
         if not target:
             return
+        self._mark_ok(target)
         had_failure = self.transport_failures.pop(target, None)
         if had_failure and self.current and self.current["address"] == target:
             # This request only succeeded after a transport failure on the
