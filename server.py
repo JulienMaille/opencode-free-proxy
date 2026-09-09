@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--proxy", default=None, help="Static SOCKS5 proxy (socks5://host:port)")
     p.add_argument("--proxy-pool", action=argparse.BooleanOptionalAction, default=True, help="Enable SOCKS5 proxy pool with transport-failure and per-proxy 429 rotation (default: on, use --no-proxy-pool to disable)")
     p.add_argument("--api-key", default=None, help="API key for client auth")
+    p.add_argument("--allow-direct-fallback", action=argparse.BooleanOptionalAction, default=False, help="Allow one direct (no-proxy) fetch after proxy-pool exhaustion on retriable statuses (default: off; direct fetch exposes this server's own IP)")
     return p.parse_args()
 
 args = parse_args()
@@ -61,6 +63,14 @@ _pp_env = os.environ.get("OPENCODE_PROXY_POOL", "").lower()
 PROXY_POOL_ENABLED = args.proxy_pool
 if _pp_env:
     PROXY_POOL_ENABLED = _pp_env not in ("0", "false", "no")
+
+# Exhaust-then-direct fallback: default OFF (direct fetch exposes this
+# server's own IP). Opt in with --allow-direct-fallback or
+# OPENCODE_ALLOW_DIRECT_FALLBACK=1/true/yes.
+_df_env = os.environ.get("OPENCODE_ALLOW_DIRECT_FALLBACK", "").lower()
+ALLOW_DIRECT_FALLBACK = bool(args.allow_direct_fallback)
+if _df_env:
+    ALLOW_DIRECT_FALLBACK = _df_env in ("1", "true", "yes", "on")
 
 _default_proxy = None if PROXY_POOL_ENABLED else STATIC_PROXY
 
@@ -85,21 +95,53 @@ _stream_default_client = httpx.AsyncClient(
     ),
     proxy=_default_proxy,
 )
+# Dedicated no-proxy clients for the exhaust-then-direct fallback attempt.
+# These always bypass STATIC_PROXY / env proxies so the fallback is truly direct.
+_direct_client = httpx.AsyncClient(
+    base_url="https://opencode.ai",
+    timeout=httpx.Timeout(
+        connect=REQUEST_CONNECT_TIMEOUT,
+        read=REQUEST_READ_TIMEOUT,
+        write=REQUEST_READ_TIMEOUT,
+        pool=REQUEST_CONNECT_TIMEOUT,
+    ),
+    proxy=None,
+    trust_env=False,
+)
+_stream_direct_client = httpx.AsyncClient(
+    base_url="https://opencode.ai",
+    timeout=httpx.Timeout(
+        connect=REQUEST_CONNECT_TIMEOUT,
+        read=STREAM_READ_TIMEOUT,
+        write=STREAM_READ_TIMEOUT,
+        pool=REQUEST_CONNECT_TIMEOUT,
+    ),
+    proxy=None,
+    trust_env=False,
+)
 
 # ── App ───────────────────────────────────────────────────────────
+
+def _spawn_background(coro):
+    """Spawn a background task with a clean req context (no inherited tag)."""
+    _clear_req_ctx()
+    return asyncio.ensure_future(coro)
+
 
 @asynccontextmanager
 async def _lifespan(app: Starlette):
     # Start background model discovery
-    asyncio.ensure_future(_periodic_model_refresh())
+    _spawn_background(_periodic_model_refresh())
     if PROXY_POOL_ENABLED:
         _log("Proxy pool enabled, loading SOCKS5 proxies in background...")
-        asyncio.ensure_future(proxy_pool.load())
+        _spawn_background(proxy_pool.load())
         _log("  (pool will be ready once verification completes)")
     yield
     await proxy_pool.close()
     await _default_client.aclose()
     await _stream_default_client.aclose()
+    await _direct_client.aclose()
+    await _stream_direct_client.aclose()
 
 app = Starlette(lifespan=_lifespan)
 
@@ -135,8 +177,38 @@ def auth(request: Request) -> str | None:
 
 # ── Helpers ───────────────────────────────────────────────────────
 
+def _redact_for_log(text: str) -> str:
+    """Redact Authorization / Bearer / nvapi- secrets so logs never leak keys."""
+    try:
+        s = str(text)
+        s = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-~+/=]+", r"\1***", s)
+        s = re.sub(r"nvapi-[A-Za-z0-9._\-]+", "nvapi-***", s)
+        s = re.sub(r"(?i)(authorization['\"\s:=]+)([A-Za-z0-9._\-~+/=]+)", r"\1***", s)
+        return s
+    except Exception:
+        return str(text)
+
+
+_req_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("req_ctx", default="")
+
+
+def new_request_id() -> str:
+    """Generate a per-request correlation id (8 hex chars) and bind it."""
+    rid = f"req={secrets.token_hex(4)}"
+    _req_ctx.set(rid)
+    return rid
+
+
+def _req_tag() -> str:
+    try:
+        v = _req_ctx.get()
+    except Exception:
+        return ""
+    return f" {v}" if v else ""
+
+
 def _log(*a):
-    msg = f"[{time.strftime('%H:%M:%S')}] " + " ".join(str(x) for x in a)
+    msg = _redact_for_log(f"[{time.strftime('%H:%M:%S')}]" + _req_tag() + " " + " ".join(str(x) for x in a))
     if "[zen] OK" in msg or "buffered fallback" in msg:
         print(f"\x1b[32m{msg}\x1b[0m", flush=True)
     elif "Stream error 400" in msg or "400 diag" in msg:
@@ -740,22 +812,67 @@ def _mark_model_dead(model: str | None) -> bool:
     return True
 
 
+# ── Slash-free aliasing for OpenCode Zen models (no Kilo) ─────────
+# Keys are slash-free / colon-free picker aliases; values are the bare
+# canonical Zen ids actually served via Zen (no provider prefix, no :effort
+# suffix) so the picker never sees slash/colon breakage.
+MODEL_ALIASES: dict[str, str] = {
+    "muse-spark": "muse-spark-1.3-contributor-free",
+    "muse-spark-1.2": "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3": "muse-spark-1.3-contributor-free",
+    "big-pickle": "big-pickle",
+    "mimo": "mimo-v2.5-free",
+    "mimo-v2.5": "mimo-v2.5-free",
+    "nemotron-lightning": "nemotron-3.5-lightning-free",
+    "nemotron-3.5-lightning": "nemotron-3.5-lightning-free",
+    "nemotron-ultra": "nemotron-3-ultra-free",
+    "nemotron-3-ultra": "nemotron-3-ultra-free",
+    "laguna": "laguna-s-2.1-free",
+    "laguna-s-2.1": "laguna-s-2.1-free",
+    "longcat": "longcat-2.0-free",
+    "longcat-2.0": "longcat-2.0-free",
+    "hy3": "hy3-free",
+    "ling-flash": "ling-3.0-flash-fin-free",
+    "north-mini": "north-mini-code-free",
+    "north-mini-code": "north-mini-code-free",
+    "deepseek-flash": "deepseek-v4-flash-free",
+}
+
+
+def resolveCanonicalModelId(alias: str | None) -> str | None:
+    """Resolve a slash-free picker alias to its bare canonical Zen id.
+
+    Handles `provider/prefix` stripping and `:effort` suffix stripping, so
+    inputs like `opencode-local/muse-spark:high` resolve without slash/colon
+    breakage. Unknown ids pass through as the bare normalized id.
+    """
+    if not alias:
+        return alias
+    s = str(alias)
+    if "/" in s:
+        s = s.rsplit("/", 1)[-1]
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    if s.startswith("ocf-"):
+        s = s[4:]
+    s = s.strip()
+    if not s:
+        return s
+    hit = MODEL_ALIASES.get(s.lower())
+    return hit if hit else s
+
+
 def _normalize_model(model: str) -> str:
     """Normalize a client model id to the bare Zen upstream id.
 
     opencode sends ids like `opencode-local/muse-spark-1.2-contributor-free:high`:
     `opencode-local/` is the provider prefix and `:high` is the reasoning-effort
-    suffix. Both are stripped, as is the legacy `ocf-` prefix.
+    suffix. Both are stripped, as is the legacy `ocf-` prefix. Slash-free
+    picker aliases resolve via resolveCanonicalModelId().
     """
     if not model:
         return model
-    if "/" in model:
-        model = model.rsplit("/", 1)[-1]
-    if ":" in model:
-        model = model.split(":", 1)[0]
-    if model.startswith("ocf-"):
-        model = model[4:]
-    return model
+    return resolveCanonicalModelId(model)
 
 
 def _normalize_role(role: str) -> str:
@@ -932,6 +1049,213 @@ async def _backoff(attempt: int, base: float = 1.0, max_delay: float = 10.0):
     delay = min(base * (2 ** attempt), max_delay)
     jitter = random.uniform(0, delay * 0.25)
     await asyncio.sleep(delay + jitter)
+
+
+# ── pi-freeflow: exhaust-then-direct fallback helpers ─────────────
+# Retriable upstream statuses: try next proxy/key; 504 fast-breaks pool
+# cycling (no backoff sleep, immediate rotate). After the pool is exhausted,
+# one direct-fetch attempt goes out with no proxy and relay headers stripped
+# — gated behind --allow-direct-fallback / OPENCODE_ALLOW_DIRECT_FALLBACK
+# (default OFF: a direct fetch exposes this server's own IP upstream).
+_RETRIABLE_STATUSES = frozenset({408, 429, 502, 503, 504, *range(520, 531)})
+
+
+def _is_retriable_status(code) -> bool:
+    try:
+        return int(code) in _RETRIABLE_STATUSES
+    except Exception:
+        return False
+
+
+_ABORT_TYPE_NAMES = frozenset({
+    "AbortError", "CancelledError", "Cancel", "ClientDisconnect", "Disconnect",
+    "ClientDisconnected", "ConnectionAborted", "GeneratorExit",
+})
+_ABORT_TEXT_MARKERS = (
+    "aborterror", "client disconnect", "client abort", "aborted",
+    "disconnect", "generator exit", "event loop is closed",
+    "connection reset", "broken pipe", "client closed",
+)
+
+
+def _is_client_abort(exc: BaseException | None) -> bool:
+    """True for client-side aborts: never mark the pool failed for these.
+
+    Mirrors proxy_pool.is_cancelled / nvidia_pool.is_cancelled so all three
+    pools agree on GeneratorExit/Disconnect/AbortError variants.
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+        return True
+    name = type(exc).__name__
+    if name in _ABORT_TYPE_NAMES:
+        return True
+    text = f"{name}: {exc}".lower()
+    return any(m in text for m in _ABORT_TEXT_MARKERS)
+
+
+def _clear_req_ctx():
+    """Reset the req tag so background tasks never inherit a request's id.
+
+    ContextVars propagate into tasks spawned from a request handler
+    (asyncio.ensure_future / create_task copy the current context), so
+    background work like pool refills must clear the tag first — otherwise
+    log lines from unrelated background work get misattributed to whatever
+    request happened to spawn them.
+    """
+    try:
+        _req_ctx.set("")
+    except Exception:
+        pass
+
+
+def _strip_direct_headers(headers: dict | None) -> dict:
+    """Strip relay/proxy hop headers for the direct-fetch fallback attempt."""
+    if not isinstance(headers, dict):
+        return {}
+    out = {}
+    for k, v in headers.items():
+        kl = str(k).lower()
+        if kl.startswith("x-relay-") or kl.startswith("x-proxy"):
+            continue
+        out[k] = v
+    return out
+
+
+# Throttled upstream-429 hint (once per 10 min): shared free-tier IP quota.
+_UPSTREAM_429_HINT = "Shared free-tier IP quota — rotating proxy/exit before surfacing 429"
+_UPSTREAM_429_HINT_INTERVAL = 600.0
+_last_429_hint_ts = 0.0
+
+
+def _log_429_hint():
+    global _last_429_hint_ts
+    now = time.time()
+    if now - _last_429_hint_ts < _UPSTREAM_429_HINT_INTERVAL:
+        return
+    _last_429_hint_ts = now
+    _log(f"[zen] {_UPSTREAM_429_HINT}")
+
+
+async def _maybe_backoff(attempt: int, status_code=None):
+    """Backoff except fast-break on 504: rotate pool immediately, no sleep."""
+    if status_code is not None:
+        try:
+            if int(status_code) == 504:
+                return
+        except Exception:
+            pass
+    await _backoff(attempt)
+
+
+def _ensure_req_id():
+    """Guarantee a req=<8hex> tag exists for this request context."""
+    try:
+        if not _req_ctx.get():
+            new_request_id()
+    except Exception:
+        pass
+    return _req_tag()
+
+
+def _safe_pool_failure(addr: str | None, exc: BaseException | None = None, hard: bool = False) -> bool:
+    """Report a transport failure unless it is a client-side abort.
+
+    Client AbortError/CancelledError means the caller went away — the proxy
+    exit did nothing wrong, so the pool must not be marked failed.
+    Returns True when the failure was actually recorded.
+    """
+    if not PROXY_POOL_ENABLED or not addr:
+        return False
+    if _is_client_abort(exc):
+        _log(f"[pool] client abort ({type(exc).__name__ if exc is not None else '?'}); not marking {addr} failed")
+        return False
+    proxy_pool.report_failure(addr, hard=hard)
+    return True
+
+
+def _safe_pool_stream_failure(addr: str | None, exc: BaseException | None = None) -> bool:
+    """Abort-guarded report_stream_failure. Returns True when recorded."""
+    if not PROXY_POOL_ENABLED or not addr:
+        return False
+    if _is_client_abort(exc):
+        _log(f"[pool] client abort ({type(exc).__name__ if exc is not None else '?'}); not marking {addr} failed")
+        return False
+    proxy_pool.report_stream_failure(addr)
+    return True
+
+
+def _report_upstream_status(addr: str | None, status: int | None) -> bool:
+    """Record an upstream HTTP status for escalating 5xx/504 cooldown.
+
+    Delegates to proxy_pool.report_http_status (escalating entry cooldown;
+    504 fast-breaks instead of cycling the pool). 429 is excluded — it keeps
+    its dedicated report_ratelimit sites. Returns True if the caller should
+    roll to the next proxy, False on 504 fast-break (stop cycling).
+    """
+    if not PROXY_POOL_ENABLED or not addr or status is None:
+        return True
+    try:
+        code = int(status)
+    except Exception:
+        return True
+    if code == 429:
+        return True  # dedicated report_ratelimit path owns 429
+    try:
+        return proxy_pool.report_http_status(addr, code)
+    except Exception:
+        return True
+
+
+def _report_nvidia_status(key: str | None, status: int | None) -> bool:
+    """Record an upstream HTTP status for escalating 5xx/504 key cooldown.
+
+    Delegates to nvidia_keys.report_http_status (429 keeps its dedicated
+    report_rate_limit sites). Returns True if the caller should roll to the
+    next key, False on 504 fast-break.
+    """
+    if not key or status is None:
+        return True
+    try:
+        code = int(status)
+    except Exception:
+        return True
+    if code == 429:
+        return True  # dedicated report_rate_limit path owns 429
+    try:
+        return nvidia_keys.report_http_status(key, code)
+    except Exception:
+        return True
+
+
+def _log_direct_fallback(model, status):
+    """Loud log line whenever the gated post-exhaustion direct fetch fires."""
+    _log(f"[zen] DIRECT FALLBACK [{model}]: pool exhausted on retriable {status}; one no-proxy fetch (server IP exposed)")
+
+
+async def _direct_buffered_post(path: str, req_body: dict, headers: dict, client=None):
+    """One direct-fetch attempt: no proxy, relay headers stripped.
+
+    Used only after the proxy pool is exhausted on a retriable status, and
+    only when ALLOW_DIRECT_FALLBACK is on. Returns (status_code, data,
+    body_text) or (None, None, "") on transport failure.
+    """
+    client = client or _direct_client
+    try:
+        resp = await client.post(path, json=req_body, headers=_strip_direct_headers(headers))
+    except Exception as e:
+        return None, None, f"direct-fetch transport failure: {_exc_desc(e)}"
+    try:
+        raw = await resp.aread()
+    except Exception as e:
+        return resp.status_code, {}, f"direct-fetch read failure: {_exc_desc(e)}"
+    text = raw.decode("utf-8", errors="replace") if raw else ""
+    try:
+        data = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+        data = {}
+    return resp.status_code, data, text
 
 
 async def _client_gone(request: Request) -> bool:
@@ -1407,8 +1731,10 @@ async def _zen_responses_stream_with_retry(
     content, reasoning deltas → reasoning_content, function_call items →
     tool_calls, response.completed → finish chunk + usage + [DONE].
     """
+    _ensure_req_id()
     last_error = None
     attempts = MAX_RETRIES if max_retries is None else max_retries
+    direct_only = False  # set after pool exhaustion: next loop is the one direct-fetch attempt
     cid = oc_id("chatcmpl")
     created = int(time.time())
     continuations = 0  # mid-stream resumes (partial content appended as context)
@@ -1472,7 +1798,7 @@ async def _zen_responses_stream_with_retry(
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
-        if PROXY_POOL_ENABLED:
+        if PROXY_POOL_ENABLED and not direct_only:
             if not proxy_pool.ready:
                 await proxy_pool.load()
             p = await proxy_pool.select()
@@ -1482,7 +1808,7 @@ async def _zen_responses_stream_with_retry(
                 p = await proxy_pool.select()
                 if p is None:
                     _log("[pool] Still no proxy after refresh, falling back to direct")
-                    client = _stream_default_client
+                    client = _stream_direct_client
                     proxy_addr = None
                 else:
                     proxy_addr = p["address"]
@@ -1491,7 +1817,9 @@ async def _zen_responses_stream_with_retry(
                 proxy_addr = p["address"]
                 client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
         else:
-            client = _stream_default_client
+            if direct_only:
+                headers = _strip_direct_headers(headers)
+            client = _stream_direct_client if direct_only else _stream_default_client
             proxy_addr = None
 
         try:
@@ -1501,15 +1829,21 @@ async def _zen_responses_stream_with_retry(
             resp = await client.send(upstream_request, stream=True)
         except Exception as e:
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses request failed (attempt {attempt}): {_exc_desc(e)}")
+            if _is_client_abort(e):
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.release(proxy_addr)
+                yield _openai_stream_error(f"Client aborted: {_exc_desc(e)}", "upstream_error", "transport_error")
+                return
+            # Setup failure = the tunnel never established (SOCKS
+            # handshake / connect / TLS died before any HTTP bytes).
+            # Always hard: retrying the same exit just burns another
+            # attempt on it. Note the allowlist approach misses
+            # socksio's raw ProtocolError("Malformed reply") — it escapes
+            # httpx unwrapped (no req= URL in the log), so it fell into
+            # the soft 1/2 grace path and was retried on the dead exit.
+            # (Abort already returned above, so _safe_pool_failure records.)
+            _safe_pool_failure(proxy_addr, e, hard=True)
             if PROXY_POOL_ENABLED and proxy_addr:
-                # Setup failure = the tunnel never established (SOCKS
-                # handshake / connect / TLS died before any HTTP bytes).
-                # Always hard: retrying the same exit just burns another
-                # attempt on it. Note the allowlist approach misses
-                # socksio's raw ProtocolError("Malformed reply") — it escapes
-                # httpx unwrapped (no req= URL in the log), so it fell into
-                # the soft 1/2 grace path and was retried on the dead exit.
-                proxy_pool.report_failure(proxy_addr, hard=True)
                 proxy_pool.release(proxy_addr)
             last_error = e
             if attempt < attempts:
@@ -1527,14 +1861,24 @@ async def _zen_responses_stream_with_retry(
             except Exception:
                 err_msg = "Rate limit exceeded"
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses 429 (attempt {attempt}): {err_msg}")
+            _log_429_hint()
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.report_ratelimit(proxy_addr)
                 proxy_pool.release(proxy_addr)
             await resp.aclose()
             if attempt < attempts:
-                await _backoff(attempt)
+                await _maybe_backoff(attempt, 429)
                 attempt += 1
                 continue
+            if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
+                direct_only = True
+                _log_direct_fallback(model, 429)
+                headers = _strip_direct_headers(headers)
+                await _maybe_backoff(attempt, 429)
+                attempt += 1
+                continue
+            if PROXY_POOL_ENABLED and not ALLOW_DIRECT_FALLBACK:
+                _log(f"[zen] pool exhausted on retriable 429; direct fallback disabled (opt in with --allow-direct-fallback)")
             yield _openai_stream_error(err_msg + " (free model rate limit)", "rate_limit_error", "rate_limit_exceeded")
             return
 
@@ -1550,6 +1894,31 @@ async def _zen_responses_stream_with_retry(
                 data = {}
             err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses error {resp.status_code}: {raw[:400]!r}")
+            if _is_retriable_status(resp.status_code) and PROXY_POOL_ENABLED and not direct_only and attempt >= attempts:
+                # Escalating 5xx/504 cooldown for this exit; 504 fast-breaks
+                # (False = stop cycling the pool, surface the error now).
+                if not _report_upstream_status(proxy_addr, resp.status_code):
+                    if PROXY_POOL_ENABLED and proxy_addr:
+                        proxy_pool.release(proxy_addr)
+                    await resp.aclose()
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                if not ALLOW_DIRECT_FALLBACK:
+                    _log(f"[zen] pool exhausted on retriable {resp.status_code}; direct fallback disabled (opt in with --allow-direct-fallback)")
+                    if PROXY_POOL_ENABLED and proxy_addr:
+                        proxy_pool.release(proxy_addr)
+                    await resp.aclose()
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                direct_only = True
+                _log_direct_fallback(model, resp.status_code)
+                headers = _strip_direct_headers(headers)
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.release(proxy_addr)
+                await resp.aclose()
+                await _maybe_backoff(attempt, resp.status_code)
+                attempt += 1
+                continue
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             if _is_region_error(data, body_text):
@@ -1562,15 +1931,20 @@ async def _zen_responses_stream_with_retry(
                 yield _openai_stream_error(err_msg, "upstream_error", "region_blocked")
                 return
             await resp.aclose()
-            if resp.status_code >= 500 and attempt < attempts:
+            if _is_retriable_status(resp.status_code) and attempt < attempts:
                 # 504 "Upstream response was not valid JSON" is the provider
                 # (Console) failing to parse the MODEL's raw output — the shape
                 # of our request (reasoning level, budget) influences whether
                 # the model emits parseable JSON. Log the request shape so the
                 # next occurrence is correlatable, then retry as before.
+                # 504 fast-breaks pool cycling (no backoff sleep).
                 if resp.status_code == 504:
                     _log(f"[zen] [{model}|{proxy_addr or 'direct'}] 504 detail (attempt {attempt}); req={_responses_diag(resp_body)}")
-                await _backoff(attempt)
+                # Escalating 5xx/504 cooldown; 504 fast-break stops cycling.
+                if not _report_upstream_status(proxy_addr, resp.status_code):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                await _maybe_backoff(attempt, resp.status_code)
                 attempt += 1
                 continue
             yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
@@ -1808,8 +2182,9 @@ async def _zen_responses_stream_with_retry(
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses stream interrupted: {_exc_desc(e)}")
                 last_error = e
-                if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_stream_failure(proxy_addr)
+                if _safe_pool_stream_failure(proxy_addr, e):
+                    transport_reported = True
+                elif _is_client_abort(e):
                     transport_reported = True
                 if not streamed_any and attempt < attempts and not await _client_gone(request):
                     pass  # retry below
@@ -1860,7 +2235,7 @@ async def _zen_responses_stream_with_retry(
                 PROXY_POOL_ENABLED and proxy_addr
                 and not saw_error_event and not transport_reported
             ):
-                proxy_pool.report_stream_failure(proxy_addr)
+                _safe_pool_stream_failure(proxy_addr)
             if not transport_reported and not saw_error_event:
                 last_error = ValueError(f"responses stream ended before completion (streamed_any={streamed_any} content_len={len(_content_buf)})")
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] empty responses EOF (attempt {attempt}); req={_responses_diag(resp_body)}")
@@ -1869,7 +2244,7 @@ async def _zen_responses_stream_with_retry(
             continue
         if PROXY_POOL_ENABLED and proxy_addr:
             if not streamed_any and not saw_error_event and not transport_reported:
-                proxy_pool.report_stream_failure(proxy_addr)
+                _safe_pool_stream_failure(proxy_addr)
             elif streamed_any:
                 # Partial then graceful EOF: rotate without poisoning the pool.
                 try:
@@ -2119,6 +2494,7 @@ async def _zen_request_with_retry(
     max_retries: int = None,
 ):
     """Non-streaming Zen API call with proxy pool retry on 429."""
+    _ensure_req_id()
     if req_body.get("stream") is False and _needs_stream_bridge(model):
         # Buffered transport times out on this model's silent warm-up; stream
         # internally and hand the caller a normal completion object instead.
@@ -2127,6 +2503,8 @@ async def _zen_request_with_retry(
         )
     last_error = None
     attempts = MAX_RETRIES if max_retries is None else max_retries
+    last_status: int | None = None
+    pool_exhausted_retriable = False
 
     for attempt in range(attempts + 1):
         if await _client_gone(request):
@@ -2168,9 +2546,13 @@ async def _zen_request_with_retry(
                 )
             except Exception as e:
                 _log(f"[zen] Request failed (attempt {attempt}): {_exc_desc(e)}")
-                if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_failure(proxy_addr)
+                _safe_pool_failure(proxy_addr, e, hard=False)
                 last_error = e
+                if _is_client_abort(e):
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": {"message": f"Client aborted: {_exc_desc(e)}", "type": "upstream_error"}},
+                    )
                 if attempt < attempts:
                     await _backoff(attempt)
                 continue
@@ -2179,9 +2561,13 @@ async def _zen_request_with_retry(
                 body_bytes = await resp.aread()
             except Exception as e:
                 _log(f"[zen] Response read failed (attempt {attempt}): {_exc_desc(e)}")
-                if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_failure(proxy_addr)
+                _safe_pool_failure(proxy_addr, e, hard=False)
                 last_error = e
+                if _is_client_abort(e):
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": {"message": f"Client aborted: {_exc_desc(e)}", "type": "upstream_error"}},
+                    )
                 if attempt < attempts:
                     await _backoff(attempt)
                     continue
@@ -2200,36 +2586,62 @@ async def _zen_request_with_retry(
 
             if is_rate_limit:
                 err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                last_status = 429
                 _log(f"[zen] 429 (attempt {attempt}): {err_msg}")
+                _log_429_hint()
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_ratelimit(proxy_addr)
                 # A 429 is a per-IP quota burn: the next proxy in the pool has
                 # fresh quota. Rotate and retry instead of telling the client;
                 # only surface the error once every attempt is exhausted.
                 if attempt < attempts and not await _client_gone(request):
-                    await _backoff(attempt)
+                    await _maybe_backoff(attempt, 429)
                     continue
+                pool_exhausted_retriable = bool(PROXY_POOL_ENABLED)
+                if pool_exhausted_retriable:
+                    break
                 return _local_rate_limit_response(err_msg + " (free model rate limit)")
 
             if resp.status_code >= 400:
                 err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                last_status = resp.status_code
                 is_context_exceeded = _is_context_limit_error(data, body_text)
                 bare_500 = _is_bare_internal_error(resp.status_code, data, body_text)
                 _log(f"[zen] Error {resp.status_code}: {err_msg}")
                 # Not a proxy failure: 4xx/5xx are upstream or request errors that
                 # repeat identically on every proxy, so never blacklist for them.
-                # Fail fast on deterministic errors (all 4xx, and the bare 500
-                # "Internal server error" that means the model is down upstream):
-                # retrying them across proxies only multiplies one fast failure
-                # into ~6 slow ones with backoff. Only transient 5xx
-                # (502/503/504, detailed 500s) are worth another attempt.
+                # Fail fast on deterministic errors (all 4xx except retriable
+                # 408/429, and the bare 500 "Internal server error" that means
+                # the model is down upstream): retrying them across proxies only
+                # multiplies one fast failure into ~6 slow ones with backoff.
+                # Retriable (408/429/502/503/504/520-530) rotate to the next
+                # proxy; 504 fast-breaks pool cycling (no backoff sleep).
                 if is_context_exceeded:
                     _log("[zen] Context limit error; not retrying on another proxy")
                 if bare_500:
                     _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
                     err_msg = f"{err_msg} (model appears down upstream; try another free model)"
+                elif _is_retriable_status(resp.status_code) and not is_context_exceeded and attempt < attempts:
+                    # Escalating 5xx/504 cooldown; 504 fast-break stops cycling.
+                    if not _report_upstream_status(proxy_addr, resp.status_code):
+                        return JSONResponse(
+                            status_code=resp.status_code,
+                            content={"error": {"message": err_msg, "type": "upstream_error"}},
+                        )
+                    await _maybe_backoff(attempt, resp.status_code)
+                    continue
+                elif _is_retriable_status(resp.status_code) and not is_context_exceeded:
+                    _report_upstream_status(proxy_addr, resp.status_code)
+                    pool_exhausted_retriable = bool(PROXY_POOL_ENABLED)
+                    if pool_exhausted_retriable:
+                        break
                 elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
-                    await _backoff(attempt)
+                    if not _report_upstream_status(proxy_addr, resp.status_code):
+                        return JSONResponse(
+                            status_code=resp.status_code,
+                            content={"error": {"message": err_msg, "type": "upstream_error"}},
+                        )
+                    await _maybe_backoff(attempt, resp.status_code)
                     continue
                 return JSONResponse(
                     status_code=resp.status_code,
@@ -2260,6 +2672,38 @@ async def _zen_request_with_retry(
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
 
+    # Exhaust-then-direct: pool cycled through all retries on a retriable
+    # status — one direct-fetch attempt (no proxy, relay headers stripped).
+    # Gated behind --allow-direct-fallback / OPENCODE_ALLOW_DIRECT_FALLBACK
+    # (default off: a direct fetch exposes this server's own IP upstream).
+    if pool_exhausted_retriable and not await _client_gone(request):
+        if not ALLOW_DIRECT_FALLBACK:
+            _log(f"[zen] pool exhausted on retriable {last_status}; direct fallback disabled (opt in with --allow-direct-fallback)")
+        else:
+            _log_direct_fallback(model, last_status)
+            code, data, text = await _direct_buffered_post(
+                "/zen/v1/chat/completions", req_body, headers
+            )
+            if code is not None and code < 400 and isinstance(data, dict) and data.get("choices"):
+                usage = (data.get("usage") or {})
+                if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
+                    _add_tokens(model,
+                        usage.get("prompt_tokens") or 0,
+                        usage.get("completion_tokens") or 0,
+                        usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                        usage.get("prompt_cache_miss_tokens") or 0,
+                    )
+                _log(f"[zen] OK [{model}|direct] direct-fetch succeeded after pool exhaustion")
+                return data
+            if code is not None:
+                _log(f"[zen] direct-fetch returned {code}: {text[:200]!r}")
+                if isinstance(data, dict) and data.get("choices"):
+                    return data
+                return JSONResponse(
+                    status_code=code if isinstance(code, int) and code >= 400 else 502,
+                    content={"error": {"message": (data.get("error") or {}).get("message") if isinstance(data, dict) else text or "Direct fetch failed", "type": "upstream_error"}},
+                )
+            _log(f"[zen] direct-fetch failed: {text[:200]}")
     if last_error:
         return JSONResponse(
             status_code=502,
@@ -2282,7 +2726,11 @@ async def _zen_stream_with_retry(
     max_retries: int = None,
 ):
     """Streaming Zen API call with proxy pool retry on 429/403 and ReadError recovery."""
+    _ensure_req_id()
     last_error = None
+    last_status: int | None = None
+    pool_exhausted_retriable = False
+    direct_only = False  # set after pool exhaustion: next loop is the one direct-fetch attempt
     attempts = MAX_RETRIES if max_retries is None else max_retries
     finish_delivered = False  # True once a finish_reason chunk was forwarded
     tool_streamed = False  # True once a tool-call fragment was forwarded
@@ -2299,7 +2747,7 @@ async def _zen_stream_with_retry(
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
-        if PROXY_POOL_ENABLED:
+        if PROXY_POOL_ENABLED and not direct_only:
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
@@ -2323,7 +2771,12 @@ async def _zen_stream_with_retry(
                     f"socks5://{proxy_addr}", streaming=True
                 )
         else:
-            client = _stream_default_client
+            # Mirror the Responses-stream branch: the post-exhaustion
+            # direct-fetch attempt strips relay headers and uses the
+            # dedicated no-proxy client instead of the default one.
+            if direct_only:
+                headers = _strip_direct_headers(headers)
+            client = _stream_direct_client if direct_only else _stream_default_client
             proxy_addr = None
 
         if client is None:
@@ -2335,8 +2788,7 @@ async def _zen_stream_with_retry(
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream client is None: {_exc_desc(err)}")
             err.__cause__ = last_error
             last_error = err
-            if PROXY_POOL_ENABLED and proxy_addr:
-                proxy_pool.report_failure(proxy_addr, hard=True)
+            _safe_pool_failure(proxy_addr, err, hard=True)
             # Force a fresh selection next loop; also try direct fallback immediately
             if PROXY_POOL_ENABLED:
                 proxy_pool.current = None
@@ -2353,11 +2805,21 @@ async def _zen_stream_with_retry(
             resp = await client.send(upstream_request, stream=True)
         except Exception as e:
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream request failed (attempt {attempt} pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'}): {_exc_desc(e)}")
-            if PROXY_POOL_ENABLED and proxy_addr:
-                # Same as the responses setup path: a setup failure means the
-                # tunnel never established, so rotate immediately instead of
-                # spending the soft-grace retry on the same dead exit.
-                proxy_pool.report_failure(proxy_addr, hard=True)
+            if _is_client_abort(e):
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    _log(f"[pool] client abort ({type(e).__name__}); not marking {proxy_addr} failed")
+                    proxy_pool.release(proxy_addr)
+                yield _openai_stream_error(
+                    f"Client aborted: {_exc_desc(e)}",
+                    "upstream_error",
+                    "transport_error",
+                )
+                return
+            # Same as the responses setup path: a setup failure means the
+            # tunnel never established, so rotate immediately instead of
+            # spending the soft-grace retry on the same dead exit.
+            # (Abort already returned above, so _safe_pool_failure records.)
+            _safe_pool_failure(proxy_addr, e, hard=True)
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             last_error = e
@@ -2382,18 +2844,25 @@ async def _zen_stream_with_retry(
                     err_msg = "Rate limit exceeded"
             except Exception as e:
                 _log(f"[zen] Stream 429 read failed (attempt {attempt}): {_exc_desc(e)}")
-                if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_failure(proxy_addr)
+                if _is_client_abort(e):
+                    if PROXY_POOL_ENABLED and proxy_addr:
+                        proxy_pool.release(proxy_addr)
+                    await resp.aclose()
+                    yield _openai_stream_error(f"Client aborted: {_exc_desc(e)}")
+                    return
+                _safe_pool_failure(proxy_addr, e, hard=False)
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.release(proxy_addr)
                 await resp.aclose()
                 if attempt < attempts:
-                    await _backoff(attempt)
+                    await _maybe_backoff(attempt, 429)
                     attempt += 1
                     continue
                 yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
                 return
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream 429 (attempt {attempt}): {err_msg}")
+            _log_429_hint()
+            last_status = 429
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.report_ratelimit(proxy_addr)
             if PROXY_POOL_ENABLED and proxy_addr:
@@ -2402,9 +2871,21 @@ async def _zen_stream_with_retry(
             # Per-IP quota burn: the next proxy has fresh quota. Rotate and
             # retry before ever telling the client about the rate limit.
             if attempt < attempts and not await _client_gone(request):
-                await _backoff(attempt)
+                await _maybe_backoff(attempt, 429)
                 attempt += 1
                 continue
+            if PROXY_POOL_ENABLED and not pool_exhausted_retriable and ALLOW_DIRECT_FALLBACK:
+                # Exhaust-then-direct: one direct-fetch attempt (no proxy,
+                # relay headers stripped) before surfacing the 429.
+                pool_exhausted_retriable = True
+                direct_only = True
+                _log_direct_fallback(model, 429)
+                headers = _strip_direct_headers(headers)
+                await _maybe_backoff(attempt, 429)
+                attempt += 1
+                continue
+            if PROXY_POOL_ENABLED and not ALLOW_DIRECT_FALLBACK:
+                _log(f"[zen] pool exhausted on retriable 429; direct fallback disabled (opt in with --allow-direct-fallback)")
             yield _openai_stream_error(
                 err_msg + " (free model rate limit)",
                 "rate_limit_error",
@@ -2417,13 +2898,18 @@ async def _zen_stream_with_retry(
                 raw = await resp.aread()
             except Exception as e:
                 _log(f"[zen] Stream error body read failed (attempt {attempt}): {_exc_desc(e)}")
-                if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_failure(proxy_addr)
+                if _is_client_abort(e):
+                    if PROXY_POOL_ENABLED and proxy_addr:
+                        proxy_pool.release(proxy_addr)
+                    await resp.aclose()
+                    yield _openai_stream_error(f"Client aborted: {_exc_desc(e)}")
+                    return
+                _safe_pool_failure(proxy_addr, e, hard=False)
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.release(proxy_addr)
                 await resp.aclose()
                 if attempt < attempts:
-                    await _backoff(attempt)
+                    await _maybe_backoff(attempt, None)
                     attempt += 1
                     continue
                 yield _openai_stream_error(f"Upstream error: {_exc_desc(e)}")
@@ -2476,11 +2962,37 @@ async def _zen_stream_with_retry(
             if is_context_exceeded:
                 _log("[zen] Context limit error; not retrying on another proxy")
             await resp.aclose()
+            last_status = resp.status_code
             if _is_bare_internal_error(resp.status_code, data, body_text):
                 _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
                 err_msg = f"{err_msg} (model appears down upstream; try another free model)"
+            elif _is_retriable_status(resp.status_code) and not is_context_exceeded and attempt < attempts:
+                # Escalating 5xx/504 cooldown for this exit (504 fast-breaks —
+                # False means stop cycling, surface the error on this pass).
+                if not _report_upstream_status(proxy_addr, resp.status_code):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                await _maybe_backoff(attempt, resp.status_code)
+                attempt += 1
+                continue
+            elif _is_retriable_status(resp.status_code) and not is_context_exceeded and PROXY_POOL_ENABLED and not pool_exhausted_retriable:
+                if not _report_upstream_status(proxy_addr, resp.status_code):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                pool_exhausted_retriable = True
+                if ALLOW_DIRECT_FALLBACK:
+                    direct_only = True
+                    _log_direct_fallback(model, resp.status_code)
+                    headers = _strip_direct_headers(headers)
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                _log(f"[zen] pool exhausted on retriable {resp.status_code}; direct fallback disabled (opt in with --allow-direct-fallback)")
             elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
-                await _backoff(attempt)
+                if not _report_upstream_status(proxy_addr, resp.status_code):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                await _maybe_backoff(attempt, resp.status_code)
                 attempt += 1
                 continue
             yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
@@ -2505,8 +3017,7 @@ async def _zen_stream_with_retry(
                             f"[zen] Malformed upstream stream (attempt {attempt}): "
                             f"{err}; raw={_stream_preview(line)}"
                         )
-                        if PROXY_POOL_ENABLED and proxy_addr:
-                            proxy_pool.report_failure(proxy_addr)
+                        _safe_pool_failure(proxy_addr, err)
                         last_error = err
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
@@ -2534,8 +3045,7 @@ async def _zen_stream_with_retry(
                             f"[zen] Malformed upstream stream (attempt {attempt}): "
                             f"{err}; raw={_stream_preview(payload)}"
                         )
-                        if PROXY_POOL_ENABLED and proxy_addr:
-                            proxy_pool.report_failure(proxy_addr)
+                        _safe_pool_failure(proxy_addr, err)
                         last_error = err
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
@@ -2548,8 +3058,7 @@ async def _zen_stream_with_retry(
                             f"[zen] Malformed upstream stream (attempt {attempt}): "
                             f"{err}; raw={_stream_preview(payload)}"
                         )
-                        if PROXY_POOL_ENABLED and proxy_addr:
-                            proxy_pool.report_failure(proxy_addr)
+                        _safe_pool_failure(proxy_addr, err)
                         last_error = err
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
                             retry_stream = True
@@ -2623,9 +3132,8 @@ async def _zen_stream_with_retry(
                 last_error = e
                 # A torn-down tunnel cannot carry this stream further; rotate
                 # away immediately rather than giving the same proxy another
-                # chance.
-                if PROXY_POOL_ENABLED and proxy_addr:
-                    proxy_pool.report_stream_failure(proxy_addr)
+                # chance. Client aborts never mark the pool failed.
+                _safe_pool_stream_failure(proxy_addr, e)
                 if finish_delivered:
                     # The client already saw finish_reason; the turn completed.
                     # Just terminate the stream cleanly instead of failing it.
@@ -2695,7 +3203,7 @@ async def _zen_stream_with_retry(
             # mid-tool-call). Blacklisting the exit burns good proxies.
             # Only hard-blacklist when nothing was delivered at all.
             if PROXY_POOL_ENABLED and proxy_addr and not streamed_any:
-                proxy_pool.report_stream_failure(proxy_addr)
+                _safe_pool_stream_failure(proxy_addr)
             elif PROXY_POOL_ENABLED and proxy_addr and streamed_any:
                 # Rotate away from this connection without poisoning the pool
                 try:
@@ -2750,6 +3258,7 @@ async def _zen_stream_anthropic_with_retry(
     max_retries: int = None,
 ):
     """Anthropic-format streaming with proxy pool retry on 429 and ReadError recovery."""
+    _ensure_req_id()
     msg_id = oc_id("msg")
     content_idx = 0
     tool_idx = -1
@@ -2826,12 +3335,13 @@ async def _zen_stream_anthropic_with_retry(
                     except Exception:
                         err_msg = "Rate limit"
                     _log(f"[zen] Anthropic stream 429 (attempt {attempt}): {err_msg}")
+                    _log_429_hint()
                     if PROXY_POOL_ENABLED and proxy_addr:
                         proxy_pool.report_ratelimit(proxy_addr)
                     # Per-IP quota: rotate to a fresh exit before telling the
                     # client we are rate-limited.
                     if attempt < attempts and not await _client_gone(request):
-                        await _backoff(attempt)
+                        await _maybe_backoff(attempt, 429)
                         attempt += 1
                         continue
                     yield send_sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err_msg + " (free model rate limit)"}})
@@ -2870,8 +3380,19 @@ async def _zen_stream_anthropic_with_retry(
                     if _is_bare_internal_error(resp.status_code, data, body_text):
                         _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
                         err_msg = f"{err_msg} (model appears down upstream; try another free model)"
+                    elif _is_retriable_status(resp.status_code) and not is_context_exceeded and attempt < attempts:
+                        # Escalating 5xx/504 cooldown; 504 fast-break stops cycling.
+                        if not _report_upstream_status(proxy_addr, resp.status_code):
+                            yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
+                            return
+                        await _maybe_backoff(attempt, resp.status_code)
+                        attempt += 1
+                        continue
                     elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
-                        await _backoff(attempt)
+                        if not _report_upstream_status(proxy_addr, resp.status_code):
+                            yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
+                            return
+                        await _maybe_backoff(attempt, resp.status_code)
                         attempt += 1
                         continue
                     yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
@@ -3026,7 +3547,7 @@ async def _zen_stream_anthropic_with_retry(
                 _log(f"[zen] Anthropic stream incomplete (attempt {attempt} proxy={proxy_addr or 'direct'} pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'} {detail})")
                 last_error = ValueError(f"upstream stream closed before finish_reason ({detail})")
                 if PROXY_POOL_ENABLED and proxy_addr and not streamed_any:
-                    proxy_pool.report_stream_failure(proxy_addr)
+                    _safe_pool_stream_failure(proxy_addr)
                 elif PROXY_POOL_ENABLED and proxy_addr and streamed_any:
                     try:
                         proxy_pool._evict_client(proxy_addr)
@@ -3066,9 +3587,10 @@ async def _zen_stream_anthropic_with_retry(
         except Exception as e:
             _log(f"[zen] Anthropic stream HTTP error (attempt {attempt}): {_exc_desc(e)}")
             # Only transport-level failures are proxy failures; a bug in our
-            # translation code must not blacklist a healthy proxy.
-            if PROXY_POOL_ENABLED and proxy_addr and isinstance(e, httpx.HTTPError):
-                proxy_pool.report_stream_failure(proxy_addr)
+            # translation code must not blacklist a healthy proxy. Client
+            # aborts never mark the pool failed.
+            if isinstance(e, httpx.HTTPError):
+                _safe_pool_stream_failure(proxy_addr, e)
             last_error = e
             if headers_sent and finish_delivered:
                 # Terminal finish_reason already delivered; stop cleanly.
@@ -3307,7 +3829,13 @@ async def nvidia_request_with_retry(
                 # key with no delay; a different key may have access.
                 if resp.status_code < 500 and attempt < key_limit + attempts - 1:
                     continue
-                # 5xx → transient: short backoff then retry.
+                # 5xx → escalating key cooldown (504 fast-breaks, no cycling);
+                # then transient retry with backoff.
+                if not _report_nvidia_status(key, resp.status_code):
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg, "type": "upstream_error"}},
+                    )
                 if attempt < key_limit + attempts - 1:
                     await _backoff(attempt)
                     continue
@@ -3455,14 +3983,19 @@ async def nvidia_stream_with_retry(
             await client.aclose()
             # No bytes have streamed yet -> safe to try another key. A 404 means
             # this key lacks the model; a 5xx may be transient. Sweep the pool.
+            # 5xx records escalating key cooldown (504 fast-breaks, no cycling).
             if resp.status_code < 500 and attempt < attempts + key_limit:
                 attempt += 1
                 await _backoff(attempt)
                 continue
-            if resp.status_code >= 500 and attempt < attempts + key_limit * 2:
-                attempt += 1
-                await _backoff(attempt)
-                continue
+            if resp.status_code >= 500:
+                if not _report_nvidia_status(key, resp.status_code):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                if attempt < attempts + key_limit * 2:
+                    attempt += 1
+                    await _backoff(attempt)
+                    continue
             yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
             return
 
@@ -3806,6 +4339,7 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
 # ── Routes: OpenAI format ─────────────────────────────────────────
 
 async def list_models(request: Request):
+    new_request_id()
     if not _models_cache:
         await _fetch_free_models()
     data = []
@@ -3818,6 +4352,12 @@ async def list_models(request: Request):
             if meta.get("modalities"):
                 entry["modalities"] = meta["modalities"]
         data.append(entry)
+    # Slash-free picker aliases for OpenCode Zen models (no slash/colon):
+    # expose each alias whose canonical id is actually served.
+    _seen_ids = {e["id"] for e in data}
+    for alias, canonical in sorted(MODEL_ALIASES.items()):
+        if canonical in _seen_ids and alias not in _seen_ids:
+            data.append({"id": alias, "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
     # NVIDIA NIM models exposed behind the nvidia/ (and nvimin/) prefix.
     if nvidia_keys.ready:
         for alias in ("kimi-k3", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-coder"):
@@ -3826,6 +4366,7 @@ async def list_models(request: Request):
 
 
 async def chat_completions(request: Request):
+    new_request_id()
     user = auth(request)
     if not user:
         return JSONResponse(status_code=401, content={"error": {"message": "Invalid API key"}})
@@ -3953,6 +4494,7 @@ async def chat_completions(request: Request):
 # ── Routes: Anthropic Messages format ─────────────────────────────
 
 async def messages(request: Request):
+    new_request_id()
     user = auth(request)
     if not user:
         return JSONResponse(
@@ -4333,6 +4875,7 @@ async def _stream_as_responses(upstream, model: str, session_id=None):
 
 
 async def handle_responses(request: Request):
+    new_request_id()
     try:
         body = await request.json()
         model = body.get("model", "")
