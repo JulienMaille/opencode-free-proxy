@@ -90,6 +90,20 @@ REQUEST_READ_TIMEOUT = 120
 # requests, but give streaming clients a longer idle window.
 STREAM_READ_TIMEOUT = 300
 
+# ── Sticky-primary + healthy-first + escalating cooldown (pi-freeflow port) ──
+# Per-entry cooldowns (ms). Base 30s; 45s on generic 5xx; 60s on 504 gateway
+# timeout; 90s × min(4, consecutive_failures) on 429. Internal timestamps are
+# stored in seconds (cooling_until); helpers convert.
+COOLDOWN_BASE_MS = 30_000
+COOLDOWN_5XX_MS = 45_000
+COOLDOWN_504_MS = 60_000
+COOLDOWN_429_MS = 90_000
+COOLDOWN_MAX_MULT = 4
+# 60s sliding window: >5 429s/min across the pool logs one burst-warning
+# (throttled to at most one log per window).
+BURST_WINDOW_SECS = 60.0
+BURST_THRESHOLD = 5
+
 # Public SOCKS lists contain many stale or mislabelled HTTP endpoints. Keep the
 # default candidate set focused on the two SOCKS ports that are most common in
 # these lists; set OPENCODE_PROXY_PORT_FILTER=false to allow every port.
@@ -162,6 +176,13 @@ class ProxyPool:
         self.stats: dict[str, dict] = {}
         self._stats_dirty = False
         self._last_stats_save = 0.0
+        # ── pi-freeflow sticky-primary entry state ──
+        # {addr: {consecutive_failures, last429At, lastLatencyMs,
+        #         success, fail, cooling_until}}. cooling_until is an epoch
+        # timestamp (seconds); entry is healthy when cooling_until < now.
+        self.entries: dict[str, dict] = {}
+        self._429_times: list[float] = []
+        self._last_burst_warn = 0.0
         self._try_load_cache()
 
     # ── Stability stats ──────────────────────────────────────────────
@@ -186,6 +207,7 @@ class ProxyPool:
     def _record_latency(self, addr: str, seconds: float):
         s = self._stat(addr)
         s["ema"] = seconds if not s["ema"] else 0.7 * s["ema"] + 0.3 * seconds
+        self._entry(addr)["lastLatencyMs"] = int(seconds * 1000)
         self._stats_dirty = True
 
     def _quality(self, addr: str) -> float:
@@ -209,6 +231,88 @@ class ProxyPool:
             self._stats_dirty = False
             self._save_cache()
 
+    # ── Sticky-primary + healthy-first entry state (pi-freeflow port) ──
+
+    def _entry(self, addr: str) -> dict:
+        return self.entries.setdefault(addr, {
+            "consecutive_failures": 0,
+            "last429At": 0.0,
+            "lastLatencyMs": 0,
+            "success": 0,
+            "fail": 0,
+            "cooling_until": 0.0,
+        })
+
+    def _is_cooling(self, addr: str, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return float(self.entries.get(addr, {}).get("cooling_until", 0.0)) > now
+
+    @staticmethod
+    def _cooldown_ms(status: int | None, consecutive_failures: int) -> int:
+        """Escalating cooldown: 30s base, 45s on 5xx, 60s on 504,
+        90s * min(4, consecutive_failures) on 429."""
+        if status == 429:
+            mult = max(1, min(COOLDOWN_MAX_MULT, consecutive_failures))
+            return COOLDOWN_429_MS * mult
+        if status == 504:
+            return COOLDOWN_504_MS
+        if status is not None and 500 <= status < 600:
+            return COOLDOWN_5XX_MS
+        return COOLDOWN_BASE_MS
+
+    def _note_429(self, now: float):
+        self._429_times.append(now)
+        cutoff = now - BURST_WINDOW_SECS
+        self._429_times = [t for t in self._429_times if t > cutoff]
+        if len(self._429_times) > BURST_THRESHOLD and now - self._last_burst_warn >= BURST_WINDOW_SECS:
+            self._last_burst_warn = now
+            _log(f"429 burst-warning: {len(self._429_times)} 429s in last 60s across pool")
+
+    def _apply_entry_cooldown(self, addr: str, status: int | None) -> int:
+        now = time.time()
+        e = self._entry(addr)
+        e["consecutive_failures"] = int(e.get("consecutive_failures", 0)) + 1
+        e["fail"] = int(e.get("fail", 0)) + 1
+        if status == 429:
+            e["last429At"] = now
+            self._note_429(now)
+        ms = self._cooldown_ms(status, e["consecutive_failures"])
+        e["cooling_until"] = now + ms / 1000.0
+        self._stats_dirty = True
+        return ms
+
+    def getOrdered(self) -> list[dict]:
+        """Healthy-first ordering: current (if healthy) first, then healthy
+        hot entries by quality, then cooling entries by earliest recovery."""
+        now = time.time()
+        seen: set[str] = set()
+        healthy: list[dict] = []
+        cooling: list[dict] = []
+        ordered_candidates: list[dict] = []
+        if self.current and self.current.get("address"):
+            ordered_candidates.append(self.current)
+        ordered_candidates.extend(self.hot)
+        for p in ordered_candidates:
+            addr = p.get("address")
+            if not addr or addr in seen:
+                continue
+            seen.add(addr)
+            if self._is_bad(addr):
+                continue
+            if self._is_cooling(addr, now):
+                cooling.append(p)
+            else:
+                healthy.append(p)
+        healthy.sort(key=lambda p: self._quality(p["address"]))
+        # Keep sticky-primary first when it is healthy.
+        if self.current and healthy and healthy[0].get("address") != self.current.get("address"):
+            for i, p in enumerate(healthy):
+                if p.get("address") == self.current.get("address"):
+                    healthy.insert(0, healthy.pop(i))
+                    break
+        cooling.sort(key=lambda p: float(self.entries.get(p["address"], {}).get("cooling_until", 0.0)))
+        return healthy + cooling
+
     def _try_load_cache(self) -> bool:
         data = _load_json(CACHE_FILE, {})
         if isinstance(data, dict):
@@ -220,6 +324,36 @@ class ProxyPool:
                     for a, s in saved_stats.items()
                     if isinstance(a, str) and isinstance(s, dict)
                 }
+            saved_entries = data.get("entries")
+            if isinstance(saved_entries, dict):
+                now = time.time()
+                for a, s in saved_entries.items():
+                    if not isinstance(a, str) or not isinstance(s, dict):
+                        continue
+                    try:
+                        cooling_until = float(s.get("cooling_until", 0.0))
+                    except (TypeError, ValueError):
+                        cooling_until = 0.0
+                    # Drop expired cooldowns and reset their failure streak: a
+                    # stale consecutive_failures with zeroed cooling_until
+                    # would give the first post-restart 429 a max cooldown.
+                    expired = cooling_until <= now
+                    if expired:
+                        cooling_until = 0.0
+                    try:
+                        consecutive_failures = int(s.get("consecutive_failures", 0))
+                        if expired:
+                            consecutive_failures = 0
+                        self.entries[a] = {
+                            "consecutive_failures": consecutive_failures,
+                            "last429At": float(s.get("last429At", 0.0)),
+                            "lastLatencyMs": int(s.get("lastLatencyMs", 0)),
+                            "success": int(s.get("success", 0)),
+                            "fail": int(s.get("fail", 0)),
+                            "cooling_until": cooling_until,
+                        }
+                    except (TypeError, ValueError):
+                        continue
             candidates = data.get("candidates")
             age = time.time() - saved_at
             has_sources = (
@@ -248,6 +382,7 @@ class ProxyPool:
             "saved_at": time.time(),
             "candidates": self.candidates,
             "stats": self.stats,
+            "entries": self.entries,
         })
 
     @staticmethod
@@ -291,6 +426,12 @@ class ProxyPool:
         if rl and rl > now:
             return True
         return False
+
+    def _is_unavailable(self, addr: str, now: float | None = None) -> bool:
+        """Bad (blacklist/rate-limit/port) OR in escalating cooldown."""
+        if self._is_bad(addr):
+            return True
+        return self._is_cooling(addr, now)
 
     async def load(self):
         """Fetch sources in background. Returns immediately — pool is ready."""
@@ -470,7 +611,7 @@ class ProxyPool:
         """
         if self.current:
             addr = self.current["address"]
-            if not self._is_bad(addr):
+            if not self._is_unavailable(addr):
                 if self._load(addr) < MAX_PER_PROXY:
                     self._inflight[addr] = self._inflight.get(addr, 0) + 1
                     self._inflight_at[addr] = time.time()
@@ -486,10 +627,10 @@ class ProxyPool:
         if not self.candidates and self._source_task:
             await self._source_task
 
-        # 1. Hot buffer — least-loaded verified proxy with spare capacity,
-        #    skipping the overloaded current so it isn't hit even harder.
-        #    Prune stale/bad entries first so dead weight doesn't accumulate
-        #    and block the background refill from topping the buffer up.
+        # 1. Hot buffer — healthy-first via getOrdered(): sticky current stays
+        #    first while healthy, then healthy hot entries by quality, then
+        #    cooling entries by earliest recovery. Prune stale/bad entries
+        #    first so dead weight doesn't accumulate and block refill.
         now = time.time()
         self.hot = [
             p for p in self.hot
@@ -498,7 +639,8 @@ class ProxyPool:
         ]
         best = None
         best_score = None
-        for p in self.hot:
+        fallback = None
+        for p in self.getOrdered():
             verified_at = float(p.get("verified_at", 0))
             if now - verified_at > HOT_TTL:
                 continue
@@ -509,6 +651,12 @@ class ProxyPool:
             load = self._load(p["address"])
             if load >= MAX_PER_PROXY:
                 continue
+            if self._is_cooling(p["address"], now):
+                # All healthy entries are busy — remember the earliest
+                # recovering cooling entry as a last resort.
+                if fallback is None:
+                    fallback = p
+                continue
             # Rank by stability: latency EWMA discounted by reliability
             # (Laplace-smoothed ok/fail), with a mild penalty per extra
             # in-flight request so bursts still spread across exits.
@@ -516,6 +664,9 @@ class ProxyPool:
             if best is None or score < best_score:
                 best = p
                 best_score = score
+        if best is None and fallback is not None:
+            best = fallback
+            _log(f"Selected cooling proxy (earliest recovery): {best['address']}")
         if best is not None:
             self.current = best
             self._inflight[best["address"]] = self._inflight.get(best["address"], 0) + 1
@@ -661,16 +812,65 @@ class ProxyPool:
 
         _log(f"Refill done: +{added}, checked={checked}, hot={len(self.hot)}/{HOT_TARGET}")
 
-    def report_ratelimit(self, addr: str | None = None):
+    def report_ratelimit(self, addr: str | None = None, status: int | None = 429):
         target = addr or (self.current and self.current["address"])
         if not target:
             return
         self.transport_failures.pop(target, None)
         self.rate_limits[target] = time.time() + RATE_LIMIT_TTL
+        ms = self._apply_entry_cooldown(target, status if status is not None else 429)
         self._evict_client(target)
-        _log(f"Rate-limited {target} for {RATE_LIMIT_TTL // 60}m; rotating")
+        _log(f"Rate-limited {target} for {RATE_LIMIT_TTL // 60}m (+{ms // 1000}s entry cooldown); rotating")
         if self.current and self.current["address"] == target:
             self.current = None
+
+    def report_http_status(self, addr: str | None = None, status: int | None = None) -> bool:
+        """Record an upstream HTTP status for ``addr`` with escalating cooldown.
+
+        Returns True if the caller should roll to the next entry, False on
+        504 fast-break (don't cycle the pool — upstream timed out, not the
+        proxy's fault to sweep).
+        """
+        target = addr or (self.current and self.current["address"])
+        if not target:
+            return True
+        if status == 504:
+            ms = self._apply_entry_cooldown(target, 504)
+            self._mark_fail(target)
+            self._evict_client(target)
+            _log(f"504 from {target} (+{ms // 1000}s cooldown); fast-break, not cycling pool")
+            return False
+        if status == 429:
+            self.report_ratelimit(target, status=429)
+            return True
+        if status is not None and 500 <= status < 600:
+            ms = self._apply_entry_cooldown(target, status)
+            self._mark_fail(target)
+            self._evict_client(target)
+            _log(f"HTTP {status} from {target} (+{ms // 1000}s cooldown); rotating")
+            if self.current and self.current["address"] == target:
+                self.current = None
+            return True
+        return True
+
+    @staticmethod
+    def is_cancelled(exc: BaseException | None) -> bool:
+        """True for client AbortError / cancellation — never penalize these."""
+        if exc is None:
+            return False
+        if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+            return True
+        name = type(exc).__name__
+        if name in ("AbortError", "CancelledError", "Cancel", "ClientDisconnect", "Disconnect"):
+            return True
+        msg = str(exc)
+        if "AbortError" in msg or "aborted" in msg.lower() or "client disconnect" in msg.lower():
+            return True
+        return False
+
+    def report_cancelled(self, addr: str | None = None, exc: BaseException | None = None):
+        """Client aborted / cancelled — release only, never penalize entry."""
+        return
 
     def rotate_without_blacklist(self, addr: str | None = None):
         """Drop sticky selection for ``addr`` WITHOUT blacklisting it.
@@ -686,14 +886,19 @@ class ProxyPool:
         if self.current and self.current["address"] == target:
             self.current = None
 
-    def report_failure(self, addr: str | None = None, hard: bool = False):
+    def report_failure(self, addr: str | None = None, hard: bool = False,
+                       exc: BaseException | None = None):
         """Record a transport-level failure for ``addr``.
 
         Soft failures (e.g. a single ReadError) get one grace retry on the
         same exit; ``hard`` failures (connect timeout, proxy unreachable)
         blacklist immediately — an exit that refuses connections is dead for
-        the rest of this request anyway.
+        the rest of this request anyway. Client AbortError/cancel (``exc``)
+        is never penalized.
         """
+        if self.is_cancelled(exc):
+            self.report_cancelled(addr, exc)
+            return
         target = addr or (self.current and self.current["address"])
         if not target:
             return
@@ -711,6 +916,7 @@ class ProxyPool:
         if not hard and failures < 2:
             _log(f"Transport failure {target} ({failures}/2); retrying same proxy")
             return
+        self._apply_entry_cooldown(target, None)
         self.blacklist[target] = time.time() + BLACKLIST_TTL
         self.transport_failures.pop(target, None)
         reason = "hard transport failure" if hard else f"{failures} transport failures"
@@ -745,6 +951,12 @@ class ProxyPool:
         if not target:
             return
         self._mark_ok(target)
+        e = self._entry(target)
+        e["consecutive_failures"] = 0
+        e["cooling_until"] = 0.0
+        e["success"] = int(e.get("success", 0)) + 1
+        self._stats_dirty = True
+        self._maybe_save_stats()
         had_failure = self.transport_failures.pop(target, None)
         if had_failure and self.current and self.current["address"] == target:
             # This request only succeeded after a transport failure on the
@@ -776,7 +988,8 @@ class ProxyPool:
         now = time.time()
         bl = sum(1 for a in self.blacklist if self.blacklist.get(a, 0) > now)
         rl = sum(1 for a in self.rate_limits if self.rate_limits.get(a, 0) > now)
-        return f"candidates={len(self.candidates)} hot={len(self.hot)} verifying={len(self.verifying)} blacklisted={bl} rate_limited={rl}"
+        cooling = sum(1 for a, e in self.entries.items() if float(e.get("cooling_until", 0.0)) > now)
+        return f"candidates={len(self.candidates)} hot={len(self.hot)} verifying={len(self.verifying)} blacklisted={bl} rate_limited={rl} cooling={cooling}"
 
     async def force_refresh(self):
         now = time.time()
