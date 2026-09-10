@@ -17,6 +17,34 @@ A standalone `dist\opencode-free-proxy.exe` (~12 MB) is also provided — same d
 
 Server is at `http://localhost:6446`.
 
+## Deploying on a Free Cloud Host
+
+You can deploy this service for free on platforms like **Render**, **Koyeb**, or **Hugging Face Spaces**.
+
+### Option A: Deploy on Render (Recommended)
+
+1. Push or fork this repository to your GitHub account.
+2. Sign in to [Render](https://render.com).
+3. Click **New +** -> **Blueprint**.
+4. Connect your GitHub repository. Render will automatically detect `render.yaml` and configure the Web Service on the Free Tier.
+5. Click **Apply**. Once deployed, Render will provide a live URL (e.g. `https://your-service.onrender.com`).
+
+Alternatively, create a **Web Service** manually on Render:
+- **Environment**: Python 3
+- **Build Command**: `pip install -r requirements.txt`
+- **Start Command**: `python server.py --host 0.0.0.0`
+- **Environment Variables**: Set `PORT` (or let Render set it automatically).
+
+### Option B: Deploy with Docker (Koyeb / Hugging Face Spaces / Fly.io)
+
+This repo includes a production `Dockerfile`.
+
+1. Push this repo to GitHub.
+2. On your host of choice (e.g., Koyeb or Hugging Face Spaces Docker SDK):
+   - Choose **Docker** build mode.
+   - Set start port/container port to `6446` (or `$PORT` override).
+3. Deploy! Access health checks at `https://your-app-url/health`.
+
 ## CLI arguments
 
 ```bash
