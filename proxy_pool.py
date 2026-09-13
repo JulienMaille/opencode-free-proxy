@@ -65,6 +65,10 @@ POLL_INTERVAL = 30 * 60
 # the on-disk cache useless since refreshes only run every 30 minutes.
 CACHE_TTL = POLL_INTERVAL
 VERIFY_TIMEOUT = 6
+# Verification grace-retry delay (038321c port): a single verify miss gets one
+# retry after this short sleep before the address is marked bad. Keeps
+# VERIFY_TIMEOUT per-attempt semantics (each try still hard-bounded).
+VERIFY_RETRY_DELAY = 0.5
 VERIFY_BATCH_SIZE = 20
 HOT_TARGET = 15
 HOT_MIN = 5
@@ -541,6 +545,19 @@ class ProxyPool:
             except Exception:
                 return False
 
+    async def _verify_with_retry(self, proxy: dict) -> bool:
+        """Grace-retry verify (038321c port): one retry after a short sleep.
+
+        A single verify miss (transient SOCKS/TLS stall) must not declare the
+        exit dead. Each attempt keeps VERIFY_TIMEOUT semantics (hard-bounded
+        inside _verify); only a double miss returns False and lets the caller
+        mark bad/cooling. Never touches the HOT cache itself.
+        """
+        if await self._verify(proxy):
+            return True
+        await asyncio.sleep(VERIFY_RETRY_DELAY)
+        return await self._verify(proxy)
+
     def _take_verification_batch(
         self,
         limit: int,
@@ -690,7 +707,7 @@ class ProxyPool:
                 f"Verifying {len(batch)} candidates on-the-fly across "
                 f"{len({p.get('source', 'legacy') for p in batch})} sources..."
             )
-            pending = {asyncio.create_task(self._verify(p)): p for p in batch}
+            pending = {asyncio.create_task(self._verify_with_retry(p)): p for p in batch}
             try:
                 while pending:
                     done, _ = await asyncio.wait(
@@ -791,7 +808,7 @@ class ProxyPool:
             )
             try:
                 results = await asyncio.gather(
-                    *[self._verify(p) for p in batch], return_exceptions=True
+                    *[self._verify_with_retry(p) for p in batch], return_exceptions=True
                 )
             finally:
                 # Always release in-flight markers, even on task cancellation.
@@ -811,6 +828,69 @@ class ProxyPool:
                     self.blacklist[addr] = time.time() + BLACKLIST_TTL
 
         _log(f"Refill done: +{added}, checked={checked}, hot={len(self.hot)}/{HOT_TARGET}")
+
+    def report_too_large(self, addr: str | None = None) -> bool:
+        """413 Payload Too Large is a size signal, not a health signal.
+
+        The request body exceeded the upstream limit — the proxy exit did
+        nothing wrong, so NOTHING is penalized: no ``cooling_until``, no
+        blacklist, no rate-limit, no ``consecutive_failures`` increment, no
+        success/fail counter change. Just clears the sticky ``current`` so
+        the next ``select()`` picks the next healthy entry.
+
+        Contract (mirrors relay-413 expectations):
+        1. ``entries[addr].cooling_until`` is unchanged (still 0.0 / expired).
+        2. ``addr`` is absent from ``blacklist`` and ``rate_limits`` after
+           the call.
+        3. ``entries[addr].consecutive_failures`` and ``stats[addr]``
+           (ok/fail) are unchanged.
+        Only the sticky ``current`` pointer rotates when it pointed at
+        ``addr``. Callable directly from server.py retry loops.
+
+        Returns True (caller should roll to the next entry and retry).
+        """
+        target = addr or (self.current and self.current["address"])
+        if not target:
+            return True
+        _log(f"413 too-large via {target}; rotating (no penalty — size, not health)")
+        if self.current and self.current["address"] == target:
+            self.current = None
+        return True
+
+    def health_snapshot(self, now: float | None = None) -> dict:
+        """Minimal pool health snapshot for the server watchdog gate.
+
+        Counts unique eligible entries (sticky ``current`` + hot buffer,
+        skipping blacklisted/rate-limited/disallowed-port entries) as
+        healthy vs in escalating cooldown. Server-side
+        ``should_rotate_on_health()`` consumes this dict — no server logic
+        lives here, just the data.
+
+        Returns ``{"healthy": int, "cooling": int, "current": str | None}``
+        where ``current`` is the sticky entry address (even if cooling/bad,
+        so the gate can see what select() would drop).
+        """
+        now = time.time() if now is None else now
+        seen: set[str] = set()
+        healthy = 0
+        cooling = 0
+        ordered: list[dict] = []
+        if self.current and self.current.get("address"):
+            ordered.append(self.current)
+        ordered.extend(self.hot)
+        for p in ordered:
+            a = p.get("address")
+            if not a or a in seen:
+                continue
+            seen.add(a)
+            if self._is_bad(a):
+                continue
+            if self._is_cooling(a, now):
+                cooling += 1
+            else:
+                healthy += 1
+        cur = self.current.get("address") if self.current else None
+        return {"healthy": healthy, "cooling": cooling, "current": cur}
 
     def report_ratelimit(self, addr: str | None = None, status: int | None = 429):
         target = addr or (self.current and self.current["address"])
@@ -833,6 +913,10 @@ class ProxyPool:
         """
         target = addr or (self.current and self.current["address"])
         if not target:
+            return True
+        if status == 413:
+            # Size, not health — rotate without any penalty.
+            self.report_too_large(target)
             return True
         if status == 504:
             ms = self._apply_entry_cooldown(target, 504)
