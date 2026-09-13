@@ -17,6 +17,40 @@ A standalone `dist\opencode-free-proxy.exe` (~12 MB) is also provided — same d
 
 Server is at `http://localhost:6446`.
 
+## Deploying on a Free Cloud Host
+
+You can deploy this service for free on platforms like **Render**, **Koyeb**, or **Hugging Face Spaces**.
+
+### Option A: Deploy on Render (Recommended)
+
+1. Push or fork this repository to your GitHub account.
+2. Sign in to [Render](https://render.com).
+3. Click **New +** -> **Blueprint**.
+4. Connect your GitHub repository. Render will automatically detect `render.yaml` and configure the Web Service on the Free Tier.
+5. Click **Apply**. Once deployed, Render will provide a live URL (e.g. `https://your-service.onrender.com`).
+
+Alternatively, create a **Web Service** manually on Render:
+- **Environment**: Python 3
+- **Build Command**: `pip install -r requirements.txt`
+- **Start Command**: `python server.py --host 0.0.0.0`
+- **Environment Variables**: Set `PORT` (or let Render set it automatically).
+
+### Option B: Free Alternatives to Render
+
+This repository includes a production `Dockerfile` that works out of the box on several free hosting providers:
+
+1. **Koyeb**:
+   - Offers a free nano instance (512MB RAM, shared vCPU).
+   - Sign up at [koyeb.com](https://www.koyeb.com), connect GitHub, select **Docker** or **Python** build method, and deploy.
+2. **Hugging Face Spaces**:
+   - Free CPU basic tier (16GB RAM, 2 vCPUs).
+   - Create a new Space on [huggingface.co](https://huggingface.co/spaces), select **Docker** space SDK, push this repository, and Hugging Face will host it for free.
+3. **Fly.io**:
+   - Offers a free trial / allowance for small app instances.
+   - Run `fly launch` using the included `Dockerfile` and set exposed port to `6446`.
+4. **Northflank / Railway / Deta Space**:
+   - Provide free developer credits or free developer tiers for Docker containers.
+
 ## CLI arguments
 
 ```bash
