@@ -678,22 +678,46 @@ def _is_region_error(data: dict | None = None, body: str = "") -> bool:
     return "not available in your country" in text
 
 
-def _is_promotion_ended_error(data: dict | None = None, body: str = "") -> bool:
+def _is_promotion_ended_error(data: dict | None = None, body: str = "", status_code: int | None = None, model: str | None = None) -> bool:
     """Recognize entitlement errors for a model whose free promotion ended.
 
     Observed as ``{"type":"ModelError","message":"Free promotion has ended
     for ... Free"}`` (HTTP 401). This repeats identically on every proxy and
     every retry — it is account/entitlement level, not transport level — so
     retrying is pure waste. The model is dead until upstream re-lists it.
+
+    A bare ModelError body (no promotion phrase, e.g. ``deepseek-*-free``
+    401) retires via the same lazy path, but only when it is a 401 on a
+    listed ``-free`` model — other ModelError shapes must not retire.
     """
-    error = data.get("error") if isinstance(data, dict) else None
-    if not isinstance(error, dict):
-        error = {}
-    etype = str(error.get("type") or "").strip().lower()
+    if not isinstance(data, dict):
+        data = {}
+    err = data.get("error")
+    if not isinstance(err, dict):
+        err = {}
+    top_type = str(data.get("type") or "").strip().lower()
+    err_type = str(err.get("type") or "").strip().lower()
     text = " ".join(
-        str(v) for v in (error.get("message"), body) if v is not None
+        str(v) for v in (data.get("message"), err.get("message"), body) if v is not None
     ).lower()
-    return "promotion has ended" in text or etype == "modelerror"
+    if "promotion has ended" in text:
+        return True
+    if top_type != "modelerror" and err_type != "modelerror":
+        return False
+    try:
+        code = int(status_code) if status_code is not None else None
+    except Exception:
+        code = None
+    # In-body stream errors arrive without an HTTP status (stream already
+    # 200): require the explicit phrase there — a bare ModelError mid-stream
+    # (e.g. transient "overloaded") must NOT retire. A real HTTP status must
+    # be 401 to qualify as the keyless-tier retire case.
+    if code is None:
+        return False
+    if code != 401:
+        return False
+    m = _normalize_model(model) if model else ""
+    return bool(m) and (bool(_FREE_MODEL_RE.match(m)) or m in _FREE_MODEL_EXTRA or m in _models_cache or m in _dead_models or m in DEAD_IDS)
 
 
 def _blocks_text(content) -> str:
@@ -710,52 +734,197 @@ def _blocks_text(content) -> str:
 _models_cache: list[str] = []
 _models_meta: dict[str, dict] = {}  # model_id -> {name, limit, modalities}
 _dead_models: set[str] = set()  # ids rejected upstream (free promotion ended); excluded from rediscovery
-# Free-tier ids whose name does not carry a "free" tag (models.dev cost == 0),
+# Free-tier ids whose name does not carry a "-free" suffix (models.dev cost == 0),
 # kept alongside name-tagged models so discovery doesn't drop them.
 _FREE_MODEL_EXTRA: set[str] = {"big-pickle"}
+# Precise free filter (port of pi-opencode-free FREE_REGEX): optional
+# `opencode/` prefix + mandatory `-free` suffix, case-insensitive.
+_FREE_MODEL_RE = re.compile(r"^(opencode/)?.*-free$", re.IGNORECASE)
 _MODELS_REFRESH_SECS = 43200  # safety-net refresh every 12h; unknown models trigger on-demand
+# Conservative /v1/models defaults when models.dev is unreachable.
+_DEFAULT_LIMIT = {"context": 128000, "output": 16384, "contextWindow": 128000, "maxTokens": 16384}
+_DEFAULT_MODALITIES = {"input": ["text", "image"], "output": ["text"]}
+# Parallel discovery deadline (~3s combined for Zen + models.dev).
+_DISCOVERY_DEADLINE_SECS = 3.5
+
+
+# ── Persistent dead-model denylist (pi-freeflow DEAD_MODEL_IDS pattern) ──
+# File-backed so a retired -free id stays retired across restarts: stale
+# disk state or a resurrected upstream listing cannot bring it back.
+# Pattern only — no upstream id values are copied here.
+_DEAD_IDS_FILE = _BASE_DIR / "data" / "dead-models.json"
+DEAD_IDS: set[str] = set()  # persistent denylist; kept in sync with _dead_models
+
+
+def _sanitize_models_cache() -> int:
+    """Purge denylisted ids from the served snapshot. Returns purged count."""
+    global _models_cache, _models_meta
+    dead = _dead_models | DEAD_IDS
+    if not dead:
+        return 0
+    purged = 0
+    if _models_cache:
+        kept = [m for m in _models_cache if m not in dead]
+        purged = len(_models_cache) - len(kept)
+        if purged:
+            _models_cache = kept
+    for m in list(_models_meta):
+        if m in dead:
+            _models_meta.pop(m, None)
+    return purged
+
+
+def _load_dead_ids() -> None:
+    """Load the persistent denylist from disk (disk-cache read + sanitize)."""
+    global DEAD_IDS
+    try:
+        with open(_DEAD_IDS_FILE, encoding="utf-8") as f:
+            raw = json.load(f) or []
+    except FileNotFoundError:
+        raw = []
+    except Exception:
+        raw = []
+    ids = {str(m).strip() for m in raw} if isinstance(raw, list) else set()
+    ids = {m for m in ids if m}
+    DEAD_IDS = ids
+    _dead_models.update(ids)
+    _sanitize_models_cache()
+
+
+def _persist_dead_ids() -> None:
+    """Persist the denylist (best-effort, never raises)."""
+    try:
+        _DEAD_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DEAD_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(DEAD_IDS), f, indent=2, sort_keys=True)
+    except OSError:
+        pass
+
+
+# ── Stealth/omen admission gate (stealth-models policy, pattern only) ──
+# stealth/* and omen* ids enter the picker/aliases only with Zen free-list
+# presence AND the free-regex (or explicit allowlist). Ghost client-side
+# listings (e.g. Omen Alpha) fail the gate here instead of 404ing at
+# request time. No new models are added by this gate.
+_STEALTH_OMEN_RE = re.compile(r"^(opencode/)?(stealth[/\-_].*|omen.*)$", re.IGNORECASE)
+
+
+def _is_stealth_or_omen(model_id: str | None) -> bool:
+    try:
+        return bool(model_id) and bool(_STEALTH_OMEN_RE.match(str(model_id).strip()))
+    except Exception:
+        return False
+
+
+def _stealth_admitted(model_id: str, zen_free: set[str] | None = None) -> bool:
+    """True unless a stealth/omen id fails the admission gate (logs rejection)."""
+    if not _is_stealth_or_omen(model_id):
+        return True
+    mid = str(model_id).strip()
+    if not (_FREE_MODEL_RE.match(mid) or mid in _FREE_MODEL_EXTRA):
+        _log(f"[models] stealth gate: rejected {mid!r} (fails free filter, no allowlist entry)")
+        return False
+    if zen_free is not None and mid not in zen_free:
+        _log(f"[models] stealth gate: rejected {mid!r} (absent from Zen free list)")
+        return False
+    return True
+
+
+_load_dead_ids()
 
 
 async def _fetch_free_models():
-    """Query Zen API + models.dev, merge free model list with context limits."""
+    """Query Zen API + models.dev, merge free model list with context limits.
+
+    Both sources are fetched in parallel behind a combined ~3s deadline.
+    On empty discovery the previous snapshot is kept (never wipe good cache).
+    """
     global _models_cache, _models_meta
     try:
         async with httpx.AsyncClient() as c:
-            # 1. Get available models from Zen API
-            r = await c.get(
-                "https://opencode.ai/zen/v1/models",
-                headers={"User-Agent": f"opencode/{OC_VERSION}", "x-opencode-client": "cli"},
-                timeout=10,
-            )
-            if r.status_code != 200:
-                _log(f"[models] Zen API returned {r.status_code}, keeping cached models")
+            zen_headers = {"User-Agent": f"opencode/{OC_VERSION}", "x-opencode-client": "cli"}
+
+            async def _get_zen():
+                return await c.get(
+                    "https://opencode.ai/zen/v1/models",
+                    headers=zen_headers,
+                    timeout=10,
+                )
+
+            async def _get_models_dev():
+                return await c.get("https://models.dev/api.json", timeout=10)
+
+            try:
+                zen_res, md_res = await asyncio.wait_for(
+                    asyncio.gather(_get_zen(), _get_models_dev(), return_exceptions=True),
+                    timeout=_DISCOVERY_DEADLINE_SECS,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                _log("[models] Discovery deadline exceeded, keeping cached models")
+                return
+            r = zen_res
+            if isinstance(r, BaseException) or r is None:
+                _log(f"[models] Zen API fetch failed ({r!r} if error), keeping cached models")
+                return
+            if getattr(r, "status_code", None) != 200:
+                _log(f"[models] Zen API returned {getattr(r, 'status_code', '?')}, keeping cached models")
                 return
             data = r.json()
             all_models = [m["id"] for m in data.get("data", []) if isinstance(m, dict)]
-            free = [m for m in all_models if ("free" in m.lower() or m in _FREE_MODEL_EXTRA) and m not in _dead_models]
+            zen_free = {m for m in all_models if (_FREE_MODEL_RE.match(m) or m in _FREE_MODEL_EXTRA)}
+            free = [
+                m for m in all_models
+                if (_FREE_MODEL_RE.match(m) or m in _FREE_MODEL_EXTRA)
+                and m not in _dead_models
+                and m not in DEAD_IDS
+                and _stealth_admitted(m, zen_free)
+            ]
             if not free:
                 _log("[models] No free models found in Zen API, keeping cached")
                 return
 
-            # 2. Fetch context limits from models.dev
+            # 2. Merge context limits from models.dev (parallel fetch above).
+            meta: dict[str, dict] = {}
             try:
-                md = await c.get("https://models.dev/api.json", timeout=10)
+                md = md_res
+                if isinstance(md, BaseException) or md is None:
+                    raise RuntimeError(f"models.dev fetch failed: {md!r}")
                 if md.status_code == 200:
                     md_data = md.json()
                     oc_models = md_data.get("opencode", {}).get("models", {})
-                    meta = {}
                     for mid in free:
                         entry = oc_models.get(mid)
                         if entry:
+                            limit = entry.get("limit") or {}
+                            if not isinstance(limit, dict):
+                                limit = {}
+                            # Conservative defaults when fields are missing.
+                            ctx = limit.get("context") or limit.get("contextWindow") or _DEFAULT_LIMIT["context"]
+                            out = limit.get("output") or limit.get("maxTokens") or _DEFAULT_LIMIT["maxTokens"]
+                            mods = entry.get("modalities")
+                            if not isinstance(mods, dict):
+                                mods = {}
+                            # Normalize modalities to text/image for /v1/models.
+                            in_mods = [m for m in (mods.get("input") or []) if m in ("text", "image")] or ["text"]
+                            out_mods = [m for m in (mods.get("output") or []) if m in ("text", "image")] or ["text"]
                             meta[mid] = {
                                 "name": entry.get("name"),
-                                "limit": entry.get("limit"),
-                                "modalities": entry.get("modalities"),
+                                "limit": {"context": ctx, "output": out, "contextWindow": ctx, "maxTokens": out},
+                                "modalities": {"input": in_mods, "output": out_mods},
+                            }
+                        else:
+                            meta[mid] = {
+                                "name": None,
+                                "limit": dict(_DEFAULT_LIMIT),
+                                "modalities": dict(_DEFAULT_MODALITIES),
                             }
                     _models_meta = meta
                     _log(f"[models] Loaded metadata for {len(meta)} models from models.dev")
+                else:
+                    raise RuntimeError(f"models.dev returned {md.status_code}")
             except Exception as e:
-                _log(f"[models] models.dev fetch failed: {e}, metadata may be missing")
+                _log(f"[models] models.dev fetch failed: {e}, using conservative defaults")
+                _models_meta = {mid: {"name": None, "limit": dict(_DEFAULT_LIMIT), "modalities": dict(_DEFAULT_MODALITIES)} for mid in free}
 
             _models_cache = free
             _log(f"[models] Discovered {len(free)} free models: {', '.join(free)}")
@@ -786,29 +955,62 @@ async def _ensure_model_known(model: str) -> bool:
     free model is usable on the very next request instead of waiting for the
     periodic refresh.
     """
-    if model in _dead_models:
+    if model in _dead_models or model in DEAD_IDS:
         return False
+    _sanitize_models_cache()
     if model in _models_cache:
+        if not _stealth_admitted(model, set(_models_cache)):
+            return False
         return True
+    if _is_stealth_or_omen(model) and not (
+        _FREE_MODEL_RE.match(model) or model in _FREE_MODEL_EXTRA
+    ):
+        _log(f"[models] stealth gate: rejected {model!r} (fails free filter, no allowlist entry)")
+        return False
     await _fetch_free_models()
     return model in _models_cache
 
 
-def _mark_model_dead(model: str | None) -> bool:
+def _has_promotion_phrase(data: dict | None = None, body: str = "") -> bool:
+    """True when the error evidence carries the explicit promotion-ended phrase."""
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        err = data.get("error")
+        if not isinstance(err, dict):
+            err = {}
+        text = " ".join(
+            str(v) for v in (data.get("message"), err.get("message"), body) if v is not None
+        ).lower()
+        return "promotion has ended" in text
+    except Exception:
+        return False
+
+
+def _mark_model_dead(model: str | None, persistent: bool = True) -> bool:
     """Drop a model the upstream refuses with a promotion-ended ModelError.
 
     Removes it from the served list so clients get an immediate, clear
     "Unknown model" instead of per-request 401s, and keeps it out of future
     discovery passes. Returns True if this call retired it.
+
+    persistent=True (explicit promotion phrase) also adds to file-backed
+    DEAD_IDS; persistent=False (bare 401 ModelError, no phrase) is
+    session-only so a transient 401 cannot brick the model across restarts.
     """
     global _models_cache, _models_meta
-    if not model or model in _dead_models:
+    if not model or model in _dead_models or model in DEAD_IDS:
+        if model and model in DEAD_IDS and model not in _dead_models:
+            _dead_models.add(model)
         return False
     _dead_models.add(model)
+    if persistent:
+        DEAD_IDS.add(model)
+        _persist_dead_ids()
     if model in _models_cache:
         _models_cache = [m for m in _models_cache if m != model]
         _models_meta.pop(model, None)
-    _log(f"[models] Retired {model} (upstream: free promotion ended)")
+    _log(f"[models] Retired {model} (upstream: free promotion ended){'' if persistent else ' [session-only]'}")
     return True
 
 
@@ -859,7 +1061,22 @@ def resolveCanonicalModelId(alias: str | None) -> str | None:
     if not s:
         return s
     hit = MODEL_ALIASES.get(s.lower())
-    return hit if hit else s
+    candidate = hit if hit else s
+    # Stealth/omen admission: ghost client-side listings must not enter via
+    # alias. A stealth/omen target requires the free-regex (or explicit
+    # allowlist); Zen free-list presence is enforced downstream in
+    # _ensure_model_known / _fetch_free_models. Rejected aliases fall back to
+    # the raw id so the request fails closed as "Unknown model" instead of
+    # 404ing upstream.
+    if _is_stealth_or_omen(candidate) and not (
+        _FREE_MODEL_RE.match(candidate) or candidate in _FREE_MODEL_EXTRA
+    ):
+        _log(f"[models] stealth gate: rejected alias {s!r} -> {candidate!r} (fails free filter, no allowlist entry)")
+        return s
+    if _is_stealth_or_omen(candidate) and _models_cache and candidate not in _models_cache:
+        _log(f"[models] stealth gate: rejected alias {s!r} -> {candidate!r} (absent from Zen free list)")
+        return s
+    return candidate
 
 
 def _normalize_model(model: str) -> str:
@@ -1067,6 +1284,123 @@ def _is_retriable_status(code) -> bool:
         return False
 
 
+# ── 413 = size, not health (pi-freeflow relay.ts:158-181) ──────────
+# A 413 Payload Too Large means the request body exceeded an upstream limit —
+# the proxy exit did nothing wrong. It is deliberately NOT in
+# _RETRIABLE_STATUSES: every retry loop has a dedicated 413 branch that
+# rotates to the next proxy (then direct-if-enabled) with ZERO pool-health
+# accounting — no cooling_until, no blacklist, no consecutive_failures++, no
+# report_failure / report_success / report_http_status.
+def _is_too_large_status(code) -> bool:
+    try:
+        return int(code) == 413
+    except Exception:
+        return False
+
+
+def _rotate_on_too_large(addr: str | None) -> bool:
+    """Rotate off a 413 exit with zero health penalty. Returns True (retry).
+
+    Delegates to proxy_pool.report_too_large (which only clears the sticky
+    ``current`` pointer — no cooldown/blacklist/counters touched). Releases
+    nothing: each retry loop owns its concurrency slot (``finally`` in the
+    buffered loop, manual ``release()`` in the streaming loops). Callers must
+    NOT record anything else for a 413.
+    """
+    if not PROXY_POOL_ENABLED or not addr:
+        return True
+    try:
+        proxy_pool.report_too_large(addr)
+    except Exception:
+        # Fall back to a bare sticky reset if the pool helper is unavailable.
+        try:
+            if proxy_pool.current and proxy_pool.current.get("address") == addr:
+                proxy_pool.current = None
+        except Exception:
+            pass
+    return True
+
+
+# ── Watchdog matrix (pi-freeflow client.ts:shouldRecoverOnHealth) ───
+# Pure gate: True = force a pool refresh / key rotation (recover), False =
+# hold the current selection (prevent flapping). Matrix:
+#   None / gone            → True
+#   version mismatch       → True
+#   sseDegraded True       → True
+#   sseDegraded undefined  → False (hold)
+def should_rotate_on_health(health) -> bool:
+    """Pure predicate: should an empty selection force recovery (True)?"""
+    if health is None:
+        return True
+    if not isinstance(health, dict):
+        return True
+    if health.get("gone"):
+        return True
+    if health.get("versionMismatch") is True:
+        return True
+    ver = health.get("version")
+    exp = health.get("expectedVersion", health.get("expected_version"))
+    if ver is not None and exp is not None and str(ver) != str(exp):
+        return True
+    if health.get("sseDegraded") is True:
+        return True
+    healthy = health.get("healthy")
+    cooling = health.get("cooling")
+    # Pool snapshot shape (proxy_pool.health_snapshot): zero healthy entries
+    # means the pool is gone/degraded → recover. (bool is an int subclass,
+    # so exclude it explicitly — flags are handled above.)
+    if isinstance(healthy, int) and not isinstance(healthy, bool):
+        if isinstance(cooling, int) and not isinstance(cooling, bool):
+            return healthy <= 0
+        return healthy <= 0
+    return False
+
+
+def _pool_health_for_gate() -> dict | None:
+    """Best-effort pool snapshot for the watchdog gate (no network).
+
+    Returns None when the snapshot itself fails — the gate treats None as
+    "recover", preserving the old always-refresh behavior on error.
+    """
+    try:
+        return proxy_pool.health_snapshot()
+    except Exception:
+        return None
+
+
+# ── Probe hardening (pi-freeflow 038321c) ──────────────────────────
+# "Don't declare dead on first miss": a liveness/health miss sleeps 200ms
+# and re-polls once before the caller treats the target as gone.
+_PROBE_REPOLL_SECS = 0.2
+
+
+async def _select_with_repoll():
+    """proxy_pool.select() with probe hardening (no network beyond select).
+
+    An empty selection races pool refill — sleep 200ms and re-poll once
+    before the caller declares the pool empty and forces a refresh.
+    """
+    p = await proxy_pool.select()
+    if p is not None:
+        return p
+    await asyncio.sleep(_PROBE_REPOLL_SECS)
+    return await proxy_pool.select()
+
+
+async def _maybe_force_refresh(reason: str) -> bool:
+    """Force a pool refresh only when the watchdog gate says rotate.
+
+    Returns True when a refresh was forced. When the gate says hold
+    (healthy current / no degradation signal), the refresh is skipped to
+    prevent flapping — the caller falls through to its normal fallback.
+    """
+    if not should_rotate_on_health(_pool_health_for_gate()):
+        _log(f"[pool] {reason}: watchdog holds current selection (no refresh, no flapping)")
+        return False
+    await proxy_pool.force_refresh()
+    return True
+
+
 _ABORT_TYPE_NAMES = frozenset({
     "AbortError", "CancelledError", "Cancel", "ClientDisconnect", "Disconnect",
     "ClientDisconnected", "ConnectionAborted", "GeneratorExit",
@@ -1116,6 +1450,8 @@ def _strip_direct_headers(headers: dict | None) -> dict:
         return {}
     out = {}
     for k, v in headers.items():
+        if v is None:
+            continue
         kl = str(k).lower()
         if kl.startswith("x-relay-") or kl.startswith("x-proxy"):
             continue
@@ -1259,11 +1595,21 @@ async def _direct_buffered_post(path: str, req_body: dict, headers: dict, client
 
 
 async def _client_gone(request: Request) -> bool:
-    """True if the requesting client has disconnected (so retries stop)."""
+    """True if the requesting client has disconnected (so retries stop).
+
+    Probe hardening: don't declare dead on first miss — a positive first
+    poll sleeps 200ms and re-polls once; only a confirmed miss aborts.
+    """
     try:
-        return await request.is_disconnected()
+        if not await request.is_disconnected():
+            return False
     except Exception:
         return False
+    try:
+        await asyncio.sleep(_PROBE_REPOLL_SECS)
+        return bool(await request.is_disconnected())
+    except Exception:
+        return True
 
 
 def _local_rate_limit_response(message: str) -> JSONResponse:
@@ -1395,9 +1741,15 @@ def _continuation_body(req_body: dict, content: str, reasoning: str) -> dict:
 _SAMPLING_KEYS = ("temperature", "top_p", "stop")
 
 
+# prompt_cache_key passes through additively on the Zen path; retention is
+# never forwarded (stripped in zen_request). Kept out of _SAMPLING_KEYS so the
+# NVIDIA path is untouched.
+_ZEN_SAMPLING_KEYS = _SAMPLING_KEYS + ("prompt_cache_key",)
+
+
 def _sampling_from(body: dict) -> dict:
     """Pick client sampling params the upstream accepts; absent = upstream default."""
-    return {k: body[k] for k in _SAMPLING_KEYS if body.get(k) is not None}
+    return {k: body[k] for k in _ZEN_SAMPLING_KEYS if body.get(k) is not None}
 
 
 _NVIDIA_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
@@ -1422,17 +1774,23 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tok
             req_body["tool_choice"] = tool_choice
         else:
             req_body["tool_choice"] = "auto"
+    # max_tokens hygiene: prefer max_tokens, never synthesize
+    # max_completion_tokens from it. Both forward verbatim when supplied.
     if max_tokens is not None:
         req_body["max_tokens"] = max_tokens
     if max_completion_tokens is not None:
         req_body["max_completion_tokens"] = max_completion_tokens
     if sampling:
         req_body.update(sampling)
+    # prompt_cache_retention is never sent upstream; prompt_cache_key (if any)
+    # rides along additively via sampling.
+    req_body.pop("prompt_cache_retention", None)
 
     request_id = oc_id("msg")
+    # Keyless: Zen free tier rejects ANY Authorization Bearer (401), so omit
+    # the header entirely. Keep x-opencode-client/project + UA.
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer public",
         "User-Agent": f"opencode/{OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
@@ -1519,8 +1877,10 @@ def _responses_sampling_from(body: dict) -> dict:
 
     ``stop`` is a Chat Completions field: blindly merging it into the
     Responses body risks a 400 or silent ignore, so it stays Chat-only.
+    ``prompt_cache_key`` passes through additively; retention is stripped
+    in _zen_responses_body.
     """
-    return {k: body[k] for k in _RESPONSES_SAMPLING_KEYS if body.get(k) is not None}
+    return {k: body[k] for k in _RESPONSES_SAMPLING_KEYS + ("prompt_cache_key",) if body.get(k) is not None}
 
 
 def _responses_content_parts(content, assistant: bool = False) -> list:
@@ -1658,7 +2018,9 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
             if isinstance(t, dict)
         ]
         body["tool_choice"] = "auto"
-    mt = max_completion_tokens if max_completion_tokens is not None else max_tokens
+    # max_tokens hygiene: prefer max_tokens (never rename it); fall back to
+    # max_completion_tokens only when max_tokens is absent.
+    mt = max_tokens if max_tokens is not None else max_completion_tokens
     # Muse's reasoning tokens count against the SAME budget as output
     # (usage showed completion_tokens=128 with zero text at max_out=128),
     # so a tool-free budget below the floor is raised to leave room for
@@ -1679,6 +2041,7 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
         body["reasoning"] = {"effort": eff, "summary": "auto"}
     if sampling:
         body.update(sampling)
+    body.pop("prompt_cache_retention", None)
     return body
 
 
@@ -1801,10 +2164,10 @@ async def _zen_responses_stream_with_retry(
         if PROXY_POOL_ENABLED and not direct_only:
             if not proxy_pool.ready:
                 await proxy_pool.load()
-            p = await proxy_pool.select()
+            p = await _select_with_repoll()
             if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
-                await proxy_pool.force_refresh()
+                await _maybe_force_refresh("No proxy available")
                 p = await proxy_pool.select()
                 if p is None:
                     _log("[pool] Still no proxy after refresh, falling back to direct")
@@ -1894,6 +2257,29 @@ async def _zen_responses_stream_with_retry(
                 data = {}
             err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses error {resp.status_code}: {raw[:400]!r}")
+            if _is_too_large_status(resp.status_code):
+                # 413 = size, not health: rotate with ZERO health accounting,
+                # then direct-if-enabled (keep last 413 body for salvage).
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses 413 too-large: {err_msg} — rotating (no penalty)")
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    _rotate_on_too_large(proxy_addr)
+                    proxy_pool.release(proxy_addr)
+                await resp.aclose()
+                if attempt < attempts and not await _client_gone(request):
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
+                    direct_only = True
+                    _log_direct_fallback(model, resp.status_code)
+                    headers = _strip_direct_headers(headers)
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                if PROXY_POOL_ENABLED and not ALLOW_DIRECT_FALLBACK:
+                    _log(f"[zen] pool exhausted on 413; direct fallback disabled (opt in with --allow-direct-fallback)")
+                yield _openai_stream_error(err_msg, "upstream_error", "413")
+                return
             if _is_retriable_status(resp.status_code) and PROXY_POOL_ENABLED and not direct_only and attempt >= attempts:
                 # Escalating 5xx/504 cooldown for this exit; 504 fast-breaks
                 # (False = stop cycling the pool, surface the error now).
@@ -1929,6 +2315,13 @@ async def _zen_responses_stream_with_retry(
                     attempt += 1
                     continue
                 yield _openai_stream_error(err_msg, "upstream_error", "region_blocked")
+                return
+            # Entitlement error (401 ModelError incl. promotion-ended): retire
+            # the model and terminate immediately, same lazy path as chat.
+            if _is_promotion_ended_error(data, body_text, resp.status_code, model):
+                await resp.aclose()
+                _mark_model_dead(model, persistent=_has_promotion_phrase(data, body_text))
+                yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
                 return
             await resp.aclose()
             if _is_retriable_status(resp.status_code) and attempt < attempts:
@@ -1996,6 +2389,11 @@ async def _zen_responses_stream_with_retry(
                         err_msg = (err.get("message") if isinstance(err, dict) else None) or piece.get("message") or "Upstream error"
                         _log(f"[zen] Responses stream error (attempt {attempt}): {err_msg}")
                         last_error = ValueError(err_msg)
+                        # Same lazy-retire path as chat on ModelError bodies.
+                        if _is_promotion_ended_error(piece, json.dumps(piece) if isinstance(piece, dict) else "", None, model):
+                            _mark_model_dead(model, persistent=_has_promotion_phrase(piece, json.dumps(piece) if isinstance(piece, dict) else ""))
+                            yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
+                            return
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
                             saw_error_event = True
                             break  # retry below
@@ -2515,11 +2913,11 @@ async def _zen_request_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            p = await proxy_pool.select()
+            p = await _select_with_repoll()
             if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), "
                      f"forcing refresh")
-                await proxy_pool.force_refresh()
+                await _maybe_force_refresh("No proxy available")
                 p = await proxy_pool.select()
                 if p is None:
                     _log("[pool] Still no proxy after refresh, falling back to direct")
@@ -2605,9 +3003,38 @@ async def _zen_request_with_retry(
             if resp.status_code >= 400:
                 err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
                 last_status = resp.status_code
+                if _is_too_large_status(resp.status_code):
+                    # 413 = size, not health: rotate with ZERO pool-health
+                    # accounting (no cooldown/blacklist/counters), keep the
+                    # body for direct-fallback salvage below. 413 is smaller
+                    # than this body in every proxy but MAY succeed direct
+                    # (different upstream limit) — so treat it like a
+                    # retriable exhaust only when the flag allows direct.
+                    _log(f"[zen] 413 too-large (attempt {attempt}): {err_msg} — rotating (no penalty)")
+                    _rotate_on_too_large(proxy_addr)
+                    if attempt < attempts and not await _client_gone(request):
+                        await _maybe_backoff(attempt, resp.status_code)
+                        continue
+                    if PROXY_POOL_ENABLED and ALLOW_DIRECT_FALLBACK:
+                        pool_exhausted_retriable = True
+                        break
+                    return JSONResponse(
+                        status_code=413,
+                        content={"error": {"message": err_msg, "type": "upstream_error", "code": "payload_too_large"}},
+                    )
                 is_context_exceeded = _is_context_limit_error(data, body_text)
                 bare_500 = _is_bare_internal_error(resp.status_code, data, body_text)
                 _log(f"[zen] Error {resp.status_code}: {err_msg}")
+                # Entitlement error (401 ModelError incl. promotion-ended):
+                # identical on every proxy/retry — retire the model and fail
+                # fast instead of burning retries across the pool.
+                if _is_promotion_ended_error(data, body_text, resp.status_code, model):
+                    _log(f"[zen] Model {model} retired upstream (ModelError); dropping from list")
+                    _mark_model_dead(model, persistent=_has_promotion_phrase(data, body_text))
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": f"{model} is no longer available: {err_msg}", "type": "upstream_error", "code": "model_retired"}},
+                    )
                 # Not a proxy failure: 4xx/5xx are upstream or request errors that
                 # repeat identically on every proxy, so never blacklist for them.
                 # Fail fast on deterministic errors (all 4xx except retriable
@@ -2751,10 +3178,10 @@ async def _zen_stream_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            p = await proxy_pool.select()
+            p = await _select_with_repoll()
             if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
-                await proxy_pool.force_refresh()
+                await _maybe_force_refresh("No proxy available")
                 p = await proxy_pool.select()
                 if p is None:
                     _log("[pool] Still no proxy after refresh, falling back to direct")
@@ -2951,13 +3378,35 @@ async def _zen_stream_with_retry(
             # that repeat identically on every proxy, so never blacklist for
             # them. A 503 is upstream capacity: keep the current exit and let
             # the retry below ride it out (no report_success — it was not
-            # healthy for this call).
-            if _is_promotion_ended_error(data, body_text):
+            # healthy for this call). 413 is a size signal (dedicated branch
+            # above) — never cooled/blacklisted/counted.
+            if _is_promotion_ended_error(data, body_text, resp.status_code, model):
                 # Entitlement error: identical on every proxy/retry. Retire
                 # the model and terminate the stream immediately.
                 await resp.aclose()
-                _mark_model_dead(model)
+                _mark_model_dead(model, persistent=_has_promotion_phrase(data, body_text))
                 yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
+                return
+            if _is_too_large_status(resp.status_code):
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream 413 too-large: {err_msg} — rotating (no penalty)")
+                _rotate_on_too_large(proxy_addr)
+                await resp.aclose()
+                last_status = 413
+                if attempt < attempts and not await _client_gone(request):
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                if PROXY_POOL_ENABLED and not pool_exhausted_retriable:
+                    pool_exhausted_retriable = True
+                    if ALLOW_DIRECT_FALLBACK:
+                        direct_only = True
+                        _log_direct_fallback(model, resp.status_code)
+                        headers = _strip_direct_headers(headers)
+                        await _maybe_backoff(attempt, resp.status_code)
+                        attempt += 1
+                        continue
+                    _log(f"[zen] pool exhausted on 413; direct fallback disabled (opt in with --allow-direct-fallback)")
+                yield _openai_stream_error(err_msg, "upstream_error", "413")
                 return
             if is_context_exceeded:
                 _log("[zen] Context limit error; not retrying on another proxy")
@@ -3082,8 +3531,8 @@ async def _zen_stream_with_retry(
                                 "rate_limit_exceeded",
                             )
                             return
-                        if _is_promotion_ended_error(piece, line):
-                            _mark_model_dead(model)
+                        if _is_promotion_ended_error(piece, line, None, model):
+                            _mark_model_dead(model, persistent=_has_promotion_phrase(piece, line))
                             yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
                             return
                         if not streamed_any and attempt < attempts and not await _client_gone(request):
@@ -3302,10 +3751,10 @@ async def _zen_stream_anthropic_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            p = await proxy_pool.select()
+            p = await _select_with_repoll()
             if p is None:
                 _log(f"[pool] No proxy ({proxy_pool.get_pool_state()}), forcing refresh")
-                await proxy_pool.force_refresh()
+                await _maybe_force_refresh("No proxy")
                 p = await proxy_pool.select()
                 if p is None:
                     _log("[pool] Fallback to direct")
@@ -3370,10 +3819,20 @@ async def _zen_stream_anthropic_with_retry(
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                         return
                     # Not a proxy failure: 4xx/5xx are upstream or request
-                    # errors that repeat identically on every proxy.
-                    if _is_promotion_ended_error(data, body_text):
-                        _mark_model_dead(model)
+                    # errors that repeat identically on every proxy. 413 is a
+                    # size signal — rotate with zero health accounting.
+                    if _is_promotion_ended_error(data, body_text, resp.status_code, model):
+                        _mark_model_dead(model, persistent=_has_promotion_phrase(data, body_text))
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"{model} is no longer available: {err_msg}"}})
+                        return
+                    if _is_too_large_status(resp.status_code):
+                        _log(f"[zen] Anthropic stream 413 too-large (attempt {attempt}): {err_msg} — rotating (no penalty)")
+                        _rotate_on_too_large(proxy_addr)
+                        if attempt < attempts and not await _client_gone(request):
+                            await _maybe_backoff(attempt, resp.status_code)
+                            attempt += 1
+                            continue
+                        yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg, "code": "payload_too_large"}})
                         return
                     if is_context_exceeded:
                         _log("[zen] Context limit error; not retrying on another proxy")
@@ -3416,8 +3875,8 @@ async def _zen_stream_anthropic_with_retry(
                                 _piece = json.loads(raw_line.strip()[6:] if raw_line.strip().startswith("data: ") else raw_line)
                             except (json.JSONDecodeError, TypeError, ValueError):
                                 _piece = {}
-                            if _is_promotion_ended_error(_piece, raw_line):
-                                _mark_model_dead(model)
+                            if _is_promotion_ended_error(_piece, raw_line, None, model):
+                                _mark_model_dead(model, persistent=_has_promotion_phrase(_piece, raw_line))
                                 yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"{model} is no longer available: {err_msg}"}})
                                 return
                             if attempt < attempts:
@@ -4342,15 +4801,30 @@ async def list_models(request: Request):
     new_request_id()
     if not _models_cache:
         await _fetch_free_models()
+    _sanitize_models_cache()
     data = []
+    try:
+        _zen_free_ids: set[str] | None = set(_models_cache)
+    except Exception:
+        _zen_free_ids = None
     for m in _models_cache:
+        if not _stealth_admitted(m, _zen_free_ids):
+            continue
         entry = {"id": m, "object": "model", "created": 1779000000, "owned_by": "opencode-free"}
         meta = _models_meta.get(m)
         if meta:
             if meta.get("limit"):
                 entry["limits"] = meta["limit"]
+            else:
+                entry["limits"] = dict(_DEFAULT_LIMIT)
             if meta.get("modalities"):
                 entry["modalities"] = meta["modalities"]
+            else:
+                entry["modalities"] = dict(_DEFAULT_MODALITIES)
+        else:
+            # Conservative defaults when models.dev was unreachable.
+            entry["limits"] = dict(_DEFAULT_LIMIT)
+            entry["modalities"] = dict(_DEFAULT_MODALITIES)
         data.append(entry)
     # Slash-free picker aliases for OpenCode Zen models (no slash/colon):
     # expose each alias whose canonical id is actually served.
