@@ -530,7 +530,7 @@ class ProxyPool:
                 r = await c.get(
                     "https://opencode.ai/zen/v1/models",
                     headers={
-                        "User-Agent": "opencode/1.15.0",
+                        "User-Agent": "opencode/1.18.31",
                         "x-opencode-client": "cli",
                     },
                 )
@@ -970,6 +970,31 @@ class ProxyPool:
         if self.current and self.current["address"] == target:
             self.current = None
 
+    async def rotate_away(self, addr: str | None = None):
+        """Evict the pooled client for ``addr`` and clear sticky ``current``
+        if (and only if) it still points at ``addr`` — atomically.
+
+        Fixes the sticky-exit race where concurrent streams did an unlocked
+        check-then-clear (``current.get('address') == addr`` + private
+        ``_evict_client``): one stream could clear a ``current`` that another
+        stream had just re-selected, stealing its exit. Holding
+        ``_select_lock`` (the existing select() serialization lock) makes the
+        evict + clear-if-matches a single critical section versus select().
+
+        No health semantics: no blacklist, no cooldown, no success/fail
+        counter change — the exit stays eligible via the hot buffer. Only
+        the pooled AsyncClients are dropped and the sticky pointer rotated
+        when it pointed at ``addr``. Does NOT touch ``_inflight`` slots;
+        each retry loop still owns its release().
+        """
+        async with self._select_lock:
+            target = addr or (self.current and self.current["address"])
+            if not target:
+                return
+            self._evict_client(target)
+            if self.current and self.current["address"] == target:
+                self.current = None
+
     def report_failure(self, addr: str | None = None, hard: bool = False,
                        exc: BaseException | None = None):
         """Record a transport-level failure for ``addr``.
@@ -979,12 +1004,22 @@ class ProxyPool:
         blacklist immediately — an exit that refuses connections is dead for
         the rest of this request anyway. Client AbortError/cancel (``exc``)
         is never penalized.
+
+        Idempotent: if ``target`` is already blacklisted with a future expiry
+        (concurrent requests sharing one sticky exit failing together), only
+        the first reporter logs — later reports just ensure sticky/hot
+        consistency and return silently.
         """
         if self.is_cancelled(exc):
             self.report_cancelled(addr, exc)
             return
         target = addr or (self.current and self.current["address"])
         if not target:
+            return
+        if self.blacklist.get(target, 0) > time.time():
+            self.hot = [p for p in self.hot if p["address"] != target]
+            if self.current and self.current["address"] == target:
+                self.current = None
             return
         failures = self.transport_failures.get(target, 0) + 1
         self.transport_failures[target] = failures
@@ -1009,10 +1044,21 @@ class ProxyPool:
             self.current = None
 
     def _blacklist_and_rotate(self, addr: str | None, reason_tag: str):
-        """Shared: blacklist ``addr`` for BLACKLIST_TTL and clear sticky current."""
+        """Shared: blacklist ``addr`` for BLACKLIST_TTL and clear sticky current.
+
+        Idempotent: if ``target`` is already blacklisted with a future expiry
+        (concurrent requests sharing one sticky exit failing together), only
+        the first reporter logs — later reports just ensure sticky/hot
+        consistency and return silently.
+        """
         target = addr or (self.current and self.current["address"])
         if not target:
             return None
+        if self.blacklist.get(target, 0) > time.time():
+            self.hot = [p for p in self.hot if p["address"] != target]
+            if self.current and self.current["address"] == target:
+                self.current = None
+            return target
         self.transport_failures.pop(target, None)
         self.blacklist[target] = time.time() + BLACKLIST_TTL
         self._mark_fail(target)

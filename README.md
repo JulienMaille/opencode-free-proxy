@@ -193,6 +193,50 @@ curl http://localhost:6446/v1/models # nvidia/* entries list available NIM route
 > case a different key in the file is used. Replace `nvidia-api-keys.txt` with
 > your own paid-tier keys for higher limits.
 
+## AMD Radeon TokenFactory
+
+In addition to the Zen-tier and NVIDIA NIM models, the proxy can serve models
+directly from [AMD Radeon TokenFactory](https://developer.amd.com.cn/radeon).
+Address an AMD model with the `amd/` (or `radeon/`) prefix, e.g.
+`amd/DeepSeek-V4-Flash`.
+
+This requires `amd-api-keys.txt` in the same folder as `server.py` — one
+`rc-...` key per line. Keys are a fixed 51 characters: `rc-` plus a 48-char
+hex body (`[0-9a-f]`). The proxy auto-rotates that file on each request.
+
+```bash
+curl http://localhost:6446/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "amd/DeepSeek-V4-Flash",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+Supported canonical IDs (also work as `amd/<id>`):
+
+- `amd/DeepSeek-V4-Flash` (Cline `defaultModelId`)
+- `amd/DeepSeek-V4-Flash-Vision-Exp`
+- `amd/DeepSeek-V4.1-Flash`
+- `amd/MiniCPM5-2B`
+- `amd/Qwen3.8-27B`
+- `amd/Qwen3.8-Flash-Next`
+
+Friendly slugs (`amd/deepseek-v4-flash`) and legacy IDs
+(`DeepSeek-V4-Flash-0731`, `MiniCPM-V46`, `MiniCPM5-1B`, `Qwen3.6-35B-A3B`)
+resolve to the canonical verbatim TokenFactory IDs. `GET /v1/models`
+dynamically discovers IDs from the TokenFactory `/models` endpoint when a key
+is loaded, falling back to the hardcoded list on failure. `POST /v1/messages`
+(Anthropic) is supported the same way as the NVIDIA route.
+
+Check key status with:
+
+```
+curl http://localhost:6446/health   # amd_keys: <count>, amd_models: [...]
+curl http://localhost:6446/v1/models # amd/* entries list available TokenFactory routes
+```
+
 - **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy gets one transport retry, then is blacklisted after its second transport failure; `429` responses temporarily skip the current proxy so the caller can retry through another IP.
 - **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
 

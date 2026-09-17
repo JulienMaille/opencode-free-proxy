@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import contextvars
+import copy
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import random
 import secrets
 import sys
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,6 +32,9 @@ from proxy_pool import (
 
 from nvidia_pool import pool as nvidia_keys
 from nvidia_proxy import is_nvidia_model, nvidia_model_id, nvidia_models
+
+from amd_pool import pool as amd_keys
+from amd_proxy import is_amd_model, amd_model_id, amd_models
 
 _BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -137,6 +142,18 @@ async def _lifespan(app: Starlette):
         _spawn_background(proxy_pool.load())
         _log("  (pool will be ready once verification completes)")
     yield
+    try:
+        await _flush_background_io()
+    except Exception:
+        pass
+    try:
+        _persist_tokens_sync()
+    except Exception:
+        pass
+    try:
+        _save_reasoning_sync()()
+    except Exception:
+        pass
     await proxy_pool.close()
     await _default_client.aclose()
     await _stream_default_client.aclose()
@@ -157,16 +174,49 @@ def _json(fn):
 
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
-OC_VERSION = "1.15.0"
+OC_VERSION = "1.18.31"
 PROXY_VERSION = "18"
+# Native OpenCode project id: sha1 hex of "git-remote:<normalized remote>".
+# The console/gate inspects x-opencode-project; the real CLI hashes the
+# user's project remote (verified against upstream packages/core/project.ts).
+_ZEN_PROJECT_ID = hashlib.sha1(b"git-remote:github.com/JulienMaille/opencode-free-proxy").hexdigest()
 
 # ── API Keys ──────────────────────────────────────────────────────
 
 API_KEY = args.api_key or os.environ.get("LOCAL_KEY") or os.environ.get("API_KEY")
 
+_AUTH_OPEN_WARNED = False
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    try:
+        h = (host or "").strip().lower()
+    except Exception:
+        return False
+    return h in ("127.0.0.1", "localhost", "::1")
+
 
 def auth(request: Request) -> str | None:
     if not API_KEY:
+        # Fail closed for non-loopback clients (default --host 0.0.0.0 listens
+        # on all interfaces): an unset key must NOT become a LAN-open proxy.
+        # Open mode is allowed only for loopback clients so local tools stay
+        # compatible. Gate on the client address, not the bind HOST.
+        try:
+            client_host = request.client.host if request.client else None
+        except Exception:
+            client_host = None
+        if not _is_loopback_host(client_host):
+            return None
+        global _AUTH_OPEN_WARNED
+        if not _AUTH_OPEN_WARNED:
+            _AUTH_OPEN_WARNED = True
+            print(
+                "[auth] WARNING: no API key configured (LOCAL_KEY/API_KEY/--api-key unset) — "
+                "running OPEN for loopback clients only; requests from other hosts get 401. "
+                "Set an API key before exposing this port to the network.",
+                flush=True,
+            )
         return "user"
     hdr = request.headers.get("authorization") or request.headers.get("x-api-key") or ""
     tok = hdr[7:] if hdr.startswith("Bearer ") else hdr
@@ -222,33 +272,119 @@ def _log(*a):
     _append_log(_BASE_DIR / "proxy.log", msg)
 
 
+# ── Background disk-I/O tracking (never lose data on shutdown) ──
+# _append_log() and _schedule_tokens_flush() offload sync disk writes via
+# run_in_executor and register the futures here; _flush_background_io()
+# awaits the outstanding ones (called from the lifespan shutdown path).
+
+_BG_IO: set = set()
+_BG_IO_LOCK = threading.Lock()
+
+
+def _track_bg_io(fut):
+    try:
+        with _BG_IO_LOCK:
+            _BG_IO.add(fut)
+        fut.add_done_callback(_untrack_bg_io)
+    except Exception:
+        pass
+
+
+def _untrack_bg_io(fut):
+    try:
+        with _BG_IO_LOCK:
+            _BG_IO.discard(fut)
+    except Exception:
+        pass
+
+
+async def _flush_background_io(timeout: float = 10.0):
+    """Await outstanding background disk writes (log/tokens/reasoning)."""
+    try:
+        with _BG_IO_LOCK:
+            pending = list(_BG_IO)
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+    except Exception:
+        pass
+
+
 _LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate proxy.log past 5 MB
 _LOG_KEEP_BYTES = 1 * 1024 * 1024  # ...keeping the last 1 MB
+# Serialize check-then-act rotate+append so concurrent executor writers
+# cannot interleave stat>cap -> tail-read -> truncate -> append.
+_LOG_LOCK = threading.Lock()
 
 
-def _append_log(path, msg: str):
+def _append_log_sync(path, msg: str):
     """Append one line, rotating the file down to its tail past the cap."""
     try:
-        if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
-            with open(path, "rb") as f:
-                f.seek(-_LOG_KEEP_BYTES, 2)
-                tail = f.read()
-            nl = tail.find(b"\n")
-            if nl != -1:
-                tail = tail[nl + 1:]
-            with open(path, "wb") as f:
-                f.write(f"[... rotated, kept last {len(tail) // 1024} KB ...]\n".encode("utf-8"))
-                f.write(tail)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+        with _LOG_LOCK:
+            if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
+                with open(path, "rb") as f:
+                    f.seek(-_LOG_KEEP_BYTES, 2)
+                    tail = f.read()
+                nl = tail.find(b"\n")
+                if nl != -1:
+                    tail = tail[nl + 1:]
+                with open(path, "wb") as f:
+                    f.write(f"[... rotated, kept last {len(tail) // 1024} KB ...]\n".encode("utf-8"))
+                    f.write(tail)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
     except OSError:
         pass
 
 
-def oc_id(prefix: str) -> str:
-    ts = format(int(time.time() * 1000), "x")
-    rnd = secrets.token_urlsafe(12)[:16]
-    return f"{prefix}_{ts}{rnd}"
+def _append_log(path, msg: str):
+    """Non-blocking append: offload the sync rotate+write to a worker thread.
+
+    Keeps proxy.log rotation behavior identical to _append_log_sync while
+    keeping _log() off the request hot path. Fire-and-forget from the event
+    loop; flushed implicitly since the executor write completes — and every
+    shutdown path calls _flush_background_io() before exit (see lifespan).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _append_log_sync(path, msg)
+        return
+    try:
+        fut = loop.run_in_executor(None, _append_log_sync, path, msg)
+        _track_bg_io(fut)
+    except RuntimeError:
+        # Loop closing / shutting down: fall back to a best-effort sync write.
+        try:
+            _append_log_sync(path, msg)
+        except OSError:
+            pass
+
+
+_ZEN_ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_zen_id_timestamp = 0
+_zen_id_counter = 0
+
+
+def oc_id(prefix: str, descending: bool = False) -> str:
+    """Native OpenCode identifier (verbatim port of the CLI's identifier.ts,
+    verified against anomalyco/opencode): 6-byte timestamp+counter hex + 14
+    random base62 chars → `<prefix>_<26 chars>` (30 total with prefix).
+    Sessions descend (~inverted timestamp: newest sorts first), requests
+    ascend. A per-millisecond monotonic counter keeps ids unique under the
+    same ms; submission can be strided to interleave other id chains."""
+    global _zen_id_timestamp, _zen_id_counter
+    ts = int(time.time() * 1000)
+    if ts != _zen_id_timestamp:
+        _zen_id_timestamp = ts
+        _zen_id_counter = 0
+    _zen_id_counter += 1
+    current = (ts << 12) + _zen_id_counter
+    value = ~current if descending else current
+    time_part = "".join(
+        format((value >> (40 - 8 * i)) & 0xFF, "02x") for i in range(6)
+    )
+    rand = "".join(_ZEN_ID_CHARS[b % 62] for b in secrets.token_bytes(14))
+    return f"{prefix}_{time_part}{rand}"
 
 
 _NO_CACHE = {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
@@ -296,13 +432,74 @@ def _load_tokens():
         _tokens = {}
 
 
-def _persist_tokens():
+def _persist_tokens_sync(snapshot=None):
     try:
+        data = snapshot if snapshot is not None else _tokens
         _TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_TOKENS_FILE, "w", encoding="utf-8") as f:
-            json.dump(_tokens, f, indent=2, sort_keys=True)
+            json.dump(data, f, indent=2, sort_keys=True)
     except OSError:
         pass
+
+
+# Debounced tokens flush: the hot path only marks dirty + schedules one
+# background write per quiet window instead of mkdir/open/write per call.
+_tokens_dirty = False
+_tokens_flush_scheduled = False
+_TOKENS_FLUSH_DELAY = 2.0
+
+
+def _persist_tokens():
+    _persist_tokens_sync()
+
+
+def _schedule_tokens_flush():
+    """Mark tokens dirty and schedule a single background flush.
+
+    Coalesces bursts of _add_tokens() calls into one executor write per
+    _TOKENS_FLUSH_DELAY window. Shutdown always flushes synchronously (see
+    lifespan), so no data is lost.
+    """
+    global _tokens_dirty, _tokens_flush_scheduled
+    _tokens_dirty = True
+    if _tokens_flush_scheduled:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _persist_tokens_sync()
+        _tokens_dirty = False
+        return
+    _tokens_flush_scheduled = True
+
+    async def _delayed_flush():
+        global _tokens_dirty, _tokens_flush_scheduled
+        try:
+            await asyncio.sleep(_TOKENS_FLUSH_DELAY)
+            if _tokens_dirty:
+                try:
+                    # Snapshot on the loop thread so the executor serializes an
+                    # immutable copy while _add_tokens() keeps mutating live.
+                    try:
+                        snapshot = copy.deepcopy(_tokens)
+                    except Exception:
+                        snapshot = {m: dict(b) for m, b in _tokens.items()}
+                    fut = loop.run_in_executor(None, _persist_tokens_sync, snapshot)
+                    _track_bg_io(fut)
+                    await fut
+                except Exception:
+                    pass
+                _tokens_dirty = False
+        finally:
+            _tokens_flush_scheduled = False
+
+    try:
+        fut = asyncio.ensure_future(_delayed_flush())
+        _track_bg_io(fut)
+    except RuntimeError:
+        _tokens_flush_scheduled = False
+        _persist_tokens_sync()
+        _tokens_dirty = False
 
 
 def _add_tokens(model: str, inp: int = 0, out: int = 0, cache_hit: int = 0, cache_miss: int = 0):
@@ -313,7 +510,7 @@ def _add_tokens(model: str, inp: int = 0, out: int = 0, cache_hit: int = 0, cach
     bucket["output"] += max(0, out or 0)
     bucket["cache_hit"] += max(0, cache_hit or 0)
     bucket["cache_miss"] += max(0, cache_miss or 0)
-    _persist_tokens()
+    _schedule_tokens_flush()
 
 
 _load_tokens()
@@ -401,31 +598,74 @@ def _prune_reasoning(now: float | None = None) -> int:
     return dropped
 
 
-def _save_reasoning():
-    """Persist the reasoning cache without blocking the event loop.
+# Serialize reasoning cache persistence: concurrent _save_reasoning()
+# calls must not interleave their prune/snapshot/write steps (reorder/torn
+# writes), and the executor writer must see an immutable snapshot.
+_reasoning_lock = threading.Lock()
 
-    Prunes expired entries first (so the on-disk file stays small), then
-    snapshots the cache (so the writer thread never races live mutations)
-    and runs the JSON dump in a thread-pool executor; the write is
-    fire-and-forget.
+
+def _save_reasoning_sync():
+    """Prune + snapshot + atomic-write the reasoning cache (blocking).
+
+    Runs fully on the calling thread; the lifespan shutdown path calls the
+    returned writer inline via ``_save_reasoning_sync()()`` so tmp+replace
+    always executes.
     """
-    _prune_reasoning()
-    body = {sid: dict(sack) for sid, sack in _reasoning_cache.items()}
+    with _reasoning_lock:
+        _prune_reasoning()
+        try:
+            body = copy.deepcopy(_reasoning_cache)
+        except Exception:
+            body = {sid: dict(sack) for sid, sack in _reasoning_cache.items()}
 
-    def _write():
+        def _write():
+            try:
+                _reasoning_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp = _reasoning_file.with_suffix(".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(body, f, ensure_ascii=False)
+                os.replace(tmp, _reasoning_file)
+            except OSError:
+                pass
+
+        return _write
+
+
+def _flush_reasoning_sync():
+    """Prune + snapshot + atomic-write entirely in a worker thread."""
+    with _reasoning_lock:
+        _prune_reasoning()
+        try:
+            body = copy.deepcopy(_reasoning_cache)
+        except Exception:
+            body = {sid: dict(sack) for sid, sack in _reasoning_cache.items()}
         try:
             _reasoning_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(_reasoning_file, "w", encoding="utf-8") as f:
+            tmp = _reasoning_file.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(body, f, ensure_ascii=False)
+            os.replace(tmp, _reasoning_file)
         except OSError:
             pass
 
+
+def _save_reasoning():
+    """Persist the reasoning cache without blocking the event loop.
+
+    Prune + snapshot + tmp+os.replace all run in a thread-pool executor so
+    the loop never blocks on deepcopy/prune; the write is fire-and-forget
+    but tracked so shutdown can flush it.
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        _write()  # no running loop (startup path): write inline
+        _save_reasoning_sync()()  # no running loop (startup path): write inline
         return
-    loop.run_in_executor(None, _write)
+    try:
+        fut = loop.run_in_executor(None, _flush_reasoning_sync)
+        _track_bg_io(fut)
+    except RuntimeError:
+        _save_reasoning_sync()()
 
 
 def _remember_reasoning(session_id, content, reasoning):
@@ -433,20 +673,21 @@ def _remember_reasoning(session_id, content, reasoning):
     if not session_id or not content or not reasoning:
         return
     key = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    sack = _reasoning_cache.get(session_id)
-    if not isinstance(sack, dict):
-        sack = {}
-        _reasoning_cache[session_id] = sack
-    sack[key] = {"text": reasoning, "at": time.time()}
-    if len(sack) > _REASONING_CACHE_MAX:
-        for old in list(sack)[: len(sack) - _REASONING_CACHE_MAX]:
-            sack.pop(old, None)
-    # Bound total sessions (dict is insertion-ordered, so drop the oldest) to
-    # keep the on-disk cache from growing without bound across many users.
-    if len(_reasoning_cache) > _REASONING_CACHE_MAX_SESSIONS:
-        overflow = len(_reasoning_cache) - _REASONING_CACHE_MAX_SESSIONS
-        for sid in list(_reasoning_cache)[:overflow]:
-            _reasoning_cache.pop(sid, None)
+    with _reasoning_lock:
+        sack = _reasoning_cache.get(session_id)
+        if not isinstance(sack, dict):
+            sack = {}
+            _reasoning_cache[session_id] = sack
+        sack[key] = {"text": reasoning, "at": time.time()}
+        if len(sack) > _REASONING_CACHE_MAX:
+            for old in list(sack)[: len(sack) - _REASONING_CACHE_MAX]:
+                sack.pop(old, None)
+        # Bound total sessions (dict is insertion-ordered, so drop the oldest) to
+        # keep the on-disk cache from growing without bound across many users.
+        if len(_reasoning_cache) > _REASONING_CACHE_MAX_SESSIONS:
+            overflow = len(_reasoning_cache) - _REASONING_CACHE_MAX_SESSIONS
+            for sid in list(_reasoning_cache)[:overflow]:
+                _reasoning_cache.pop(sid, None)
     _save_reasoning()
 
 
@@ -720,6 +961,38 @@ def _is_promotion_ended_error(data: dict | None = None, body: str = "", status_c
     return bool(m) and (bool(_FREE_MODEL_RE.match(m)) or m in _FREE_MODEL_EXTRA or m in _models_cache or m in _dead_models or m in DEAD_IDS)
 
 
+def _is_free_tier_gate_error(data: dict | None = None, body: str = "") -> bool:
+    """403 FreeTierError: exit rejected from Zen free tier ('can only be used
+    from within OpenCode'). Exit-dependent — other exits keep working, so
+    penalize the exit and rotate instead of surfacing terminal 403."""
+    try:
+        if body and ("FreeTierError" in body or "can only be used from within OpenCode" in body):
+            return True
+        if data:
+            err = data.get("error") or {}
+            msg = f"{err.get('type') or ''} {err.get('message') or ''}" if isinstance(err, dict) else str(err)
+            return "FreeTierError" in msg or "can only be used from within OpenCode" in msg
+    except Exception:
+        return False
+    return False
+
+
+def _report_free_tier_block(proxy_addr: str | None):
+    """Briefly blacklist ``proxy_addr`` for the exit-dependent FreeTier gate.
+
+    SYNC (owner: event-loop thread / request path). Prefers the pool's
+    dedicated hook when shipped; falls back to the region-block path so an
+    exit-specific rejection still blacklists + rotates the sticky pointer.
+    """
+    try:
+        report = getattr(proxy_pool, "report_free_tier_block", None)
+        if report is None:
+            report = proxy_pool.report_region_block
+        report(proxy_addr)
+    except Exception:
+        pass
+
+
 def _blocks_text(content) -> str:
     """Extract plain text from Anthropic content blocks (str or list)."""
     if isinstance(content, str):
@@ -743,9 +1016,15 @@ _FREE_MODEL_RE = re.compile(r"^(opencode/)?.*-free$", re.IGNORECASE)
 _MODELS_REFRESH_SECS = 43200  # safety-net refresh every 12h; unknown models trigger on-demand
 # Conservative /v1/models defaults when models.dev is unreachable.
 _DEFAULT_LIMIT = {"context": 128000, "output": 16384, "contextWindow": 128000, "maxTokens": 16384}
-_DEFAULT_MODALITIES = {"input": ["text", "image"], "output": ["text"]}
+# Conservative image-gating default: unknown models advertise text-only input.
+# Metadata-present path gates on models.dev modalities explicitly; only the
+# unknown-model fallback uses this.
+_DEFAULT_MODALITIES = {"input": ["text"], "output": ["text"]}
 # Parallel discovery deadline (~3s combined for Zen + models.dev).
 _DISCOVERY_DEADLINE_SECS = 3.5
+# Timestamp (epoch secs) of the last successful discovery snapshot; None until
+# the first success. Never cleared on empty/failed refreshes (staleness signal).
+_models_checked_at: float | None = None
 
 
 # ── Persistent dead-model denylist (pi-freeflow DEAD_MODEL_IDS pattern) ──
@@ -839,7 +1118,7 @@ async def _fetch_free_models():
     Both sources are fetched in parallel behind a combined ~3s deadline.
     On empty discovery the previous snapshot is kept (never wipe good cache).
     """
-    global _models_cache, _models_meta
+    global _models_cache, _models_meta, _models_checked_at
     try:
         async with httpx.AsyncClient() as c:
             zen_headers = {"User-Agent": f"opencode/{OC_VERSION}", "x-opencode-client": "cli"}
@@ -893,7 +1172,10 @@ async def _fetch_free_models():
                     md_data = md.json()
                     oc_models = md_data.get("opencode", {}).get("models", {})
                     for mid in free:
-                        entry = oc_models.get(mid)
+                        # Dual-key models.dev lookup: exact id, then bare
+                        # (strip `opencode/` prefix), then base (also strip
+                        # `-free` suffix) — models.dev keys bare ids.
+                        entry = oc_models.get(mid) or oc_models.get(_bareModelId(mid)) or oc_models.get(baseModelId(mid))
                         if entry:
                             limit = entry.get("limit") or {}
                             if not isinstance(limit, dict):
@@ -907,16 +1189,27 @@ async def _fetch_free_models():
                             # Normalize modalities to text/image for /v1/models.
                             in_mods = [m for m in (mods.get("input") or []) if m in ("text", "image")] or ["text"]
                             out_mods = [m for m in (mods.get("output") or []) if m in ("text", "image")] or ["text"]
+                            # Data-driven wire routing: models.dev provider.npm ==
+                            # "@ai-sdk/openai" speaks the Responses wire protocol.
+                            _prov = entry.get("provider") or {}
+                            _npm = _prov.get("npm") if isinstance(_prov, dict) else None
                             meta[mid] = {
-                                "name": entry.get("name"),
+                                "name": entry.get("name") or _humanize_name(mid),
                                 "limit": {"context": ctx, "output": out, "contextWindow": ctx, "maxTokens": out},
                                 "modalities": {"input": in_mods, "output": out_mods},
+                                "api": "openai-responses" if _npm == "@ai-sdk/openai" else "openai-completions",
                             }
                         else:
+                            _prev_api = None
+                            try:
+                                _prev_api = (_models_meta.get(mid) or {}).get("api")
+                            except Exception:
+                                _prev_api = None
                             meta[mid] = {
-                                "name": None,
+                                "name": _humanize_name(mid),
                                 "limit": dict(_DEFAULT_LIMIT),
                                 "modalities": dict(_DEFAULT_MODALITIES),
+                                "api": _prev_api if _prev_api in ("openai-responses", "openai-completions") else None,
                             }
                     _models_meta = meta
                     _log(f"[models] Loaded metadata for {len(meta)} models from models.dev")
@@ -924,9 +1217,10 @@ async def _fetch_free_models():
                     raise RuntimeError(f"models.dev returned {md.status_code}")
             except Exception as e:
                 _log(f"[models] models.dev fetch failed: {e}, using conservative defaults")
-                _models_meta = {mid: {"name": None, "limit": dict(_DEFAULT_LIMIT), "modalities": dict(_DEFAULT_MODALITIES)} for mid in free}
+                _models_meta = {mid: {"name": _humanize_name(mid), "limit": dict(_DEFAULT_LIMIT), "modalities": dict(_DEFAULT_MODALITIES), "api": ((_models_meta.get(mid) or {}).get("api") if isinstance(_models_meta.get(mid), dict) else None)} for mid in free}
 
             _models_cache = free
+            _models_checked_at = time.time()
             _log(f"[models] Discovered {len(free)} free models: {', '.join(free)}")
     except Exception as e:
         _log(f"[models] Fetch failed: {e}, keeping cached models")
@@ -1079,6 +1373,49 @@ def resolveCanonicalModelId(alias: str | None) -> str | None:
     return candidate
 
 
+def baseModelId(mid: str | None) -> str | None:
+    """Strip provider prefix and `-free` suffix for models.dev fallback lookup.
+
+    models.dev keys models under bare ids (e.g. `mimo-v2.5`) while Zen serves
+    `opencode/`-prefixed `-free` ids, so exact-match alone misses metadata.
+    """
+    if not mid:
+        return mid
+    s = str(mid).strip()
+    if "/" in s:
+        s = s.rsplit("/", 1)[-1]
+    if s.lower().endswith("-free"):
+        s = s[: -len("-free")]
+    return s
+
+
+def _bareModelId(mid: str | None) -> str | None:
+    """Strip only the provider prefix (keep `-free` suffix)."""
+    if not mid:
+        return mid
+    s = str(mid).strip()
+    if "/" in s:
+        s = s.rsplit("/", 1)[-1]
+    return s
+
+
+def _humanize_name(mid: str | None) -> str:
+    """Human-readable display name fallback: strip `-free`, Title-Case + " (Free)"."""
+    try:
+        s = str(mid or "").strip()
+        if "/" in s:
+            s = s.rsplit("/", 1)[-1]
+        if s.lower().endswith("-free"):
+            s = s[: -len("-free")]
+        s = re.sub(r"[_-]+", " ", s).strip()
+        words = [w[:1].upper() + w[1:] if w else w for w in s.split(" ") if w]
+        # Collapse any double spaces from consecutive separators.
+        label = " ".join(words)
+        return f"{label} (Free)" if label else "Unknown (Free)"
+    except Exception:
+        return "Unknown (Free)"
+
+
 def _normalize_model(model: str) -> str:
     """Normalize a client model id to the bare Zen upstream id.
 
@@ -1181,8 +1518,8 @@ def _prepare_upstream_messages(session_id, messages: list[dict]) -> list[dict]:
                 combined["content"] = (combined.get("content") or "") + ("\n" if combined.get("content") else "") + part_content
             if part.get("reasoning_content") and not combined.get("reasoning_content"):
                 combined["reasoning_content"] = part["reasoning_content"]
-            if part.get("tool_calls") and not combined.get("tool_calls"):
-                combined["tool_calls"] = part["tool_calls"]
+            if part.get("tool_calls"):
+                combined.setdefault("tool_calls", []).extend(part["tool_calls"])
             j += 1
 
         # Inject the cached thinking text for this turn if the client dropped it
@@ -1246,18 +1583,9 @@ def get_session(user: str, messages: list[dict]) -> str:
             _remember_session(sessions, full_h, sessions[h])
             return sessions[h]
 
-    new_id = f"ses_{oc_id('ses')}"
+    new_id = oc_id("ses", descending=True)
     full_h = _hash_messages(messages)
     _remember_session(sessions, full_h, new_id)
-    return new_id
-
-
-def force_new_session(user: str, messages: list[dict]) -> str:
-    new_id = f"ses_{oc_id('ses')}"
-    if user not in _user_sessions:
-        _user_sessions[user] = {}
-    full_h = _hash_messages(messages)
-    _remember_session(_user_sessions[user], full_h, new_id)
     return new_id
 
 
@@ -1445,7 +1773,17 @@ def _clear_req_ctx():
 
 
 def _strip_direct_headers(headers: dict | None) -> dict:
-    """Strip relay/proxy hop headers for the direct-fetch fallback attempt."""
+    """Strip relay/proxy hop headers for the direct-fetch fallback attempt.
+
+    Keyless applied-last-wins audit (Zen-only): Zen free tier rejects ANY
+    Authorization Bearer (401), so this strip MUST run after any pool/hook
+    header merge and MUST also drop Authorization (case-insensitive). No layer
+    in server.py / proxy_pool.py re-adds Authorization afterwards —
+    proxy_pool.get_client() only sets base_url/timeout/proxy, never headers,
+    and zen_request() builds Zen headers fresh with no Authorization key.
+    NVIDIA NIM path (_nvidia_headers) is the sole legit Bearer user and never
+    flows through this strip.
+    """
     if not isinstance(headers, dict):
         return {}
     out = {}
@@ -1453,6 +1791,8 @@ def _strip_direct_headers(headers: dict | None) -> dict:
         if v is None:
             continue
         kl = str(k).lower()
+        if kl == "authorization":
+            continue
         if kl.startswith("x-relay-") or kl.startswith("x-proxy"):
             continue
         out[k] = v
@@ -1561,6 +1901,27 @@ def _report_nvidia_status(key: str | None, status: int | None) -> bool:
         return True  # dedicated report_rate_limit path owns 429
     try:
         return nvidia_keys.report_http_status(key, code)
+    except Exception:
+        return True
+
+
+def _report_amd_status(key: str | None, status: int | None) -> bool:
+    """Record an upstream HTTP status for escalating 5xx/504 key cooldown.
+
+    Delegates to amd_keys.report_http_status (429 keeps its dedicated
+    report_rate_limit sites). Returns True if the caller should roll to the
+    next key, False on 504 fast-break.
+    """
+    if not key or status is None:
+        return True
+    try:
+        code = int(status)
+    except Exception:
+        return True
+    if code == 429:
+        return True  # dedicated report_rate_limit path owns 429
+    try:
+        return amd_keys.report_http_status(key, code)
     except Exception:
         return True
 
@@ -1760,6 +2121,14 @@ def _nvidia_sampling_from(body: dict) -> dict:
     return {k: body[k] for k in _NVIDIA_SAMPLING_KEYS if body.get(k) is not None}
 
 
+_AMD_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
+
+
+def _amd_sampling_from(body: dict) -> dict:
+    """AMD TokenFactory mirrors the NVIDIA sampling surface (reasoning_effort)."""
+    return {k: body[k] for k in _AMD_SAMPLING_KEYS if body.get(k) is not None}
+
+
 def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tokens=None, max_completion_tokens=None, sampling: dict | None = None):
     model = _normalize_model(model)
     req_body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
@@ -1785,18 +2154,25 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tok
     # prompt_cache_retention is never sent upstream; prompt_cache_key (if any)
     # rides along additively via sampling.
     req_body.pop("prompt_cache_retention", None)
+    req_body.pop("store", None)  # never forward store:true to Zen
 
     request_id = oc_id("msg")
     # Keyless: Zen free tier rejects ANY Authorization Bearer (401), so omit
     # the header entirely. Keep x-opencode-client/project + UA.
+    # Applied-last-wins: this fresh dict is built AFTER any caller header
+    # merge, and no code path in server.py / proxy_pool.py re-adds
+    # Authorization afterwards (pool clients set transport only; direct-
+    # fallback paths only strip via _strip_direct_headers, never inject).
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": f"opencode/{OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
+        "User-Agent": f"opencode/{OC_VERSION}",
         "x-opencode-client": "cli",
-        "x-opencode-project": "global",
+        "x-opencode-project": _ZEN_PROJECT_ID,
         "x-opencode-request": request_id,
         "x-opencode-session": session_id,
     }
+    if any(str(k).lower() == "authorization" for k in headers):
+        raise RuntimeError("keyless: Authorization leaked into zen_request headers")
     return req_body, headers
 
 
@@ -1817,6 +2193,23 @@ _MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 def _is_muse_spark(model: str | None) -> bool:
     m = (model or "").lower()
     return "muse-spark" in m or "muse_spark" in m
+
+
+def _model_wire_api(model: str | None) -> str:
+    """Cached wire protocol for ``model`` with substring fallback.
+
+    Returns the persisted ``_models_meta`` ``api`` ("openai-responses" vs
+    "openai-completions") when present, else falls back to the existing
+    ``_is_muse_spark()`` substring check — so muse-spark behavior is
+    identical when meta is missing.
+    """
+    try:
+        api = (_models_meta.get(str(model)) or {}).get("api")
+        if api in ("openai-responses", "openai-completions"):
+            return api
+    except Exception:
+        pass
+    return "openai-responses" if _is_muse_spark(model) else "openai-completions"
 
 
 def _muse_effort(effort) -> str | None:
@@ -2042,6 +2435,7 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
     if sampling:
         body.update(sampling)
     body.pop("prompt_cache_retention", None)
+    body.pop("store", None)  # never forward store:true to Zen
     return body
 
 
@@ -2279,6 +2673,27 @@ async def _zen_responses_stream_with_retry(
                 if PROXY_POOL_ENABLED and not ALLOW_DIRECT_FALLBACK:
                     _log(f"[zen] pool exhausted on 413; direct fallback disabled (opt in with --allow-direct-fallback)")
                 yield _openai_stream_error(err_msg, "upstream_error", "413")
+                return
+            if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    _report_free_tier_block(proxy_addr)
+                    proxy_pool.release(proxy_addr)
+                if attempt < attempts and not await _client_gone(request):
+                    await resp.aclose()
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
+                    direct_only = True
+                    _log_direct_fallback(model, resp.status_code)
+                    headers = _strip_direct_headers(headers)
+                    await resp.aclose()
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                await resp.aclose()
+                yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
                 return
             if _is_retriable_status(resp.status_code) and PROXY_POOL_ENABLED and not direct_only and attempt >= attempts:
                 # Escalating 5xx/504 cooldown for this exit; 504 fast-breaks
@@ -2616,11 +3031,9 @@ async def _zen_responses_stream_with_retry(
             # proxy or streamer fault, just a dud generation. A different exit
             # gets a genuinely fresh roll, so rotate without blacklisting.
             try:
-                proxy_pool._evict_client(proxy_addr)
+                await proxy_pool.rotate_away(proxy_addr)
             except Exception:
                 pass
-            if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
-                proxy_pool.current = None
             await _backoff(attempt)
             attempt += 1
             continue
@@ -2646,11 +3059,9 @@ async def _zen_responses_stream_with_retry(
             elif streamed_any:
                 # Partial then graceful EOF: rotate without poisoning the pool.
                 try:
-                    proxy_pool._evict_client(proxy_addr)
+                    await proxy_pool.rotate_away(proxy_addr)
                 except Exception:
                     pass
-                if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
-                    proxy_pool.current = None
         if (
             streamed_any and _content_buf and not tool_streamed
             and continuations < MAX_STREAM_CONTINUATIONS
@@ -3035,6 +3446,20 @@ async def _zen_request_with_retry(
                         status_code=resp.status_code,
                         content={"error": {"message": f"{model} is no longer available: {err_msg}", "type": "upstream_error", "code": "model_retired"}},
                     )
+                if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
+                    # FreeTier gate is exit-specific: blacklist the exit briefly and
+                    # rotate instead of surfacing a terminal 403 that another exit
+                    # would not have hit. Release handled by the loop's finally.
+                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                    if PROXY_POOL_ENABLED and proxy_addr:
+                        _report_free_tier_block(proxy_addr)
+                    if attempt < attempts and not await _client_gone(request):
+                        await _maybe_backoff(attempt, resp.status_code)
+                        continue
+                    return JSONResponse(
+                        status_code=403,
+                        content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
+                    )
                 # Not a proxy failure: 4xx/5xx are upstream or request errors that
                 # repeat identically on every proxy, so never blacklist for them.
                 # Fail fast on deterministic errors (all 4xx except retriable
@@ -3374,6 +3799,29 @@ async def _zen_stream_with_retry(
                 yield _openai_stream_error(err_msg, "upstream_error", "region_blocked")
                 return
 
+            if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
+                # FreeTier gate is exit-specific: blacklist the exit briefly and
+                # rotate (or direct-fetch when enabled) instead of surfacing a
+                # terminal 403 that another exit would not have hit. Release
+                # already happened above, so no release here.
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    _report_free_tier_block(proxy_addr)
+                await resp.aclose()
+                if attempt < attempts and not await _client_gone(request):
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
+                    direct_only = True
+                    _log_direct_fallback(model, resp.status_code)
+                    headers = _strip_direct_headers(headers)
+                    await _maybe_backoff(attempt, resp.status_code)
+                    attempt += 1
+                    continue
+                yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
+                return
+
             # Not a proxy failure: 4xx/5xx are upstream or request errors
             # that repeat identically on every proxy, so never blacklist for
             # them. A 503 is upstream capacity: keep the current exit and let
@@ -3656,11 +4104,9 @@ async def _zen_stream_with_retry(
             elif PROXY_POOL_ENABLED and proxy_addr and streamed_any:
                 # Rotate away from this connection without poisoning the pool
                 try:
-                    proxy_pool._evict_client(proxy_addr)
+                    await proxy_pool.rotate_away(proxy_addr)
                 except Exception:
                     pass
-                if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
-                    proxy_pool.current = None
             last_error = err
             if finish_delivered:
                 yield "data: [DONE]\n\n"
@@ -3682,6 +4128,20 @@ async def _zen_stream_with_retry(
                 await _backoff(attempt)
                 attempt += 1
                 continue
+            # Infer terminal finish when the upstream closed without [DONE]
+            # but content/tool fragments were already delivered: tool_calls
+            # pending -> "tool_calls", else content present -> "stop". Only
+            # the truly-empty case falls through to the error path below.
+            inferred = "tool_calls" if tool_streamed else ("stop" if _content_buf else None)
+            if inferred and streamed_any:
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] inferring finish={inferred} on graceful close without [DONE] (content_len={len(_content_buf)})")
+                if session_id and _reason_buf and _content_buf:
+                    _remember_reasoning(session_id, _content_buf, _reason_buf)
+                _term_id = oc_id("chatcmpl")
+                _term_created = int(time.time())
+                yield f"data: {json.dumps({'id': _term_id, 'object': 'chat.completion.chunk', 'created': _term_created, 'model': model or '', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': inferred}]})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
             yield _openai_stream_error(
                 _transport_error_message(err), "upstream_error", "incomplete_stream"
             )
@@ -3814,6 +4274,20 @@ async def _zen_stream_anthropic_with_retry(
                         _log(f"[zen] Region-blocked via {proxy_addr}; rotating proxy")
                         if attempt < attempts:
                             await _backoff(attempt)
+                            attempt += 1
+                            continue
+                        yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
+                        return
+                    if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
+                        # FreeTier gate is exit-specific: blacklist the exit briefly
+                        # and rotate instead of surfacing a terminal 403 that another
+                        # exit would not have hit. Release/aclose handled by the
+                        # enclosing async-with + loop finally.
+                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            _report_free_tier_block(proxy_addr)
+                        if attempt < attempts and not await _client_gone(request):
+                            await _maybe_backoff(attempt, resp.status_code)
                             attempt += 1
                             continue
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
@@ -4009,11 +4483,9 @@ async def _zen_stream_anthropic_with_retry(
                     _safe_pool_stream_failure(proxy_addr)
                 elif PROXY_POOL_ENABLED and proxy_addr and streamed_any:
                     try:
-                        proxy_pool._evict_client(proxy_addr)
+                        await proxy_pool.rotate_away(proxy_addr)
                     except Exception:
                         pass
-                    if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
-                        proxy_pool.current = None
                 if finish_delivered:
                     # Terminal finish_reason was already delivered; nothing
                     # more to emit.
@@ -4036,6 +4508,20 @@ async def _zen_stream_anthropic_with_retry(
                     attempt += 1
                     continue
                 if headers_sent:
+                    # Infer terminal stop when the upstream closed without a
+                    # finish_reason but content/tool fragments were delivered:
+                    # tool_calls pending -> "tool_use", else content -> "end_turn".
+                    # Truly-empty (no content, no tools) keeps the error path.
+                    _inferred = "tool_use" if tool_streamed else ("end_turn" if _content_buf else None)
+                    if _inferred and (headers_sent or streamed_any):
+                        _log(f"[zen] Anthropic inferring stop={_inferred} on close without finish_reason (content_len={len(_content_buf)})")
+                        if session_id and _reason_buf and _content_buf:
+                            _remember_reasoning(session_id, _content_buf, _reason_buf)
+                        for i in close_indices():
+                            yield send_sse("content_block_stop", {"type": "content_block_stop", "index": i})
+                        yield send_sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": _inferred}, "usage": {"output_tokens": output_tokens}})
+                        yield send_sse("message_stop", {"type": "message_stop"})
+                        return
                     # Message started but did not finish: close open blocks
                     # and emit a clean error event.
                     for i in close_indices():
@@ -4417,12 +4903,19 @@ async def nvidia_stream_with_retry(
                 raw = await resp.aread()
             except Exception:
                 raw = b""
+            # Decode the CURRENT attempt's body first, then parse it: the
+            # stale-body bug parsed a previous attempt's body_text here.
+            body_text = raw.decode("utf-8", errors="replace")
             try:
                 data = json.loads(body_text) if body_text else {}
             except Exception:
+                _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): unparsable body {raw[:400]!r}")
                 data = {}
-            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-            body_text = raw.decode("utf-8", errors="replace")
+            if not isinstance(data, dict):
+                _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): non-object body {raw[:400]!r}")
+                data = {}
+            err_msg = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) else None
+            err_msg = err_msg or f"HTTP {resp.status_code}"
             consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
             _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): {err_msg}")
             if _is_degraded_error(data, body_text):
@@ -4540,6 +5033,485 @@ async def nvidia_stream_with_retry(
     )
 
 
+# ── AMD Radeon TokenFactory direct transport (mirrors NVIDIA) ──
+
+# Fail-fast: if this many *consecutive* 429s happen without a single key
+# succeeding, the whole pool is saturated with rate limits. Returning a clear
+# 429 to the client beats silently looping every key with backoff for minutes
+# (which looks like "thinking" to the client). A "consecutive" run is broken by
+# any success OR any non-429 (e.g. a socket error that still tries the pool).
+AMD_POOL_429_FAILFAST = 12
+
+# Dynamic discovery cache for GET /models on the TokenFactory endpoint.
+# _AMD_DYNAMIC_IDS holds verbatim upstream IDs (no amd/ prefix); a 0.0 stamp
+# means "never fetched successfully". Never wiped on empty/failure — the
+# hardcoded amd_models() fallback always applies.
+_AMD_DYNAMIC_IDS: list[str] = []
+_AMD_DYNAMIC_AT: float = 0.0
+_AMD_DYNAMIC_TTL = 3600.0
+
+
+def amd_request_body(model, messages, stream, tools, tool_choice, max_tokens=None, max_completion_tokens=None, sampling=None):
+    """Build a standard OpenAI-compatible body for the AMD TokenFactory endpoint.
+
+    TokenFactory is OpenAI-compatible for /chat/completions; like NIM we only
+    normalize roles and don't inject any reasoning_content.
+    """
+    body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
+    if tools:
+        body["tools"] = tools
+    if tool_choice:
+        if tool_choice in ("auto", "none"):
+            body["tool_choice"] = tool_choice
+        else:
+            body["tool_choice"] = "auto"
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    if max_completion_tokens is not None:
+        body["max_completion_tokens"] = max_completion_tokens
+    if sampling:
+        body.update(sampling)
+    return body
+
+
+def _amd_headers(key: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+    }
+
+
+def _amd_client(streaming: bool):
+    from amd_pool import (
+        AMD_BASE_URL,
+        AMD_CONNECT_TIMEOUT,
+        AMD_READ_TIMEOUT,
+        AMD_STREAM_READ_TIMEOUT,
+    )
+    # trust_env=False: AMD calls go directly to developer.amd.com.cn and must
+    # NOT be routed through the SOCKS proxy pool / system HTTP proxy.
+    return httpx.AsyncClient(
+        base_url=AMD_BASE_URL,
+        timeout=httpx.Timeout(
+            connect=AMD_CONNECT_TIMEOUT,
+            read=AMD_STREAM_READ_TIMEOUT if streaming else AMD_READ_TIMEOUT,
+            write=AMD_STREAM_READ_TIMEOUT if streaming else AMD_READ_TIMEOUT,
+            pool=AMD_CONNECT_TIMEOUT,
+        ),
+        proxy=None,
+        trust_env=False,
+    )
+
+
+def _amd_rate_limit_response(err_msg: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": err_msg + " (amd key rate limit)",
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded",
+            }
+        },
+    )
+
+
+async def _amd_fetch_dynamic_ids() -> list[str]:
+    """GET the TokenFactory /models list with a pooled key (dynamic discovery).
+
+    Returns verbatim upstream IDs on success; on any failure (or empty pool)
+    returns [] and the caller falls back to amd_models(). Never wipes the
+    cached dynamic list on failure.
+    """
+    global _AMD_DYNAMIC_IDS, _AMD_DYNAMIC_AT
+    now = time.time()
+    if _AMD_DYNAMIC_IDS and now - _AMD_DYNAMIC_AT < _AMD_DYNAMIC_TTL:
+        return _AMD_DYNAMIC_IDS
+    if not amd_keys.ready:
+        return _AMD_DYNAMIC_IDS or amd_models()
+    key = amd_keys.select()
+    if key is None:
+        return _AMD_DYNAMIC_IDS or amd_models()
+    client = _amd_client(streaming=False)
+    try:
+        try:
+            resp = await client.get("/models", headers=_amd_headers(key))
+        except Exception as e:
+            _log(f"[amd] Dynamic /models fetch failed: {_exc_desc(e)}")
+            return _AMD_DYNAMIC_IDS or amd_models()
+        try:
+            raw = await resp.aread()
+        except Exception as e:
+            _log(f"[amd] Dynamic /models read failed: {_exc_desc(e)}")
+            return _AMD_DYNAMIC_IDS or amd_models()
+        if resp.status_code >= 400:
+            _log(f"[amd] Dynamic /models HTTP {resp.status_code}")
+            if resp.status_code in (401, 403):
+                amd_keys.report_rate_limit(key)
+            else:
+                _report_amd_status(key, resp.status_code)
+            return _AMD_DYNAMIC_IDS or amd_models()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            return _AMD_DYNAMIC_IDS or amd_models()
+        ids: list[str] = []
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, list):
+            for entry in data:
+                mid = entry.get("id") if isinstance(entry, dict) else None
+                if mid:
+                    ids.append(str(mid))
+        if ids:
+            amd_keys.report_success(key)
+            _AMD_DYNAMIC_IDS = sorted(set(ids))
+            _AMD_DYNAMIC_AT = now
+            return _AMD_DYNAMIC_IDS
+        return _AMD_DYNAMIC_IDS or amd_models()
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+async def amd_request_with_retry(
+    req_body: dict,
+    user: str,
+    model: str,
+    max_retries: int = None,
+):
+    """Buffered AMD TokenFactory call with key rotation on consecutive 429s.
+
+    Mirrors nvidia_request_with_retry. Returns the parsed OpenAI completion
+    dict, a JSONResponse error, or None if the client gave up.
+    """
+    attempts = max_retries if max_retries is not None else MAX_RETRIES
+    last_error = None
+    last_key = None
+    last_status = None
+    last_body = ""
+    key_limit = len(amd_keys.keys) or 1
+    # Consecutive pool-wide 429s (not broken by a success or non-429). When this
+    # reaches AMD_POOL_429_FAILFAST the whole pool is saturated → fail fast
+    # instead of looping every key with backoff for minutes ("thinking").
+    consecutive_429 = 0
+    # Sweep the whole pool: each iteration picks the next usable key (the pool
+    # advances internally), so a model that 404s for some keys (key lacks
+    # access) but works for another eventually succeeds. Rate limits rotate and
+    # cool down the offending key.
+    for attempt in range(key_limit + attempts):
+        key = amd_keys.select()
+        if key is None:
+            return _amd_rate_limit_response("all AMD keys are in rate-limit cooldown")
+        client = _amd_client(streaming=False)
+        headers = _amd_headers(key)
+        try:
+            try:
+                resp = await client.post(
+                    "/chat/completions", json=req_body, headers=headers
+                )
+            except Exception as e:
+                last_error = e
+                _log(f"[amd] Request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": f"AMD request failed: {_exc_desc(e)}", "type": "upstream_error"}},
+                )
+
+            body_bytes = await resp.aread()
+            body_text = body_bytes.decode("utf-8", errors="replace")
+            last_key = key
+            last_status = resp.status_code
+            last_body = body_text
+            try:
+                data = json.loads(body_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+
+            is_429 = resp.status_code == 429
+            is_rate_limit = is_429 or "FreeUsageLimitError" in body_text or (
+                "erate" in body_text and "429" in body_text
+            )
+            if is_rate_limit:
+                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                rotated = amd_keys.report_rate_limit(key)
+                _log(f"[amd] 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
+                consecutive_429 += 1
+                # Whole pool saturated with rate limits → fail fast with a clear
+                # 429 rather than silently looping every key for minutes.
+                if consecutive_429 >= AMD_POOL_429_FAILFAST:
+                    _log(f"[amd] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+                    return _amd_rate_limit_response(
+                        f"AMD pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment"
+                    )
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return _amd_rate_limit_response(err_msg)
+
+            if resp.status_code >= 400:
+                consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
+                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                is_context = _is_context_limit_error(data, body_text)
+                _log(f"[amd] Error {resp.status_code} (key {key[-8:]}): {err_msg} body={body_text[:200]!r}")
+                if resp.status_code in (401, 403):
+                    # Bad/revoked key — rotate away (not rate-limit but unusable).
+                    amd_keys.report_rate_limit(key)
+                if is_context:
+                    # Context window exhaustion is per-model/request, not key.
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg, "type": "context_window_error"}},
+                    )
+                # 404 (model not authorized for this key) → advance to the next
+                # key with no delay; a different key may have access.
+                if resp.status_code < 500 and attempt < key_limit + attempts - 1:
+                    continue
+                # 5xx → escalating key cooldown (504 fast-breaks, no cycling);
+                # then transient retry with backoff.
+                if not _report_amd_status(key, resp.status_code):
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg, "type": "upstream_error"}},
+                    )
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content={"error": {"message": err_msg, "type": "upstream_error"}},
+                )
+
+            amd_keys.report_success(key)
+            consecutive_429 = 0
+            usage = data.get("usage") or {}
+            if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
+                _add_tokens(model,
+                    usage.get("prompt_tokens") or 0,
+                    usage.get("completion_tokens") or 0,
+                    usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                    usage.get("prompt_cache_miss_tokens") or 0,
+                )
+            return data
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    last_err = f"AMD error after retries (last key {last_key[-8:] if last_key else 'none'}: HTTP {last_status})"
+    if last_error:
+        last_err += f": {_exc_desc(last_error)}"
+    return JSONResponse(
+        status_code=last_status or 502,
+        content={"error": {"message": last_err, "type": "upstream_error"}},
+    )
+
+
+async def amd_stream_with_retry(
+    req_body: dict,
+    user: str,
+    model: str,
+    max_retries: int = None,
+):
+    """Streaming AMD TokenFactory call with key rotation on consecutive 429s.
+
+    Mirrors nvidia_stream_with_retry. Yields OpenAI SSE lines. A key that 429s
+    rotates away (cooldown) and the request is retried with the next key.
+    """
+    attempts = max_retries if max_retries is not None else MAX_RETRIES
+    last_error = None
+    key_limit = len(amd_keys.keys) or 1
+    used_keys_in_request = 0
+    # Consecutive pool-wide 429s → fail fast when the whole pool is saturated.
+    consecutive_429 = 0
+    # Track stream throughput so we don't replay once bytes reached the client.
+    streamed_any = False
+
+    attempt = 0
+    while attempt <= attempts + key_limit * 2:
+        key = amd_keys.select()
+        if key is None:
+            yield _openai_stream_error(
+                "all AMD keys are in rate-limit cooldown",
+                "rate_limit_error", "rate_limit_exceeded",
+            )
+            return
+        used_keys_in_request += 1
+        client = _amd_client(streaming=True)
+        try:
+            upstream_request = client.build_request(
+                "POST", "/chat/completions", json=req_body,
+                headers=_amd_headers(key),
+            )
+            resp = await client.send(upstream_request, stream=True)
+        except Exception as e:
+            last_error = e
+            _log(f"[amd] Stream request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
+            await client.aclose()
+            if attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error(f"Stream request failed: {_exc_desc(e)}", "upstream_error", "transport_error")
+            return
+
+        if resp.status_code == 429:
+            try:
+                raw = await resp.aread()
+                try:
+                    data = json.loads(raw)
+                    err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                except Exception:
+                    err_msg = "Rate limit exceeded"
+            except Exception as e:
+                err_msg = f"Rate limit ({_exc_desc(e)})"
+            rotated = amd_keys.report_rate_limit(key)
+            _log(f"[amd] Stream 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
+            await resp.aclose()
+            await client.aclose()
+            consecutive_429 += 1
+            # Whole pool saturated → fail fast with a clear 429 instead of
+            # silently looping every key for minutes (looks like "thinking").
+            if consecutive_429 >= AMD_POOL_429_FAILFAST:
+                _log(f"[amd] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+                yield _openai_stream_error(
+                    f"AMD pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment",
+                    "rate_limit_error", "rate_limit_exceeded",
+                )
+                return
+            if rotated and used_keys_in_request < key_limit:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            if attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
+            return
+
+        if resp.status_code >= 400:
+            try:
+                raw = await resp.aread()
+            except Exception:
+                raw = b""
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            body_text = raw.decode("utf-8", errors="replace")
+            consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
+            _log(f"[amd] Stream error {resp.status_code} (key {key[-8:]}): {err_msg}")
+            if resp.status_code in (401, 403):
+                amd_keys.report_rate_limit(key)
+            await resp.aclose()
+            await client.aclose()
+            # No bytes have streamed yet -> safe to try another key. A 404 means
+            # this key lacks the model; a 5xx may be transient. Sweep the pool.
+            # 5xx records escalating key cooldown (504 fast-breaks, no cycling).
+            if resp.status_code < 500 and attempt < attempts + key_limit:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            if resp.status_code >= 500:
+                if not _report_amd_status(key, resp.status_code):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                if attempt < attempts + key_limit * 2:
+                    attempt += 1
+                    await _backoff(attempt)
+                    continue
+            yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+            return
+
+        # Success — stream it through
+        amd_keys.report_success(key)
+        consecutive_429 = 0
+        stream_completed = False
+        try:
+            try:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        stream_completed = True
+                        yield line + "\n\n"
+                        streamed_any = True
+                        break
+                    try:
+                        piece = json.loads(payload)
+                    except Exception:
+                        piece = {}
+                    if not isinstance(piece, dict):
+                        continue
+                    # In-stream error (e.g. rate limit surfaced mid-body)
+                    ev = _first_chunk_error(line)
+                    if ev:
+                        err_msg, is_rate_limit = ev
+                        if is_rate_limit:
+                            rotated = amd_keys.report_rate_limit(key)
+                            _log(f"[amd] Stream body rate-limit on key {key[-8:]}: {err_msg} rotated={rotated}")
+                            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
+                        else:
+                            yield _openai_stream_error(err_msg)
+                        return
+                    if '"usage"' in line:
+                        u = piece.get("usage") or {}
+                        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                            _add_tokens(model,
+                                u.get("prompt_tokens") or 0,
+                                u.get("completion_tokens") or 0,
+                                u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                                u.get("prompt_cache_miss_tokens") or 0,
+                            )
+                    yield line + "\n\n"
+                    streamed_any = True
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
+                _log(f"[amd] Stream interrupted (key {key[-8:]}): {_exc_desc(e)}")
+                last_error = e
+                if not streamed_any and attempt < attempts + key_limit * 2:
+                    attempt += 1
+                    await _backoff(attempt)
+                    continue
+                yield _openai_stream_error(_transport_error_message(e), "upstream_error", "transport_error")
+                return
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+        if not stream_completed:
+            _log(f"[amd] Stream ended before [DONE] on key {key[-8:]}")
+            if not streamed_any and attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error("AMD stream ended before completion", "upstream_error", "incomplete_stream")
+            return
+        return
+
+    yield _openai_stream_error(
+        f"connection error: AMD stream failed after retries: {_exc_desc(last_error)}",
+        "upstream_error", "transport_error",
+    )
+
+
 # ── Anthropic Messages → OpenAI conversion ────────────────────────
 
 def _anthropic_thinking(blocks) -> str:
@@ -4561,73 +5533,6 @@ def _fmt_cont(cont) -> str:
     if isinstance(cont, list):
         return "list[" + ",".join(b.get("type", "?") for b in cont if isinstance(b, dict)) + "]"
     return type(cont).__name__
-
-
-def _prune_dangling_tools(messages: list[dict]) -> list[dict]:
-    """Drop `tool` messages whose `tool_call_id` is not declared by a preceding
-    assistant message in THIS body. A warm upstream session remembers the
-    declaring turns, but a fresh session has no memory and rejects them. Used
-    only when we are about to send the request to a brand-new session."""
-    if not isinstance(messages, list):
-        return messages
-    out: list[dict] = []
-    open_tc: set = set()
-    for m in messages:
-        if not isinstance(m, dict):
-            out.append(m)
-            continue
-        role = m.get("role")
-        if role == "assistant":
-            open_tc = {tc.get("id") for tc in (m.get("tool_calls") or []) if isinstance(tc, dict)}
-            out.append(m)
-        elif role == "tool":
-            tid = m.get("tool_call_id")
-            if tid in open_tc:
-                out.append(m)
-                open_tc.discard(tid)
-            else:
-                _log("[zen] Pruned dangling tool message (id=%r) for fresh session" % (tid,))
-        else:
-            open_tc = set()
-            out.append(m)
-    return out
-
-
-_400_DUMP_DIR = _BASE_DIR / "diag"
-_400_DUMP_MAX_PER_MODEL = 3
-
-
-def _dump_400_body(req_body: dict, upstream_body: str, proxy_addr: str | None):
-    """Persist a rejected 400 request body for offline diagnosis.
-
-    The [1210] "Invalid API parameter" rejection is deterministic per body
-    (same session fails on every proxy while others succeed), so the payload
-    itself must be inspected. Bounded: at most _400_DUMP_MAX_PER_MODEL files
-    per model, then it stops writing — enough to capture one full episode.
-    """
-    try:
-        model = str(req_body.get("model") or "unknown")
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", model)
-        model_dir = _400_DUMP_DIR / safe
-        model_dir.mkdir(parents=True, exist_ok=True)
-        existing = list(model_dir.glob("*.json"))
-        if len(existing) >= _400_DUMP_MAX_PER_MODEL:
-            return
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        payload = {
-            "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "proxy": proxy_addr,
-            "upstream_error": upstream_body[:2000],
-            "request": req_body,
-        }
-        path = model_dir / f"req_{stamp}_{secrets.token_hex(3)}.json"
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        tmp.replace(path)
-        _log(f"[zen] 400 body dumped: {path.name} ({len(existing) + 1}/{_400_DUMP_MAX_PER_MODEL})")
-    except Exception as e:
-        _log(f"[zen] 400 body dump failed: {_exc_desc(e)}")
 
 
 def _log_reasoning_diag(req_body: dict):
@@ -4836,7 +5741,17 @@ async def list_models(request: Request):
     if nvidia_keys.ready:
         for alias in ("kimi-k3", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-coder"):
             data.append({"id": f"nvidia/{alias}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
-    return {"object": "list", "data": data}
+    # AMD Radeon TokenFactory models exposed behind the amd/ prefix.
+    # Dynamic discovery via GET /models when the pool is ready; hardcoded
+    # amd_models() fallback on failure — never wiped on empty.
+    if amd_keys.ready:
+        try:
+            amd_ids = await _amd_fetch_dynamic_ids()
+        except Exception:
+            amd_ids = amd_models()
+        for mid in amd_ids:
+            data.append({"id": f"amd/{mid}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
+    return {"object": "list", "data": data, "models_checked_at": _models_checked_at}
 
 
 async def chat_completions(request: Request):
@@ -4845,12 +5760,24 @@ async def chat_completions(request: Request):
     if not user:
         return JSONResponse(status_code=401, content={"error": {"message": "Invalid API key"}})
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+        )
     model = body.get("model")
     messages = body.get("messages")
     stream = body.get("stream")
     tools = body.get("tools")
     tool_choice = body.get("tool_choice")
+
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "messages is required", "type": "invalid_request_error"}},
+        )
 
     # NVIDIA NIM direct route: models addressed with nvidia/ or nvimin/ prefix
     if is_nvidia_model(model):
@@ -4880,6 +5807,34 @@ async def chat_completions(request: Request):
             return JSONResponse(status_code=502, content={"error": {"message": "Invalid upstream response", "type": "upstream_error"}})
         return data
 
+    # AMD Radeon TokenFactory direct route: models addressed with amd/ or radeon/ prefix
+    if is_amd_model(model):
+        if not amd_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": "No AMD API keys loaded (amd-api-keys.txt empty/missing)", "type": "upstream_error"}},
+            )
+        amd_model = amd_model_id(model)
+        norm_messages = _normalize_messages(messages) or []
+        req_body = amd_request_body(
+            amd_model, norm_messages, stream, tools, tool_choice,
+            body.get("max_tokens"), body.get("max_completion_tokens"), _amd_sampling_from(body),
+        )
+        if stream:
+            return StreamingResponse(
+                amd_stream_with_retry(req_body, user, amd_model),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        data = await amd_request_with_retry(req_body, user, amd_model)
+        if isinstance(data, JSONResponse):
+            return data
+        if data is None:
+            return JSONResponse(status_code=502, content={"error": {"message": "Client disconnected", "type": "upstream_error"}})
+        if not data.get("choices"):
+            return JSONResponse(status_code=502, content={"error": {"message": "Invalid upstream response", "type": "upstream_error"}})
+        return data
+
     model = _normalize_model(model)
     if not await _ensure_model_known(model):
         return JSONResponse(
@@ -4892,10 +5847,10 @@ async def chat_completions(request: Request):
     up_messages = _prepare_upstream_messages(session_id, _normalize_messages(messages))
     req_body, headers = zen_request(model, up_messages, stream, tools, tool_choice, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
 
-    if _is_muse_spark(model):
-        # Muse Spark is only served by /zen/v1/responses; chat/completions
-        # returns a deterministic 500. Translate to Responses and translate
-        # its SSE events back into chat chunks.
+    if _is_muse_spark(model) or _model_wire_api(model) == "openai-responses":
+        # Responses-routed models (muse-spark substring or models.dev
+        # provider.npm == "@ai-sdk/openai" meta): chat/completions returns a
+        # deterministic 500. Translate to Responses and translate back.
         resp_body = _zen_responses_body(
             model, up_messages, tools,
             effort=_resolve_muse_effort(body.get("model"), body),
@@ -4976,7 +5931,13 @@ async def messages(request: Request):
             content={"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}},
         )
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+        )
     model = body.get("model")
     stream = body.get("stream")
 
@@ -4991,6 +5952,7 @@ async def messages(request: Request):
             )
         nim_model = nvidia_model_id(model)
         oai_nv_messages, nv_tools = anthropic_to_openai(body)
+        oai_nv_messages = _normalize_messages(oai_nv_messages) or []
         input_tokens = len(json.dumps(oai_nv_messages)) // 4
         nv_req_body = nvidia_request_body(
             nim_model, oai_nv_messages, False, nv_tools, None,
@@ -5033,6 +5995,60 @@ async def messages(request: Request):
             )
         return anth
 
+    # AMD TokenFactory direct route (Anthropic format): convert to OpenAI, call
+    # TokenFactory, convert the completion back to Anthropic. Streams are
+    # bridged through the buffered path (same guarantee as the NVIDIA route).
+    if is_amd_model(model):
+        if not amd_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "No AMD API keys loaded"}},
+            )
+        amd_model = amd_model_id(model)
+        oai_amd_messages, amd_tools = anthropic_to_openai(body)
+        oai_amd_messages = _normalize_messages(oai_amd_messages) or []
+        input_tokens = len(json.dumps(oai_amd_messages)) // 4
+        amd_req_body = amd_request_body(
+            amd_model, oai_amd_messages, False, amd_tools, None,
+            body.get("max_tokens"), body.get("max_completion_tokens"), _amd_sampling_from(body),
+        )
+        amd_data = await amd_request_with_retry(amd_req_body, user, amd_model)
+        if isinstance(amd_data, JSONResponse):
+            return amd_data
+        if amd_data is None:
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
+            )
+        if not amd_data.get("choices"):
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Invalid upstream response"}},
+            )
+        anth = openai_to_anthropic(amd_data, amd_model, input_tokens)
+        if stream:
+            async def _amd_anthropic_sse():
+                # Stream the already-complete buffered Anthropic conversion.
+                start_payload = json.dumps({"type": "message_start", "message": anth})
+                yield f"event: message_start\ndata: {start_payload}\n\n"
+                content = anth.get("content", [])
+                for idx, block in enumerate(content):
+                    cbs_payload = json.dumps({"type": "content_block_start", "index": idx, "content_block": block})
+                    yield f"event: content_block_start\ndata: {cbs_payload}\n\n"
+                    if block.get("type") == "text":
+                        delta_payload = json.dumps({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}})
+                        yield f"event: content_block_delta\ndata: {delta_payload}\n\n"
+                    cbstop_payload = json.dumps({"type": "content_block_stop", "index": idx})
+                    yield f"event: content_block_stop\ndata: {cbstop_payload}\n\n"
+                stop_payload = json.dumps({"type": "message_stop"})
+                yield f"event: message_stop\ndata: {stop_payload}\n\n"
+            return StreamingResponse(
+                _amd_anthropic_sse(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        return anth
+
     model = _normalize_model(model)
 
     if not await _ensure_model_known(model):
@@ -5045,9 +6061,9 @@ async def messages(request: Request):
     session_id = get_session(user, oai_messages)
     input_tokens = len(json.dumps(oai_messages)) // 4
 
-    up_messages = _prepare_upstream_messages(session_id, oai_messages)
+    up_messages = _prepare_upstream_messages(session_id, _normalize_messages(oai_messages))
 
-    if _is_muse_spark(model):
+    if _is_muse_spark(model) or _model_wire_api(model) == "openai-responses":
         # Muse Spark via /zen/v1/responses (see chat route); aggregate and
         # reframe as Anthropic SSE (or a plain message when not streaming).
         _, headers = zen_request(model, up_messages, True, tools, None, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
@@ -5234,6 +6250,24 @@ async def _stream_as_responses(upstream, model: str, session_id=None):
                 data = json.loads(payload)
             except Exception:
                 continue
+            if not isinstance(data, dict):
+                continue
+            # Surface upstream error chunks explicitly: a {"error": {...}}
+            # chunk carries no choices/usage and must NOT be swallowed into
+            # a terminal status=incomplete. Emit a failed response instead.
+            err_obj = data.get("error")
+            if isinstance(err_obj, dict):
+                err_msg = err_obj.get("message") or "upstream error"
+                _log(f"[zen] Responses upstream error chunk: {_redact_for_log(str(err_msg))[:300]}")
+                yield _responses_sse("response.failed", {
+                    "type": "response.failed",
+                    "response": _response_obj(resp_id, model, "failed", [], _chat_usage_to_responses(usage)),
+                })
+                yield _responses_sse("response.completed", {
+                    "type": "response.completed",
+                    "response": _response_obj(resp_id, model, "failed", [], _chat_usage_to_responses(usage)),
+                })
+                return
             choices = data.get("choices") or []
             if not choices:
                 if data.get("usage"):
@@ -5379,7 +6413,7 @@ async def handle_responses(request: Request):
         up_messages = _prepare_upstream_messages(session_id, messages)
         req_body, headers = zen_request(zen_model, up_messages, stream, tools, tool_choice, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
 
-        if _is_muse_spark(zen_model):
+        if _is_muse_spark(zen_model) or _model_wire_api(zen_model) == "openai-responses":
             # Client speaks Responses already, but the Zen upstream for muse is
             # /zen/v1/responses, not chat/completions (which 500s). Stream there
             # natively, then map the events to client Responses events as usual.
@@ -5539,6 +6573,7 @@ async def health(request: Request):
         "status": "ok",
         "version": f"v{PROXY_VERSION}",
         "models": len(_models_cache),
+        "models_checked_at": _models_checked_at,
         "socks5": STATIC_PROXY,
         "proxy_pool": PROXY_POOL_ENABLED,
         "proxy_port_filter": sorted(ALLOWED_PROXY_PORTS) if PROXY_PORT_FILTER_ENABLED else None,
@@ -5547,6 +6582,8 @@ async def health(request: Request):
         "tokens": dict(_tokens),
         "nvidia_keys": len(nvidia_keys.keys) if nvidia_keys.ready else 0,
         "nvidia_models": [f"nvidia/{m}" for m in nvidia_models()] if nvidia_keys.ready else [],
+        "amd_keys": len(amd_keys.keys) if amd_keys.ready else 0,
+        "amd_models": [f"amd/{m}" for m in amd_models()] if amd_keys.ready else [],
         "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
     }
 
