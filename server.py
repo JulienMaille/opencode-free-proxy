@@ -18,7 +18,7 @@ import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from proxy_pool import pool as proxy_pool
 from proxy_pool import (
@@ -173,9 +173,8 @@ def _json(fn):
     return wrapper
 
 PORT = args.port or int(os.environ.get("PORT", "6446"))
-HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.18.31"
-PROXY_VERSION = "18"
+PROXY_VERSION = "19"
 # Native OpenCode project id: sha1 hex of "git-remote:<normalized remote>".
 # The console/gate inspects x-opencode-project; the real CLI hashes the
 # user's project remote (verified against upstream packages/core/project.ts).
@@ -919,6 +918,27 @@ def _is_region_error(data: dict | None = None, body: str = "") -> bool:
     return "not available in your country" in text
 
 
+def _is_unavailable_error(data: dict | None = None, body: str = "") -> bool:
+    """Recognize 'Model is unavailable' provider errors (dead upstream model).
+
+    Observed as HTTP 400 `Error from provider (Console): Upstream request
+    failed: Model is unavailable.` for e.g. deepseek-v4-flash-free. Like the
+    promotion-ended error this repeats identically on every proxy/retry, so the
+    model is retired on first sight instead of burning attempts per request.
+    Unlike promotion-ended there is no entitlement phrase to key persistence
+    off, so callers retire session-only (persistent=False): a restart
+    re-discovers the id, and the blocklist below still hides it from clients.
+    """
+    if not isinstance(data, dict):
+        data = {}
+    error = data.get("error")
+    if not isinstance(error, dict):
+        error = {}
+    text = " ".join(
+        str(v) for v in (error.get("message"), body) if v is not None
+    ).lower()
+    return "model is unavailable" in text
+
 def _is_promotion_ended_error(data: dict | None = None, body: str = "", status_code: int | None = None, model: str | None = None) -> bool:
     """Recognize entitlement errors for a model whose free promotion ended.
 
@@ -978,19 +998,32 @@ def _is_free_tier_gate_error(data: dict | None = None, body: str = "") -> bool:
 
 
 def _report_free_tier_block(proxy_addr: str | None):
-    """Briefly blacklist ``proxy_addr`` for the exit-dependent FreeTier gate.
+    """Rotate off a FreeTier-gated exit with zero health penalty.
 
-    SYNC (owner: event-loop thread / request path). Prefers the pool's
-    dedicated hook when shipped; falls back to the region-block path so an
-    exit-specific rejection still blacklists + rotates the sticky pointer.
+    The gate is request-shaped (same request 403s on every rotated exit while
+    other requests OK on those same exits) — see
+    ``proxy_pool.report_free_tier_block``. SYNC (owner: event-loop thread /
+    request path). Falls back to a bare sticky reset if the pool hook is
+    unavailable.
     """
+    if not PROXY_POOL_ENABLED or not proxy_addr:
+        return
     try:
         report = getattr(proxy_pool, "report_free_tier_block", None)
         if report is None:
-            report = proxy_pool.report_region_block
+            if proxy_pool.current and proxy_pool.current.get("address") == proxy_addr:
+                proxy_pool.current = None
+            return
         report(proxy_addr)
     except Exception:
         pass
+
+
+# Fail fast on a request-shaped gate: the same request id 403s on every
+# rotated exit (neither ``6471b37d`` nor ``592f7836`` ever succeeded), so
+# sweeping all 6 attempts just burns latency + healthy exits. Surface after
+# this many CONSECUTIVE gates; any non-gate outcome resets the count.
+_FREE_TIER_FAIL_FAST_GATES = 3
 
 
 def _blocks_text(content) -> str:
@@ -1010,11 +1043,18 @@ _dead_models: set[str] = set()  # ids rejected upstream (free promotion ended); 
 # Free-tier ids whose name does not carry a "-free" suffix (models.dev cost == 0),
 # kept alongside name-tagged models so discovery doesn't drop them.
 _FREE_MODEL_EXTRA: set[str] = {"big-pickle"}
+# Upstream lists these ids but they always fail: deepseek-v4-flash-free
+# returns "Model is unavailable", north-mini-code-free 400s on multi-turn tool
+# calls, ling-3.0-flash-free left the free tier (404, paid slug instead).
+# Filtered from discovery AND from every listing/request path so clients never
+# see them. Volatile upstream state lives here (not DEAD_IDS): a restart
+# re-discovers when upstream heals, and session retire still applies below.
+_MODELS_BLOCKED: set[str] = {"deepseek-v4-flash-free", "north-mini-code-free", "ling-3.0-flash-free"}
+_MODELS_BLOCKED_LOWER: frozenset[str] = frozenset(m.lower() for m in _MODELS_BLOCKED)
 # Precise free filter (port of pi-opencode-free FREE_REGEX): optional
 # `opencode/` prefix + mandatory `-free` suffix, case-insensitive.
 _FREE_MODEL_RE = re.compile(r"^(opencode/)?.*-free$", re.IGNORECASE)
 _MODELS_REFRESH_SECS = 43200  # safety-net refresh every 12h; unknown models trigger on-demand
-# Conservative /v1/models defaults when models.dev is unreachable.
 _DEFAULT_LIMIT = {"context": 128000, "output": 16384, "contextWindow": 128000, "maxTokens": 16384}
 # Conservative image-gating default: unknown models advertise text-only input.
 # Metadata-present path gates on models.dev modalities explicitly; only the
@@ -1025,6 +1065,16 @@ _DISCOVERY_DEADLINE_SECS = 3.5
 # Timestamp (epoch secs) of the last successful discovery snapshot; None until
 # the first success. Never cleared on empty/failed refreshes (staleness signal).
 _models_checked_at: float | None = None
+
+
+def _is_blocked_model(model: str | None) -> bool:
+    """True if the id is blocklisted (listed upstream but always fails)."""
+    return bool(model) and str(model).lower() in _MODELS_BLOCKED_LOWER
+
+
+def _served_models() -> list[str]:
+    """Discovered free ids minus the always-failing blocklist."""
+    return [m for m in _models_cache if not _is_blocked_model(m)]
 
 
 # ── Persistent dead-model denylist (pi-freeflow DEAD_MODEL_IDS pattern) ──
@@ -1156,6 +1206,7 @@ async def _fetch_free_models():
                 if (_FREE_MODEL_RE.match(m) or m in _FREE_MODEL_EXTRA)
                 and m not in _dead_models
                 and m not in DEAD_IDS
+                and not _is_blocked_model(m)
                 and _stealth_admitted(m, zen_free)
             ]
             if not free:
@@ -1249,10 +1300,12 @@ async def _ensure_model_known(model: str) -> bool:
     free model is usable on the very next request instead of waiting for the
     periodic refresh.
     """
-    if model in _dead_models or model in DEAD_IDS:
+    if _is_blocked_model(model) or model in _dead_models or model in DEAD_IDS:
         return False
     _sanitize_models_cache()
     if model in _models_cache:
+        if _is_blocked_model(model):
+            return False
         if not _stealth_admitted(model, set(_models_cache)):
             return False
         return True
@@ -1262,7 +1315,7 @@ async def _ensure_model_known(model: str) -> bool:
         _log(f"[models] stealth gate: rejected {model!r} (fails free filter, no allowlist entry)")
         return False
     await _fetch_free_models()
-    return model in _models_cache
+    return model in _models_cache and not _is_blocked_model(model)
 
 
 def _has_promotion_phrase(data: dict | None = None, body: str = "") -> bool:
@@ -1329,9 +1382,6 @@ MODEL_ALIASES: dict[str, str] = {
     "longcat-2.0": "longcat-2.0-free",
     "hy3": "hy3-free",
     "ling-flash": "ling-3.0-flash-fin-free",
-    "north-mini": "north-mini-code-free",
-    "north-mini-code": "north-mini-code-free",
-    "deepseek-flash": "deepseek-v4-flash-free",
 }
 
 
@@ -1734,9 +1784,19 @@ _ABORT_TYPE_NAMES = frozenset({
     "ClientDisconnected", "ConnectionAborted", "GeneratorExit",
 })
 _ABORT_TEXT_MARKERS = (
-    "aborterror", "client disconnect", "client abort", "aborted",
-    "disconnect", "generator exit", "event loop is closed",
+    "aborterror", "client disconnect", "client disconnected", "client abort", "aborted",
+    "generator exit", "event loop is closed",
     "connection reset", "broken pipe", "client closed",
+)
+# Substrings that prove the error came from the UPSTREAM side (never a client abort),
+# checked before _ABORT_TEXT_MARKERS. Bare "disconnect" used to live in the marker
+# list and misclassified httpx RemoteProtocolError("Server disconnected without
+# sending a response") as "Client aborted", terminating the stream instead of
+# rotating the proxy exit and retrying. Mirrors proxy_pool/nvidia_pool is_cancelled.
+_UPSTREAM_NOT_ABORT_MARKERS = (
+    "server disconnect",
+    "without sending a response",
+    "peer closed connection",
 )
 
 
@@ -1754,6 +1814,8 @@ def _is_client_abort(exc: BaseException | None) -> bool:
     if name in _ABORT_TYPE_NAMES:
         return True
     text = f"{name}: {exc}".lower()
+    if any(m in text for m in _UPSTREAM_NOT_ABORT_MARKERS):
+        return False
     return any(m in text for m in _ABORT_TEXT_MARKERS)
 
 
@@ -2549,6 +2611,7 @@ async def _zen_responses_stream_with_retry(
         return chunks
 
     attempt = 0
+    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
     while True:
         if attempt > attempts + MAX_STREAM_CONTINUATIONS:
             break
@@ -2603,6 +2666,7 @@ async def _zen_responses_stream_with_retry(
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             last_error = e
+            free_tier_gates = 0  # transport outcome breaks the gate streak
             if attempt < attempts:
                 await _backoff(attempt)
                 attempt += 1
@@ -2623,6 +2687,7 @@ async def _zen_responses_stream_with_retry(
                 proxy_pool.report_ratelimit(proxy_addr)
                 proxy_pool.release(proxy_addr)
             await resp.aclose()
+            free_tier_gates = 0  # 429 is exit-shaped quota, not the request gate
             if attempt < attempts:
                 await _maybe_backoff(attempt, 429)
                 attempt += 1
@@ -2673,12 +2738,17 @@ async def _zen_responses_stream_with_retry(
                 if PROXY_POOL_ENABLED and not ALLOW_DIRECT_FALLBACK:
                     _log(f"[zen] pool exhausted on 413; direct fallback disabled (opt in with --allow-direct-fallback)")
                 yield _openai_stream_error(err_msg, "upstream_error", "413")
-                return
             if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                free_tier_gates += 1
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     _report_free_tier_block(proxy_addr)
                     proxy_pool.release(proxy_addr)
+                if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
+                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                    await resp.aclose()
+                    yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
+                    return
                 if attempt < attempts and not await _client_gone(request):
                     await resp.aclose()
                     await _maybe_backoff(attempt, resp.status_code)
@@ -2718,6 +2788,7 @@ async def _zen_responses_stream_with_retry(
                     proxy_pool.release(proxy_addr)
                 await resp.aclose()
                 await _maybe_backoff(attempt, resp.status_code)
+                free_tier_gates = 0  # retriable outcome breaks the gate streak
                 attempt += 1
                 continue
             if PROXY_POOL_ENABLED and proxy_addr:
@@ -2725,6 +2796,7 @@ async def _zen_responses_stream_with_retry(
             if _is_region_error(data, body_text):
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_region_block(proxy_addr)
+                free_tier_gates = 0  # region outcome breaks the gate streak
                 if attempt < attempts:
                     await _backoff(attempt)
                     attempt += 1
@@ -2733,7 +2805,7 @@ async def _zen_responses_stream_with_retry(
                 return
             # Entitlement error (401 ModelError incl. promotion-ended): retire
             # the model and terminate immediately, same lazy path as chat.
-            if _is_promotion_ended_error(data, body_text, resp.status_code, model):
+            if _is_unavailable_error(data, body_text) or _is_promotion_ended_error(data, body_text, resp.status_code, model):
                 await resp.aclose()
                 _mark_model_dead(model, persistent=_has_promotion_phrase(data, body_text))
                 yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
@@ -2805,7 +2877,7 @@ async def _zen_responses_stream_with_retry(
                         _log(f"[zen] Responses stream error (attempt {attempt}): {err_msg}")
                         last_error = ValueError(err_msg)
                         # Same lazy-retire path as chat on ModelError bodies.
-                        if _is_promotion_ended_error(piece, json.dumps(piece) if isinstance(piece, dict) else "", None, model):
+                        if _is_unavailable_error(piece, json.dumps(piece) if isinstance(piece, dict) else "") or _is_promotion_ended_error(piece, json.dumps(piece) if isinstance(piece, dict) else "", None, model):
                             _mark_model_dead(model, persistent=_has_promotion_phrase(piece, json.dumps(piece) if isinstance(piece, dict) else ""))
                             yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
                             return
@@ -3314,6 +3386,7 @@ async def _zen_request_with_retry(
     attempts = MAX_RETRIES if max_retries is None else max_retries
     last_status: int | None = None
     pool_exhausted_retriable = False
+    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
 
     for attempt in range(attempts + 1):
         if await _client_gone(request):
@@ -3357,6 +3430,7 @@ async def _zen_request_with_retry(
                 _log(f"[zen] Request failed (attempt {attempt}): {_exc_desc(e)}")
                 _safe_pool_failure(proxy_addr, e, hard=False)
                 last_error = e
+                free_tier_gates = 0  # transport outcome breaks the gate streak
                 if _is_client_abort(e):
                     return JSONResponse(
                         status_code=502,
@@ -3372,6 +3446,7 @@ async def _zen_request_with_retry(
                 _log(f"[zen] Response read failed (attempt {attempt}): {_exc_desc(e)}")
                 _safe_pool_failure(proxy_addr, e, hard=False)
                 last_error = e
+                free_tier_gates = 0  # transport outcome breaks the gate streak
                 if _is_client_abort(e):
                     return JSONResponse(
                         status_code=502,
@@ -3400,7 +3475,7 @@ async def _zen_request_with_retry(
                 _log_429_hint()
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.report_ratelimit(proxy_addr)
-                # A 429 is a per-IP quota burn: the next proxy in the pool has
+                free_tier_gates = 0  # 429 is exit-shaped quota, not the request gate
                 # fresh quota. Rotate and retry instead of telling the client;
                 # only surface the error once every attempt is exhausted.
                 if attempt < attempts and not await _client_gone(request):
@@ -3439,7 +3514,7 @@ async def _zen_request_with_retry(
                 # Entitlement error (401 ModelError incl. promotion-ended):
                 # identical on every proxy/retry — retire the model and fail
                 # fast instead of burning retries across the pool.
-                if _is_promotion_ended_error(data, body_text, resp.status_code, model):
+                if _is_unavailable_error(data, body_text) or _is_promotion_ended_error(data, body_text, resp.status_code, model):
                     _log(f"[zen] Model {model} retired upstream (ModelError); dropping from list")
                     _mark_model_dead(model, persistent=_has_promotion_phrase(data, body_text))
                     return JSONResponse(
@@ -3447,12 +3522,16 @@ async def _zen_request_with_retry(
                         content={"error": {"message": f"{model} is no longer available: {err_msg}", "type": "upstream_error", "code": "model_retired"}},
                     )
                 if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                    # FreeTier gate is exit-specific: blacklist the exit briefly and
-                    # rotate instead of surfacing a terminal 403 that another exit
-                    # would not have hit. Release handled by the loop's finally.
-                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                    free_tier_gates += 1
+                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
                     if PROXY_POOL_ENABLED and proxy_addr:
                         _report_free_tier_block(proxy_addr)
+                    if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
+                        _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                        return JSONResponse(
+                            status_code=403,
+                            content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
+                        )
                     if attempt < attempts and not await _client_gone(request):
                         await _maybe_backoff(attempt, resp.status_code)
                         continue
@@ -3589,6 +3668,7 @@ async def _zen_stream_with_retry(
     continuations = 0  # mid-stream resume attempts (see MAX_STREAM_CONTINUATIONS)
 
     attempt = 0
+    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
     while True:
         # Total work cap: plain retries (attempts) + mid-stream continuations
         # (MAX_STREAM_CONTINUATIONS) share one counter, so 4 torn-stream resumes
@@ -3675,6 +3755,7 @@ async def _zen_stream_with_retry(
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             last_error = e
+            free_tier_gates = 0  # transport outcome breaks the gate streak
             if attempt < attempts:
                 await _backoff(attempt)
                 attempt += 1
@@ -3720,6 +3801,7 @@ async def _zen_stream_with_retry(
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             await resp.aclose()
+            free_tier_gates = 0  # 429 is exit-shaped quota, not the request gate
             # Per-IP quota burn: the next proxy has fresh quota. Rotate and
             # retry before ever telling the client about the rate limit.
             if attempt < attempts and not await _client_gone(request):
@@ -3792,6 +3874,7 @@ async def _zen_stream_with_retry(
                     proxy_pool.report_region_block(proxy_addr)
                 _log(f"[zen] Region-blocked via {proxy_addr}; rotating proxy")
                 await resp.aclose()
+                free_tier_gates = 0  # region outcome breaks the gate streak
                 if attempt < attempts:
                     await _backoff(attempt)
                     attempt += 1
@@ -3800,14 +3883,15 @@ async def _zen_stream_with_retry(
                 return
 
             if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                # FreeTier gate is exit-specific: blacklist the exit briefly and
-                # rotate (or direct-fetch when enabled) instead of surfacing a
-                # terminal 403 that another exit would not have hit. Release
-                # already happened above, so no release here.
-                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                free_tier_gates += 1
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     _report_free_tier_block(proxy_addr)
                 await resp.aclose()
+                if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
+                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                    yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
+                    return
                 if attempt < attempts and not await _client_gone(request):
                     await _maybe_backoff(attempt, resp.status_code)
                     attempt += 1
@@ -3828,7 +3912,7 @@ async def _zen_stream_with_retry(
             # the retry below ride it out (no report_success — it was not
             # healthy for this call). 413 is a size signal (dedicated branch
             # above) — never cooled/blacklisted/counted.
-            if _is_promotion_ended_error(data, body_text, resp.status_code, model):
+            if _is_unavailable_error(data, body_text) or _is_promotion_ended_error(data, body_text, resp.status_code, model):
                 # Entitlement error: identical on every proxy/retry. Retire
                 # the model and terminate the stream immediately.
                 await resp.aclose()
@@ -3979,7 +4063,7 @@ async def _zen_stream_with_retry(
                                 "rate_limit_exceeded",
                             )
                             return
-                        if _is_promotion_ended_error(piece, line, None, model):
+                        if _is_unavailable_error(piece, line) or _is_promotion_ended_error(piece, line, None, model):
                             _mark_model_dead(model, persistent=_has_promotion_phrase(piece, line))
                             yield _openai_stream_error(f"{model} is no longer available: {err_msg}", "upstream_error", "model_retired")
                             return
@@ -4199,6 +4283,7 @@ async def _zen_stream_anthropic_with_retry(
         return idx
 
     attempt = 0
+    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
     while True:
         # Total work cap: plain retries (attempts) + continuations share one counter.
         # It's intentional — see _zen_stream_with_retry.
@@ -4247,6 +4332,7 @@ async def _zen_stream_anthropic_with_retry(
                     _log_429_hint()
                     if PROXY_POOL_ENABLED and proxy_addr:
                         proxy_pool.report_ratelimit(proxy_addr)
+                    free_tier_gates = 0  # 429 is exit-shaped quota, not the request gate
                     # Per-IP quota: rotate to a fresh exit before telling the
                     # client we are rate-limited.
                     if attempt < attempts and not await _client_gone(request):
@@ -4272,6 +4358,7 @@ async def _zen_stream_anthropic_with_retry(
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_region_block(proxy_addr)
                         _log(f"[zen] Region-blocked via {proxy_addr}; rotating proxy")
+                        free_tier_gates = 0  # region outcome breaks the gate streak
                         if attempt < attempts:
                             await _backoff(attempt)
                             attempt += 1
@@ -4279,13 +4366,14 @@ async def _zen_stream_anthropic_with_retry(
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                         return
                     if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                        # FreeTier gate is exit-specific: blacklist the exit briefly
-                        # and rotate instead of surfacing a terminal 403 that another
-                        # exit would not have hit. Release/aclose handled by the
-                        # enclosing async-with + loop finally.
-                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403: {err_msg} — blacklisting exit briefly, rotating")
+                        free_tier_gates += 1
+                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
                         if PROXY_POOL_ENABLED and proxy_addr:
                             _report_free_tier_block(proxy_addr)
+                        if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
+                            _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                            yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
+                            return
                         if attempt < attempts and not await _client_gone(request):
                             await _maybe_backoff(attempt, resp.status_code)
                             attempt += 1
@@ -4295,7 +4383,7 @@ async def _zen_stream_anthropic_with_retry(
                     # Not a proxy failure: 4xx/5xx are upstream or request
                     # errors that repeat identically on every proxy. 413 is a
                     # size signal — rotate with zero health accounting.
-                    if _is_promotion_ended_error(data, body_text, resp.status_code, model):
+                    if _is_unavailable_error(data, body_text) or _is_promotion_ended_error(data, body_text, resp.status_code, model):
                         _mark_model_dead(model, persistent=_has_promotion_phrase(data, body_text))
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"{model} is no longer available: {err_msg}"}})
                         return
@@ -4349,7 +4437,7 @@ async def _zen_stream_anthropic_with_retry(
                                 _piece = json.loads(raw_line.strip()[6:] if raw_line.strip().startswith("data: ") else raw_line)
                             except (json.JSONDecodeError, TypeError, ValueError):
                                 _piece = {}
-                            if _is_promotion_ended_error(_piece, raw_line, None, model):
+                            if _is_unavailable_error(_piece, raw_line) or _is_promotion_ended_error(_piece, raw_line, None, model):
                                 _mark_model_dead(model, persistent=_has_promotion_phrase(_piece, raw_line))
                                 yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"{model} is no longer available: {err_msg}"}})
                                 return
@@ -5700,6 +5788,646 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
     }
 
 
+# ── Routes: Ollama format ─────────────────────────────────────────
+# Minimal Ollama-compatible shim for clients that only speak Ollama
+# (e.g. some VS Code extensions): GET /api/tags lists the same models as
+# /v1/models, POST /api/chat and POST /api/generate fan out to the same
+# Zen / NVIDIA-NIM upstream paths as /v1/chat/completions. Streaming uses
+# Ollama NDJSON (one JSON object per line), not SSE. Structured output
+# via `format` is NOT translated — the model returns plain text.
+
+OLLAMA_VERSION = "0.11.4"
+OLLAMA_MODIFIED_AT = "2026-01-01T00:00:00Z"
+# Keep in sync with the nvidia/* entries exposed by list_models.
+_OLLAMA_NVIDIA_ALIASES = ("kimi-k3", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-coder")
+
+
+def _ollama_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+
+async def _ollama_names() -> list[str]:
+    """Model names served on the Ollama shim (same set as /v1/models)."""
+    names = _served_models()
+    seen = set(names)
+    for alias, canonical in sorted(MODEL_ALIASES.items()):
+        if canonical in seen and alias not in seen and not _is_blocked_model(canonical):
+            names.append(alias)
+    if nvidia_keys.ready:
+        for alias in _OLLAMA_NVIDIA_ALIASES:
+            nid = f"nvidia/{alias}"
+            if nid not in seen:
+                names.append(nid)
+                seen.add(nid)
+    if amd_keys.ready:
+        try:
+            amd_ids = await _amd_fetch_dynamic_ids()
+        except Exception:
+            amd_ids = amd_models()
+        for mid in amd_ids:
+            nid = f"amd/{mid}"
+            if nid not in seen:
+                names.append(nid)
+                seen.add(nid)
+    return names
+
+
+def _ollama_details(name: str) -> dict:
+    if is_nvidia_model(name):
+        canon = nvidia_model_id(name)
+    elif is_amd_model(name):
+        canon = amd_model_id(name)
+    else:
+        canon = _normalize_model(name) or ""
+    meta = _models_meta.get(canon) or {}
+    modalities = meta.get("modalities") or {}
+    caps = ["completion", "tools"]
+    inp = modalities.get("input") if isinstance(modalities, dict) else None
+    if isinstance(inp, list) and any(str(x).lower() == "image" for x in inp):
+        caps.append("vision")
+    return {
+        "digest": "sha256:" + hashlib.sha256(name.encode("utf-8")).hexdigest(),
+        "details": {
+            "parent_model": "",
+            "format": "",
+            "family": "opencode-free",
+            "families": ["opencode-free"],
+            "parameter_size": "",
+            "quantization_level": "",
+        },
+        "capabilities": caps,
+    }
+
+
+async def ollama_tags(request: Request):
+    new_request_id()
+    if not _models_cache:
+        await _fetch_free_models()
+    models = []
+    for n in await _ollama_names():
+        d = _ollama_details(n)
+        models.append({
+            "name": n,
+            "model": n,
+            "modified_at": OLLAMA_MODIFIED_AT,
+            "size": 0,
+            "digest": d["digest"],
+            "details": d["details"],
+        })
+    return {"models": models}
+
+
+async def ollama_version(request: Request):
+    new_request_id()
+    return {"version": OLLAMA_VERSION}
+
+
+async def ollama_ps(request: Request):
+    new_request_id()
+    return {"models": []}
+
+
+async def ollama_root(request: Request):
+    new_request_id()
+    return PlainTextResponse("Ollama is running")
+
+
+async def ollama_show(request: Request):
+    new_request_id()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    name = body.get("model") or body.get("name") or ""
+    if not name:
+        return JSONResponse(status_code=400, content={"error": "model name required"})
+    if is_nvidia_model(name):
+        if not nvidia_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "No NVIDIA API keys loaded (nvidia-api-keys.txt empty/missing)"},
+            )
+    elif is_amd_model(name):
+        if not amd_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "No AMD API keys loaded (amd-api-keys.txt empty/missing)"},
+            )
+    elif not await _ensure_model_known(_normalize_model(name)):
+        return JSONResponse(status_code=404, content={"error": f'model "{name}" not found'})
+    d = _ollama_details(name)
+    return {
+        "modelfile": f"FROM {name}",
+        "parameters": "",
+        "template": "",
+        "details": d["details"],
+        "model_info": {"general.architecture": "opencode-free"},
+        "capabilities": d["capabilities"],
+    }
+
+
+def _ollama_messages_to_openai(msgs, system=None) -> list[dict]:
+    """Ollama chat messages -> OpenAI chat messages (images become parts)."""
+    out: list[dict] = []
+    if isinstance(system, str) and system:
+        out.append({"role": "system", "content": system})
+    for m in msgs or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role") or "user"
+        if role not in ("system", "user", "assistant", "tool"):
+            role = "user"
+        content = m.get("content")
+        if content is None:
+            content = ""
+        images = m.get("images") or []
+        if images and isinstance(content, str):
+            parts: list[dict] = []
+            if content:
+                parts.append({"type": "text", "text": content})
+            for img in images:
+                if not isinstance(img, str) or not img:
+                    continue
+                url = img if img.startswith("data:") else f"data:image/jpeg;base64,{img}"
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+            entry: dict = {"role": role, "content": parts or content}
+        elif isinstance(content, str):
+            entry = {"role": role, "content": content}
+        else:
+            entry = {"role": role, "content": json.dumps(content, ensure_ascii=False) if content else ""}
+        if role == "assistant":
+            oai_tcs = []
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
+                args = fn.get("arguments")
+                if isinstance(args, dict):
+                    args = json.dumps(args, ensure_ascii=False)
+                oai_tcs.append({
+                    "id": tc.get("id") or oc_id("call"),
+                    "type": "function",
+                    "function": {"name": fn.get("name") or "", "arguments": args or ""},
+                })
+            if oai_tcs:
+                entry["tool_calls"] = oai_tcs
+            thinking = m.get("thinking")
+            if isinstance(thinking, str) and thinking:
+                entry["reasoning_content"] = thinking
+        if role == "tool" and m.get("tool_call_id"):
+            entry["tool_call_id"] = m["tool_call_id"]
+        out.append(entry)
+    return out
+
+
+def _ollama_tools_to_openai(tools):
+    if not tools:
+        return None
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if "function" in t:
+            out.append(t)
+        else:
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("parameters") or t.get("input_schema") or {},
+                },
+            })
+    return out or None
+
+
+def _ollama_sampling_from(options: dict, body: dict) -> dict:
+    sampling = {}
+    for k in ("temperature", "top_p", "stop"):
+        v = options.get(k, body.get(k))
+        if v is not None:
+            sampling[k] = v
+    return sampling
+
+
+def _ollama_max_tokens(options: dict, body: dict):
+    """Ollama num_predict (-1 = unlimited) -> max_tokens."""
+    for k in ("num_predict", "max_tokens", "max_completion_tokens"):
+        v = options.get(k, body.get(k))
+        if v is None:
+            continue
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            continue
+        if v < 0:
+            return None
+        if v == 0:
+            continue
+        return v
+    return None
+
+
+def _ollama_stream_flag(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(value)
+
+
+def _ollama_think_enabled(think) -> bool:
+    if think is None:
+        return False
+    if isinstance(think, bool):
+        return think
+    if isinstance(think, dict):
+        return True
+    if isinstance(think, str):
+        return think.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(think)
+
+
+def _ollama_effort_body(body: dict, options: dict, think) -> dict:
+    """Merge reasoning-effort knobs for _resolve_muse_effort + Responses sampling."""
+    effort: dict = {}
+    for src in (body, options):
+        if not isinstance(src, dict):
+            continue
+        if isinstance(src.get("reasoning"), dict) and "reasoning" not in effort:
+            effort["reasoning"] = src["reasoning"]
+        if src.get("reasoning_effort") and not effort.get("reasoning_effort"):
+            effort["reasoning_effort"] = src["reasoning_effort"]
+    if isinstance(think, dict) and think.get("effort"):
+        effort["reasoning_effort"] = think["effort"]
+    elif think is False:
+        effort["reasoning_effort"] = "none"
+    for k in ("temperature", "top_p"):
+        if isinstance(options, dict) and options.get(k) is not None:
+            effort[k] = options[k]
+        elif body.get(k) is not None:
+            effort[k] = body[k]
+    return effort
+
+
+def _ollama_status(resp: JSONResponse) -> int:
+    try:
+        return int(resp.status_code)
+    except Exception:
+        return 502
+
+
+def _ollama_message(resp: JSONResponse) -> str:
+    try:
+        data = json.loads(resp.body.decode("utf-8"))
+    except Exception:
+        return "Upstream error"
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        return err.get("message") or "Upstream error"
+    if isinstance(err, str):
+        return err
+    return "Upstream error"
+
+
+async def _ollama_upstream(request, user, model_raw, oai_messages, tools, stream, max_tokens, sampling, effort_body):
+    """Shared Zen/NIM fan-out for the Ollama shim (mirrors chat_completions).
+
+    Returns (kind, payload) where kind is:
+      "sse"   -> payload is an async generator of OpenAI SSE strings
+      "data"  -> payload is a buffered chat.completion dict
+      "error" -> payload is (status_code, message) for an Ollama {"error": ...} body
+    """
+    if is_nvidia_model(model_raw):
+        if not nvidia_keys.ready:
+            return ("error", (503, "No NVIDIA API keys loaded (nvidia-api-keys.txt empty/missing)"))
+        nim_model = nvidia_model_id(model_raw)
+        norm_messages = _normalize_messages(oai_messages) or []
+        req_body = nvidia_request_body(
+            nim_model, norm_messages, stream, tools, None,
+            max_tokens, None, sampling,
+        )
+        if stream:
+            return ("sse", nvidia_stream_with_retry(req_body, user, nim_model))
+        data = await nvidia_request_with_retry(req_body, user, nim_model)
+        if isinstance(data, JSONResponse):
+            return ("error", (_ollama_status(data), _ollama_message(data)))
+        if data is None:
+            return ("error", (502, "Client disconnected"))
+        if not data.get("choices"):
+            return ("error", (502, "Invalid upstream response"))
+        return ("data", data)
+
+    if is_amd_model(model_raw):
+        if not amd_keys.ready:
+            return ("error", (503, "No AMD API keys loaded (amd-api-keys.txt empty/missing)"))
+        amd_model = amd_model_id(model_raw)
+        norm_messages = _normalize_messages(oai_messages) or []
+        req_body = amd_request_body(
+            amd_model, norm_messages, stream, tools, None,
+            max_tokens, None, sampling,
+        )
+        if stream:
+            return ("sse", amd_stream_with_retry(req_body, user, amd_model))
+        data = await amd_request_with_retry(req_body, user, amd_model)
+        if isinstance(data, JSONResponse):
+            return ("error", (_ollama_status(data), _ollama_message(data)))
+        if data is None:
+            return ("error", (502, "Client disconnected"))
+        if not data.get("choices"):
+            return ("error", (502, "Invalid upstream response"))
+        return ("data", data)
+
+    model = _normalize_model(model_raw)
+    if not await _ensure_model_known(model):
+        return ("error", (400, f"Unknown model: {model}. Available: {', '.join(_served_models())}"))
+    session_id = get_session(user, oai_messages)
+    up_messages = _prepare_upstream_messages(session_id, _normalize_messages(oai_messages))
+    req_body, headers = zen_request(model, up_messages, stream, tools, None, session_id, max_tokens, None, sampling)
+
+    if _is_muse_spark(model) or _model_wire_api(model) == "openai-responses":
+        resp_body = _zen_responses_body(
+            model, up_messages, tools,
+            effort=_resolve_muse_effort(model_raw, effort_body),
+            max_tokens=max_tokens,
+            sampling=_responses_sampling_from(effort_body or {}),
+        )
+        gen = _zen_responses_stream_with_retry(request, resp_body, headers, user, oai_messages or [], session_id, model)
+        if stream:
+            return ("sse", gen)
+        data = await _aggregate_upstream_completion(
+            request, resp_body, headers, user, oai_messages or [], session_id, model, gen=gen,
+        )
+        if isinstance(data, JSONResponse):
+            return ("error", (_ollama_status(data), _ollama_message(data)))
+        if data is None:
+            return ("error", (502, "Client disconnected"))
+        return ("data", data)
+
+    if stream:
+        if _needs_buffered_fallback(model, tools, stream):
+            _log(f"[zen] buffered fallback: stream:true -> stream:false upstream (model={model})")
+            buffered_body = dict(req_body)
+            buffered_body["stream"] = False
+            data = await _zen_request_with_retry(request, buffered_body, headers, user, oai_messages or [], session_id, model)
+            if isinstance(data, JSONResponse):
+                return ("error", (_ollama_status(data), _ollama_message(data)))
+            if data is None:
+                return ("error", (502, "Client disconnected"))
+            return ("data", data)
+        return ("sse", _zen_stream_with_retry(request, req_body, headers, user, oai_messages or [], session_id, model))
+
+    data = await _zen_request_with_retry(request, req_body, headers, user, oai_messages or [], session_id, model)
+    if isinstance(data, JSONResponse):
+        return ("error", (_ollama_status(data), _ollama_message(data)))
+    if data is None:
+        return ("error", (502, "Client disconnected"))
+    if not data.get("choices"):
+        return ("error", (502, "Invalid upstream response"))
+    return ("data", data)
+
+
+def _ollama_done_reason(finish) -> str:
+    return "length" if finish == "length" else "stop"
+
+
+def _ollama_tool_args(slot_args: str) -> dict:
+    try:
+        parsed = json.loads(slot_args) if slot_args else {}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def _ollama_ndjson_stream(sse_gen, model_name: str, mode: str, include_thinking: bool):
+    """Fold an OpenAI SSE stream (Zen/NIM/muse) into Ollama NDJSON chunks."""
+    created_at = _ollama_now()
+    content_parts: list[str] = []
+    think_parts: list[str] = []
+    tool_acc: dict[int, dict] = {}
+    finish_reason = None
+    usage = None
+    async for raw in sse_gen:
+        for block in str(raw).split("\n\n"):
+            block = block.strip()
+            if not block.startswith("data:"):
+                continue
+            payload = block[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                piece = json.loads(payload)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if isinstance(piece.get("error"), dict):
+                yield json.dumps({"error": piece["error"].get("message") or "Upstream error"}, ensure_ascii=False) + "\n"
+                return
+            choices = piece.get("choices")
+            if not choices:
+                if isinstance(piece.get("usage"), dict):
+                    usage = piece["usage"]
+                continue
+            ch = choices[0] if isinstance(choices, list) else {}
+            if not isinstance(ch, dict):
+                continue
+            delta = ch.get("delta") or {}
+            if not isinstance(delta, dict):
+                delta = {}
+            text = delta.get("content")
+            if text:
+                content_parts.append(text)
+                if mode == "generate":
+                    yield json.dumps({"model": model_name, "created_at": created_at, "response": text, "done": False}, ensure_ascii=False) + "\n"
+                else:
+                    yield json.dumps({"model": model_name, "created_at": created_at, "message": {"role": "assistant", "content": text}, "done": False}, ensure_ascii=False) + "\n"
+            thinking = delta.get("reasoning_content")
+            if thinking:
+                think_parts.append(thinking)
+                if include_thinking:
+                    if mode == "generate":
+                        yield json.dumps({"model": model_name, "created_at": created_at, "response": "", "thinking": thinking, "done": False}, ensure_ascii=False) + "\n"
+                    else:
+                        yield json.dumps({"model": model_name, "created_at": created_at, "message": {"role": "assistant", "content": "", "thinking": thinking}, "done": False}, ensure_ascii=False) + "\n"
+            for tc in delta.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                idx = tc.get("index", 0)
+                slot = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if isinstance(fn, dict):
+                    if fn.get("name"):
+                        slot["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+            if ch.get("finish_reason"):
+                finish_reason = ch["finish_reason"]
+            u = piece.get("usage")
+            if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                usage = u
+
+    full = "".join(content_parts)
+    done_reason = _ollama_done_reason(finish_reason)
+    if mode == "generate":
+        final: dict = {"model": model_name, "created_at": created_at, "response": full, "done": True, "done_reason": done_reason}
+        if include_thinking and think_parts:
+            final["thinking"] = "".join(think_parts)
+    else:
+        message: dict = {"role": "assistant", "content": full}
+        if include_thinking and think_parts:
+            message["thinking"] = "".join(think_parts)
+        if tool_acc:
+            message["tool_calls"] = [
+                {"function": {"name": tool_acc[idx]["name"], "arguments": _ollama_tool_args(tool_acc[idx]["arguments"])}}
+                for idx in sorted(tool_acc)
+            ]
+        final = {"model": model_name, "created_at": created_at, "message": message, "done": True, "done_reason": done_reason}
+    if isinstance(usage, dict):
+        final["prompt_eval_count"] = usage.get("prompt_tokens") or 0
+        final["eval_count"] = usage.get("completion_tokens") or 0
+    yield json.dumps(final, ensure_ascii=False) + "\n"
+
+
+def _ollama_chat_object(data: dict, model_name: str, include_thinking: bool) -> dict:
+    choice = (data.get("choices") or [{}])[0] or {}
+    msg = choice.get("message") or {}
+    message: dict = {"role": "assistant", "content": msg.get("content") or ""}
+    if include_thinking and msg.get("reasoning_content"):
+        message["thinking"] = msg["reasoning_content"]
+    tcs = []
+    for tc in msg.get("tool_calls") or []:
+        fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+        tcs.append({"function": {"name": fn.get("name") or "", "arguments": _ollama_tool_args(fn.get("arguments") or "")}})
+    if tcs:
+        message["tool_calls"] = tcs
+    out: dict = {
+        "model": model_name,
+        "created_at": _ollama_now(),
+        "message": message,
+        "done": True,
+        "done_reason": _ollama_done_reason(choice.get("finish_reason")),
+    }
+    usage = data.get("usage") or {}
+    if usage:
+        out["prompt_eval_count"] = usage.get("prompt_tokens") or 0
+        out["eval_count"] = usage.get("completion_tokens") or 0
+    return out
+
+
+def _ollama_generate_object(data: dict, model_name: str, include_thinking: bool) -> dict:
+    obj = _ollama_chat_object(data, model_name, include_thinking)
+    out: dict = {
+        "model": model_name,
+        "created_at": obj["created_at"],
+        "response": (obj.get("message") or {}).get("content") or "",
+        "done": True,
+        "done_reason": obj["done_reason"],
+    }
+    if "thinking" in (obj.get("message") or {}):
+        out["thinking"] = obj["message"]["thinking"]
+    if "prompt_eval_count" in obj:
+        out["prompt_eval_count"] = obj["prompt_eval_count"]
+        out["eval_count"] = obj.get("eval_count", 0)
+    return out
+
+
+async def _ollama_json_body(request):
+    """Return (body, None) or (None, error_response)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    if not isinstance(body, dict):
+        return None, JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    return body, None
+
+
+async def ollama_chat(request: Request):
+    new_request_id()
+    user = auth(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+    body, err = await _ollama_json_body(request)
+    if err is not None:
+        return err
+    model_raw = body.get("model") or ""
+    if not model_raw:
+        return JSONResponse(status_code=400, content={"error": "model required"})
+    oai_messages = _ollama_messages_to_openai(body.get("messages") or [], body.get("system"))
+    tools = _ollama_tools_to_openai(body.get("tools"))
+    options = body.get("options") or {}
+    if not isinstance(options, dict):
+        options = {}
+    sampling = _ollama_sampling_from(options, body)
+    max_tokens = _ollama_max_tokens(options, body)
+    stream = _ollama_stream_flag(body.get("stream"), True)
+    think = body.get("think", False)
+    include_thinking = _ollama_think_enabled(think)
+    effort_body = _ollama_effort_body(body, options, think)
+
+    kind, payload = await _ollama_upstream(request, user, model_raw, oai_messages, tools, stream, max_tokens, sampling, effort_body)
+    if kind == "error":
+        status, msg = payload
+        return JSONResponse(status_code=status, content={"error": msg})
+    if kind == "data":
+        return JSONResponse(_ollama_chat_object(payload, str(model_raw), include_thinking))
+    return StreamingResponse(
+        _ollama_ndjson_stream(payload, str(model_raw), "chat", include_thinking),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+async def ollama_generate(request: Request):
+    new_request_id()
+    user = auth(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+    body, err = await _ollama_json_body(request)
+    if err is not None:
+        return err
+    model_raw = body.get("model") or body.get("name") or ""
+    if not model_raw:
+        return JSONResponse(status_code=400, content={"error": "model required"})
+    prompt = body.get("prompt") or ""
+    suffix = body.get("suffix") or ""
+    gen_msgs = []
+    if body.get("system"):
+        gen_msgs.append({"role": "system", "content": str(body["system"])})
+    user_msg: dict = {"role": "user", "content": str(prompt) + str(suffix)}
+    if isinstance(body.get("images"), list) and body["images"]:
+        user_msg["images"] = body["images"]
+    gen_msgs.append(user_msg)
+    oai_messages = _ollama_messages_to_openai(gen_msgs, None)
+    options = body.get("options") or {}
+    if not isinstance(options, dict):
+        options = {}
+    sampling = _ollama_sampling_from(options, body)
+    max_tokens = _ollama_max_tokens(options, body)
+    stream = _ollama_stream_flag(body.get("stream"), True)
+    think = body.get("think", False)
+    include_thinking = _ollama_think_enabled(think)
+    effort_body = _ollama_effort_body(body, options, think)
+
+    kind, payload = await _ollama_upstream(request, user, model_raw, oai_messages, None, stream, max_tokens, sampling, effort_body)
+    if kind == "error":
+        status, msg = payload
+        return JSONResponse(status_code=status, content={"error": msg})
+    if kind == "data":
+        return JSONResponse(_ollama_generate_object(payload, str(model_raw), include_thinking))
+    return StreamingResponse(
+        _ollama_ndjson_stream(payload, str(model_raw), "generate", include_thinking),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
 # ── Routes: OpenAI format ─────────────────────────────────────────
 
 async def list_models(request: Request):
@@ -5709,10 +6437,10 @@ async def list_models(request: Request):
     _sanitize_models_cache()
     data = []
     try:
-        _zen_free_ids: set[str] | None = set(_models_cache)
+        _zen_free_ids: set[str] | None = set(_served_models())
     except Exception:
         _zen_free_ids = None
-    for m in _models_cache:
+    for m in _served_models():
         if not _stealth_admitted(m, _zen_free_ids):
             continue
         entry = {"id": m, "object": "model", "created": 1779000000, "owned_by": "opencode-free"}
@@ -5732,10 +6460,11 @@ async def list_models(request: Request):
             entry["modalities"] = dict(_DEFAULT_MODALITIES)
         data.append(entry)
     # Slash-free picker aliases for OpenCode Zen models (no slash/colon):
-    # expose each alias whose canonical id is actually served.
+    # expose each alias whose canonical id is actually served (blocked
+    # canonicals never appear in _served_models, so their aliases stay hidden).
     _seen_ids = {e["id"] for e in data}
     for alias, canonical in sorted(MODEL_ALIASES.items()):
-        if canonical in _seen_ids and alias not in _seen_ids:
+        if canonical in _seen_ids and alias not in _seen_ids and not _is_blocked_model(canonical):
             data.append({"id": alias, "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
     # NVIDIA NIM models exposed behind the nvidia/ (and nvimin/) prefix.
     if nvidia_keys.ready:
@@ -5839,7 +6568,7 @@ async def chat_completions(request: Request):
     if not await _ensure_model_known(model):
         return JSONResponse(
             status_code=400,
-            content={"error": {"message": f"Unknown model: {model}. Available: {', '.join(_models_cache)}"}},
+            content={"error": {"message": f"Unknown model: {model}. Available: {', '.join(_served_models())}"}},
         )
 
     session_id = get_session(user, messages)
@@ -6054,7 +6783,7 @@ async def messages(request: Request):
     if not await _ensure_model_known(model):
         return JSONResponse(
             status_code=400,
-            content={"type": "error", "error": {"type": "invalid_request_error", "message": f"Unknown model: {model}. Available: {', '.join(_models_cache)}"}},
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": f"Unknown model: {model}. Available: {', '.join(_served_models())}"}},
         )
 
     oai_messages, tools = anthropic_to_openai(body)
@@ -6406,7 +7135,7 @@ async def handle_responses(request: Request):
         if not await _ensure_model_known(zen_model):
             return JSONResponse(
                 status_code=400,
-                content={"error": {"message": f"Unknown model: {zen_model}. Available: {', '.join(_models_cache)}"}},
+                content={"error": {"message": f"Unknown model: {zen_model}. Available: {', '.join(_served_models())}"}},
             )
         messages = _normalize_messages(messages)
         session_id = get_session(user, messages)
@@ -6547,21 +7276,25 @@ def _extract_tools(body):
             })
     return out or None
 
+
 def _map_model(model: str) -> str:
     """Resolve legacy role aliases against the DISCOVERED model list only.
 
     No model ids are hardcoded: aliases pick from whatever the Zen API
     currently exposes, falling back to the first discovered free model.
+    Blocklisted ids are excluded, so the default/fast/smart fallbacks never
+    land on an always-failing model.
     """
-    if not _models_cache:
+    served = _served_models() or _models_cache
+    if not served:
         return _normalize_model(model)
     m = model.lower().replace("-", "").replace("_", "")
     if m == "opencodedefault":
-        return _models_cache[0]
+        return served[0]
     if m == "opencodefast":
-        return next((x for x in _models_cache if "flash" in x or "lightning" in x or "mini" in x), _models_cache[0])
+        return next((x for x in served if "flash" in x or "lightning" in x or "mini" in x), served[0])
     if m == "opencodesmart":
-        return next((x for x in _models_cache if "ultra" in x or "pro" in x or "smart" in x), _models_cache[0])
+        return next((x for x in served if "ultra" in x or "pro" in x or "smart" in x), served[0])
     return _normalize_model(model)
 
 
@@ -6584,7 +7317,7 @@ async def health(request: Request):
         "nvidia_models": [f"nvidia/{m}" for m in nvidia_models()] if nvidia_keys.ready else [],
         "amd_keys": len(amd_keys.keys) if amd_keys.ready else 0,
         "amd_models": [f"amd/{m}" for m in amd_models()] if amd_keys.ready else [],
-        "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
+        "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models", "/api/tags", "/api/show", "/api/chat", "/api/generate"],
     }
 
 
@@ -6593,6 +7326,13 @@ app.add_route("/v1/chat/completions", _json(chat_completions), methods=["POST"])
 app.add_route("/v1/messages", _json(messages), methods=["POST"])
 app.add_route("/v1/responses", _json(handle_responses), methods=["POST"])
 app.add_route("/health", _json(health), methods=["GET"])
+app.add_route("/api/tags", _json(ollama_tags), methods=["GET"])
+app.add_route("/api/version", _json(ollama_version), methods=["GET"])
+app.add_route("/api/ps", _json(ollama_ps), methods=["GET"])
+app.add_route("/api/show", _json(ollama_show), methods=["POST"])
+app.add_route("/api/chat", ollama_chat, methods=["POST"])
+app.add_route("/api/generate", ollama_generate, methods=["POST"])
+app.add_route("/", ollama_root, methods=["GET"])
 
 
 # ── Start ─────────────────────────────────────────────────────────
@@ -6607,6 +7347,7 @@ if __name__ == "__main__":
         print("  No SOCKS5 proxy configured (use --proxy, --proxy-pool, SOCKS5_PROXY, or OPENCODE_PROXY_POOL=true)")
     print("  OpenAI:    POST /v1/chat/completions")
     print("  Anthropic: POST /v1/messages")
+    print("  Ollama:    GET  /api/tags, POST /api/chat|generate")
     print("  Models:    GET  /v1/models")
     print("  Health:    GET  /health")
 

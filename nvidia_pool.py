@@ -237,8 +237,13 @@ class NVIDIAKeyPool:
                 return True
         except Exception:
             pass
-        msg = str(exc)
-        if "AbortError" in msg or "aborted" in msg.lower() or "client disconnect" in msg.lower():
+        msg = str(exc).lower()
+        # Upstream-side drops (proxy exit -> upstream died) must never count as
+        # client aborts: httpx RemoteProtocolError("Server disconnected without
+        # sending a response") contains "disconnect" but means the TUNNEL broke.
+        if "server disconnect" in msg or "without sending a response" in msg or "peer closed connection" in msg:
+            return False
+        if "AbortError" in msg or "aborted" in msg or "client disconnect" in msg:
             return True
         return False
 

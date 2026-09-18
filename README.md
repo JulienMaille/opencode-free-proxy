@@ -61,9 +61,8 @@ The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/mode
 > `Error from provider (Console): Upstream request failed: Model is unavailable.`;
 > `north-mini-code-free` — opaque `400 Provider returned error` on multi-turn
 > tool calls; and `ling-3.0-flash-free` — no longer on the free tier upstream
-> (404: "use this slug instead: inclusionai/ling-3.0-flash"). If your client
-> configures models by hand, drop them; the proxy itself serves whatever the
-> Zen API returns.
+> (404: "use this slug instead: inclusionai/ling-3.0-flash"). These three ids are
+> filtered from discovery and every listing/request path, so clients never see them.
 
 ## API
 
@@ -100,12 +99,34 @@ curl http://localhost:6446/v1/messages \
   }'
 ```
 
+### Ollama format — `POST /api/chat`, `POST /api/generate`
+
+```bash
+curl http://localhost:6446/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "big-pickle",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+`GET /api/tags` mirrors `/v1/models` in Ollama's shape; `GET /api/version`,
+`GET /api/ps`, `POST /api/show`, and `GET /` (`Ollama is running`) are also
+served. `stream` defaults to `true` (Ollama convention) with NDJSON chunks;
+pass `"stream": false` for a single JSON object. The `think` flag maps to the
+muse reasoning effort (`false` disables thinking); `options.num_predict`
+maps to `max_tokens`. Structured output via `format` is not translated.
+
+
 ### Other endpoints
 
 | Method | Path | What |
 |--------|------|------|
 | `GET` | `/v1/models` | List models (includes limits + modalities) |
 | `GET` | `/health` | Health + version |
+| `GET` | `/api/tags` | List models (Ollama shape) |
+| `POST` | `/api/chat` | Chat (Ollama shape, NDJSON stream) |
+| `POST` | `/api/generate` | Single-prompt completion (Ollama shape) |
 
 ### Auth
 

@@ -857,6 +857,37 @@ class ProxyPool:
             self.current = None
         return True
 
+    def report_free_tier_block(self, addr: str | None = None) -> bool:
+        """403 FreeTierError: request-shaped gate signal, not an exit health signal.
+
+        Log evidence shows the gate is request-sticky, not exit-sticky: the
+        same request id 403s on every rotated exit (``proxy.log`` 21:07–21:08
+        ``req=6471b37d`` gated on 4 exits, 21:19–21:20 ``req=592f7836`` on 6,
+        neither ever OK), while OTHER requests OK on those same exits seconds
+        apart (``b526ecc5`` OK on 68.71.252.38:4145 one second after
+        ``6471b37d`` gated there; ``122d95d7``/``9281b2be`` OK on
+        68.71.251.134:4145 around ``592f7836``'s gate). The exit did nothing
+        wrong — blacklisting it for 120m burns healthy exits for a
+        request-shaped rejection.
+
+        So NOTHING is penalized: no ``cooling_until``, no blacklist, no
+        rate-limit, no ``consecutive_failures`` increment, no success/fail
+        counter change, no transport-failure count, and the pooled client is
+        kept (no reconnect churn). Just clears the sticky ``current`` so the
+        next ``select()`` picks the next healthy entry and the request can
+        retry elsewhere.
+
+        Returns True (caller should roll to the next entry and retry, subject
+        to the server-side consecutive-gate fail-fast).
+        """
+        target = addr or (self.current and self.current["address"])
+        if not target:
+            return True
+        _log(f"FreeTier gate via {target}; rotating (no penalty — request-shaped, not exit health)")
+        if self.current and self.current["address"] == target:
+            self.current = None
+        return True
+
     def health_snapshot(self, now: float | None = None) -> dict:
         """Minimal pool health snapshot for the server watchdog gate.
 
@@ -947,8 +978,13 @@ class ProxyPool:
         name = type(exc).__name__
         if name in ("AbortError", "CancelledError", "Cancel", "ClientDisconnect", "Disconnect"):
             return True
-        msg = str(exc)
-        if "AbortError" in msg or "aborted" in msg.lower() or "client disconnect" in msg.lower():
+        msg = str(exc).lower()
+        # Upstream-side drops (proxy exit -> upstream died) must never count as
+        # client aborts: httpx RemoteProtocolError("Server disconnected without
+        # sending a response") contains "disconnect" but means the TUNNEL broke.
+        if "server disconnect" in msg or "without sending a response" in msg or "peer closed connection" in msg:
+            return False
+        if "AbortError" in msg or "aborted" in msg or "client disconnect" in msg:
             return True
         return False
 
