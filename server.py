@@ -871,6 +871,24 @@ def _is_bare_internal_error(status_code: int, data: dict | None = None, body: st
     return len((body or "").strip()) < 200
 
 
+def _is_backend_unavailable_error(status_code: int, data: dict | None = None, body: str = "") -> bool:
+    """Recognize the model-backend-down 503: Zen Console returns [backend_unavailable]
+    when the model's upstream backend is temporarily down. Identical on every proxy
+    exit (same upstream), so rotating/cooldowns only burn attempts and penalize
+    healthy exits. Fail fast and let the caller retry on its own timing."""
+    if status_code != 503:
+        return False
+    text = (body or "").lower()
+    if "[backend_unavailable]" not in text and "backend_unavailable" not in text:
+        msg = ""
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict):
+            msg = f"{error.get('message') or ''} {error.get('type') or ''}"
+        if "backend_unavailable" not in msg.lower():
+            return False
+    return True
+
+
 def _is_degraded_error(data: dict | None = None, body: str = "") -> bool:
     """Recognize NVIDIA NIM 'DEGRADED function cannot be invoked' 400s.
 
@@ -2766,6 +2784,25 @@ async def _zen_responses_stream_with_retry(
                 await resp.aclose()
                 yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
                 return
+            if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] backend unavailable upstream ([backend_unavailable]); failing fast (model backend down, not the exit)")
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.release(proxy_addr)
+                await resp.aclose()
+                yield _openai_stream_error(err_msg + " (backend temporarily unavailable; try again shortly)", "upstream_error", str(resp.status_code))
+                return
+            if _is_bare_internal_error(resp.status_code, data, body_text):
+                # Same model-down class as backend_unavailable: the bare
+                # "Internal server error" 500 repeats identically on every
+                # exit (observed for muse-spark). Responses path lacked the
+                # fail-fast the other three paths have — add it here so these
+                # don't get cooldown/rotate treatment on healthy exits.
+                _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
+                if PROXY_POOL_ENABLED and proxy_addr:
+                    proxy_pool.release(proxy_addr)
+                await resp.aclose()
+                yield _openai_stream_error(err_msg + " (model appears down upstream; try another free model)", "upstream_error", str(resp.status_code))
+                return
             if _is_retriable_status(resp.status_code) and PROXY_POOL_ENABLED and not direct_only and attempt >= attempts:
                 # Escalating 5xx/504 cooldown for this exit; 504 fast-breaks
                 # (False = stop cycling the pool, surface the error now).
@@ -3540,6 +3577,15 @@ async def _zen_request_with_retry(
                         status_code=403,
                         content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
                     )
+                if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                    # Model backend down upstream: identical on every proxy exit,
+                    # so fail fast with a hint instead of cooldown+rotate that
+                    # penalizes healthy exits. Release handled by the loop finally.
+                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] backend unavailable upstream ([backend_unavailable]); failing fast (model backend down, not the exit)")
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": {"message": err_msg + " (backend temporarily unavailable; try again shortly)", "type": "upstream_error"}},
+                    )
                 # Not a proxy failure: 4xx/5xx are upstream or request errors that
                 # repeat identically on every proxy, so never blacklist for them.
                 # Fail fast on deterministic errors (all 4xx except retriable
@@ -3945,6 +3991,10 @@ async def _zen_stream_with_retry(
                 _log("[zen] Context limit error; not retrying on another proxy")
             await resp.aclose()
             last_status = resp.status_code
+            if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] backend unavailable upstream ([backend_unavailable]); failing fast (model backend down, not the exit)")
+                yield _openai_stream_error(err_msg + " (backend temporarily unavailable; try again shortly)", "upstream_error", str(resp.status_code))
+                return
             if _is_bare_internal_error(resp.status_code, data, body_text):
                 _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
                 err_msg = f"{err_msg} (model appears down upstream; try another free model)"
@@ -4399,6 +4449,10 @@ async def _zen_stream_anthropic_with_retry(
                         return
                     if is_context_exceeded:
                         _log("[zen] Context limit error; not retrying on another proxy")
+                    if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] backend unavailable upstream ([backend_unavailable]); failing fast (model backend down, not the exit)")
+                        yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg + " (backend temporarily unavailable; try again shortly)"}})
+                        return
                     if _is_bare_internal_error(resp.status_code, data, body_text):
                         _log(f"[zen] Model {model} appears down upstream (bare 500); failing fast — try another model")
                         err_msg = f"{err_msg} (model appears down upstream; try another free model)"
