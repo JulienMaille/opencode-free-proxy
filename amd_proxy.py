@@ -11,11 +11,13 @@ _AMD_PREFIXES = ("amd/", "radeon/")
 
 # Canonical TokenFactory model IDs, verbatim as returned by GET /models
 # (source-of-truth is the live endpoint; this hardcoded list is the
-# 2026-09-14 fallback from models.dev). Do NOT prepend amd/ here.
+# 2026-09-17 fallback verified live). Do NOT prepend amd/ here.
 _AMD_CANONICAL = (
     "DeepSeek-V4-Flash",
     "DeepSeek-V4-Flash-Vision-Exp",
     "DeepSeek-V4.1-Flash",
+    "GLM-5.3-Flash",
+    "MinerU2.5-Pro",
     "MiniCPM5-2B",
     "Qwen3.8-27B",
     "Qwen3.8-Flash-Next",
@@ -47,6 +49,14 @@ _AMD_ALIASES = {
     "qwen3.8flashnext": "Qwen3.8-Flash-Next",
     "qwen38flashnext": "Qwen3.8-Flash-Next",
     "Qwen3.8-Flash-Next": "Qwen3.8-Flash-Next",
+    # GLM-5.3-Flash (returned 2026-09-17 live)
+    "glm5.3flash": "GLM-5.3-Flash",
+    "glm53flash": "GLM-5.3-Flash",
+    "GLM-5.3-Flash": "GLM-5.3-Flash",
+    # MinerU2.5-Pro (returned 2026-09-17 live)
+    "mineru2.5pro": "MinerU2.5-Pro",
+    "mineru25pro": "MinerU2.5-Pro",
+    "MinerU2.5-Pro": "MinerU2.5-Pro",
     # Legacy / alias IDs seen in mirrors / hackathon
     "deepseekv4flash0731": "DeepSeek-V4-Flash",
     "DeepSeek-V4-Flash-0731": "DeepSeek-V4-Flash",

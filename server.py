@@ -173,6 +173,7 @@ def _json(fn):
     return wrapper
 
 PORT = args.port or int(os.environ.get("PORT", "6446"))
+HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.18.31"
 PROXY_VERSION = "19"
 # Native OpenCode project id: sha1 hex of "git-remote:<normalized remote>".

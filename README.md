@@ -240,6 +240,8 @@ Supported canonical IDs (also work as `amd/<id>`):
 - `amd/DeepSeek-V4-Flash` (Cline `defaultModelId`)
 - `amd/DeepSeek-V4-Flash-Vision-Exp`
 - `amd/DeepSeek-V4.1-Flash`
+- `amd/GLM-5.3-Flash`
+- `amd/MinerU2.5-Pro`
 - `amd/MiniCPM5-2B`
 - `amd/Qwen3.8-27B`
 - `amd/Qwen3.8-Flash-Next`
