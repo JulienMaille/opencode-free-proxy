@@ -40,20 +40,20 @@ providers:
       requiresReasoningContentForToolCalls: true
       allowsSyntheticReasoningContentForToolCalls: false
     models:
-      - id: big-pickle
-        name: Big Pickle
+      - id: space-bunny-free
+        name: Space Bunny Free
         reasoning: true
-        input: [text]
+        input: [text, image]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 1048576
+        maxTokens: 524288
+      - id: mimo-v2.6-flash-free
+        name: MiMo V2.6 Flash Free
+        reasoning: true
+        input: [text, image]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 200000
         maxTokens: 32000
-      - id: nemotron-3.5-lightning-free
-        name: Nemotron 3.5 Lightning Free
-        reasoning: true
-        input: [text]
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        contextWindow: 1000000
-        maxTokens: 128000
       - id: mimo-v2.5-free
         name: MiMo V2.5 Free
         reasoning: true
@@ -61,34 +61,62 @@ providers:
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 200000
         maxTokens: 32000
+      - id: muse-spark-1.3-contributor-free
+        name: muse-spark-1.3-contributor-free
+        reasoning: true
+        input: [text, image]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 1048576
+        maxTokens: 131072
+      - id: muse-spark-1.2-contributor-free
+        name: muse-spark-1.2-contributor-free
+        reasoning: true
+        input: [text, image]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 1048576
+        maxTokens: 131072
+      - id: nemotron-3.5-lightning-free
+        name: nemotron-3.5-lightning-free
+        reasoning: true
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 262144
+        maxTokens: 262144
       - id: nemotron-3-ultra-free
-        name: Nemotron 3 Ultra Free
+        name: nemotron-3-ultra-free
         reasoning: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 1000000
         maxTokens: 128000
-      - id: laguna-s-2.1-free
-        name: Laguna S 2.1 Free
+      - id: ling-3.0-flash-fin-free
+        name: ling-3.0-flash-fin-free
         reasoning: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        contextWindow: 256000
+        contextWindow: 262144
+        maxTokens: 32768
+      - id: big-pickle
+        name: Big Pickle
+        reasoning: true
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 200000
         maxTokens: 32000
-      - id: longcat-2.0-free
-        name: LongCat 2.0 Free
+      - id: jev-1.13-free
+        name: jev-1.13-free
         reasoning: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        contextWindow: 1000000
-        maxTokens: 131072
+        contextWindow: 128000
+        maxTokens: 16384
 ```
 
 Notes on the `compat` knobs (validated against the Zen gateway behavior the proxy fronts):
 
 - `auth: none` — the proxy doesn't validate client auth, so omp resolves to its keyless sentinel and sends no `Authorization` header. Don't set `apiKey` here.
 - `supportsDeveloperRole: false` — the upstream rejects the newer `developer` role (only `system`/`user`/`assistant`/`tool`). omp sends `system` directly; the proxy also rewrites `developer` → `system` as a safety net.
-- `reasoningContentField: reasoning_content` + `requiresReasoningContentForToolCalls: true` + `allowsSyntheticReasoningContentForToolCalls: false` — opencode-zen 400s follow-up requests when a prior assistant tool-call turn lacks exact `reasoning_content`; Big Pickle, DeepSeek-family and MiMo reject synthetic placeholder values, hence the false.
+- `reasoningContentField: reasoning_content` + `requiresReasoningContentForToolCalls: true` + `allowsSyntheticReasoningContentForToolCalls: false` — opencode-zen 400s follow-up requests when a prior assistant tool-call turn lacks exact `reasoning_content`; MiMo and DeepSeek-family reject synthetic placeholder values, hence the false.
 - `supportsForcedToolChoice: false` — any model in thinking mode rejects forced `tool_choice` (`Thinking mode does not support this tool_choice`, upstream 400). Tell omp not to hard-force a single tool.
 - `supportsUsageInStreaming: false` — the proxy ignores `stream_options.include_usage`; don't ask for streamed usage.
 - `maxTokensField: max_tokens` — the proxy accepts both, `max_tokens` is the safest.
@@ -96,42 +124,44 @@ Notes on the `compat` knobs (validated against the Zen gateway behavior the prox
 
 ## 2. Default model roles — `~/.omp/agent/config.yml`
 
-Only Big Pickle is trusted end-to-end, so every role points at it with a per-role reasoning level (`low`/`high`/`max`). Big Pickle is always-thinking, so there is no `off` — `low` is the floor for lightweight roles. `vision` is the exception: Big Pickle is text-only, so it uses the image-capable MiMo.
+MiMo V2.6 Flash Free is the single model for all roles. A YAML anchor
+(`&model`) defines it once; every role references `*model` to avoid
+duplication. Change the anchor value and every role follows.
 
 ```yaml
+# Change model+effort here; all roles reference the anchor.
+_model: &model opencode-local/space-bunny-free:auto
+
 modelRoles:
-  default: opencode-local/big-pickle:high
-  smol: opencode-local/big-pickle:low
-  slow: opencode-local/big-pickle:max
-  plan: opencode-local/big-pickle:max
-  vision: opencode-local/mimo-v2.5-free:high
-  designer: opencode-local/big-pickle:high
-  commit: opencode-local/big-pickle:low
-  tiny: opencode-local/big-pickle:low
-  task: opencode-local/big-pickle:high
-  advisor: opencode-local/big-pickle:high
+  default: *model
+  vision: *model
+  reasoning: *model
+  fast: opencode-local/mimo-v2.6-flash-free:auto
 cycleOrder:
-  - smol
   - default
-  - slow
   - vision
-  - plan
+  - reasoning
+  - fast
+defaultThinkingLevel: auto
 symbolPreset: unicode
 theme:
-  dark: titanium
-setupVersion: 1
+  dark: win11
+  light: win11
+setupVersion: 2
+composer:
+  shape: box
 ```
 
-Pre-assigning every role avoids oh-my-pi's first-run model picker. The `:low`/`:high`/`:max` suffixes set per-role reasoning `effort` (the proxy accepts `reasoning_effort`): `max` for planning/deep work (`plan`, `slow`), `high` for the default workload (`default`, `designer`, `task`, `advisor`), `low` for quick/background tasks (`smol`, `commit`, `tiny`).
+Pre-assigning every role avoids oh-my-pi's first-run model picker. Space Bunny Free has the best specs: 1M context, 512K output, vision. The `:auto` suffix lets the classifier pick the right thinking effort per turn. To vary effort per role, use `:low`/`:high`/`:max` instead.
 
 ## 3. Verify
 
 ```powershell
-# list models (should show opencode-local with 6 entries)
+# list models (should show opencode-local entries)
 omp models
 
 # one-shot prompt through the proxy
-omp -p --model "opencode-local/big-pickle" "hello"
+omp -p --model "opencode-local/mimo-v2.6-flash-free" "hello"
 ```
 
 Start the proxy on `http://127.0.0.1:6446` before using omp.

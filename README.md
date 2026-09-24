@@ -48,13 +48,12 @@ python server.py --port 8080 --proxy socks5://127.0.0.1:9150
 
 The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/models`) and enriched with context limits / modalities from `models.dev`. It refreshes every 5 hours. Typical free models:
 
-- `muse-spark-1.3-contributor-free` / `muse-spark-1.2-contributor-free` (routed to `/zen/v1/responses` — Zen does not serve Muse Spark on chat/completions; requests are translated to the Responses API and translated back)
-- `nemotron-3.5-lightning-free`
-- `mimo-v2.5-free` (only one that also accepts image/audio/video input)
-- `nemotron-3-ultra-free`
-- `laguna-s-2.1-free`
-- `longcat-2.0-free`
+- `space-bunny-free` (text + image, 1M context, 512K output — best specs)
+- `mimo-v2.6-flash-free` / `mimo-v2.5-free` (text + image, reasoning)
+- `muse-spark-1.3-contributor-free` / `muse-spark-1.2-contributor-free` (text + image, routed to `/zen/v1/responses`)
+- `nemotron-3.5-lightning-free` / `nemotron-3-ultra-free` (text, reasoning)
 - `big-pickle` (reasoning model, text-only)
+- `jev-1.13-free`, `ling-3.0-flash-fin-free` (auto-discovered)
 
 > Removed from the curated set (still auto-discovered if the Zen API lists them):
 > `deepseek-v4-flash-free` — listed by the Zen API but currently returns
@@ -358,15 +357,15 @@ providers:
         maxTokens: 128000
 ```
 
-then point roles at models with a `:low`/`:high`/`:max` reasoning suffix:
+then point roles at models with a `:low`/`:high`/`:max`/`:auto` reasoning suffix:
 
 ```yaml
 modelRoles:
-  default: opencode-local/nemotron-3.5-lightning-free:high
-  vision: opencode-local/mimo-v2.5-free:high
+  default: opencode-local/space-bunny-free:auto
+  vision: opencode-local/space-bunny-free:auto
 ```
 
-NVIDIA models ride the same provider (`opencode-local/nvidia/kimi-k3:high`).
+NVIDIA models ride the same provider (`opencode-local/nvidia/kimi-k3:auto`).
 
 ## License
 

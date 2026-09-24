@@ -1079,8 +1079,11 @@ _DEFAULT_LIMIT = {"context": 128000, "output": 16384, "contextWindow": 128000, "
 # Metadata-present path gates on models.dev modalities explicitly; only the
 # unknown-model fallback uses this.
 _DEFAULT_MODALITIES = {"input": ["text"], "output": ["text"]}
-# Parallel discovery deadline (~3s combined for Zen + models.dev).
-_DISCOVERY_DEADLINE_SECS = 3.5
+# Parallel discovery deadline: both Zen + models.dev run concurrently, so
+# wall-clock = max(Zen, models.dev). Individual httpx timeout=10 guards each
+# request; this outer bound must be larger to avoid killing a healthy fetch
+# while the other is still in-flight (especially through SOCKS5 proxies).
+_DISCOVERY_DEADLINE_SECS = 15
 # Timestamp (epoch secs) of the last successful discovery snapshot; None until
 # the first success. Never cleared on empty/failed refreshes (staleness signal).
 _models_checked_at: float | None = None
@@ -1212,7 +1215,7 @@ async def _fetch_free_models():
                 return
             r = zen_res
             if isinstance(r, BaseException) or r is None:
-                _log(f"[models] Zen API fetch failed ({r!r} if error), keeping cached models")
+                _log(f"[models] Zen API fetch failed: {r!r}, keeping cached models")
                 return
             if getattr(r, "status_code", None) != 200:
                 _log(f"[models] Zen API returned {getattr(r, 'status_code', '?')}, keeping cached models")
@@ -1401,6 +1404,9 @@ MODEL_ALIASES: dict[str, str] = {
     "longcat-2.0": "longcat-2.0-free",
     "hy3": "hy3-free",
     "ling-flash": "ling-3.0-flash-fin-free",
+    "mimo-v2.6": "mimo-v2.6-flash-free",
+    "mimo-v2.6-flash": "mimo-v2.6-flash-free",
+    "jev": "jev-1.13-free",
 }
 
 
