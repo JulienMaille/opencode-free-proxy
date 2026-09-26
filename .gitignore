@@ -20,6 +20,7 @@ icon.ico
 icon_preview.png
 nvidia-api-keys.txt
 amd-api-keys.txt
+cline-api-keys.txt
 # key-hunt results and key-test utilities contain REAL nvapi-* keys; never commit
 results/
 test_keys_proxy.py

@@ -36,6 +36,9 @@ from nvidia_proxy import is_nvidia_model, nvidia_model_id, nvidia_models
 from amd_pool import pool as amd_keys
 from amd_proxy import is_amd_model, amd_model_id, amd_models
 
+from cline_pool import pool as cline_keys
+from cline_proxy import is_cline_model, cline_model_id, cline_models
+
 _BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
 # ── CLI args ───────────────────────────────────────────────────────
@@ -175,7 +178,7 @@ def _json(fn):
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
 OC_VERSION = "1.18.31"
-PROXY_VERSION = "19"
+PROXY_VERSION = "20"
 # Native OpenCode project id: sha1 hex of "git-remote:<normalized remote>".
 # The console/gate inspects x-opencode-project; the real CLI hashes the
 # user's project remote (verified against upstream packages/core/project.ts).
@@ -2013,6 +2016,27 @@ def _report_amd_status(key: str | None, status: int | None) -> bool:
         return True
 
 
+def _report_cline_status(key: str | None, status: int | None) -> bool:
+    """Record an upstream HTTP status for escalating 5xx/504 key cooldown.
+
+    Delegates to cline_keys.report_http_status (429 keeps its dedicated
+    report_capped/report_rate_limit sites). Returns True if the caller
+    should roll to the next key, False on 504 fast-break.
+    """
+    if not key or status is None:
+        return True
+    try:
+        code = int(status)
+    except Exception:
+        return True
+    if code == 429:
+        return True  # dedicated report_capped path owns 429
+    try:
+        return cline_keys.report_http_status(key, code)
+    except Exception:
+        return True
+
+
 def _log_direct_fallback(model, status):
     """Loud log line whenever the gated post-exhaustion direct fetch fires."""
     _log(f"[zen] DIRECT FALLBACK [{model}]: pool exhausted on retriable {status}; one no-proxy fetch (server IP exposed)")
@@ -2214,6 +2238,14 @@ _AMD_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
 def _amd_sampling_from(body: dict) -> dict:
     """AMD TokenFactory mirrors the NVIDIA sampling surface (reasoning_effort)."""
     return {k: body[k] for k in _AMD_SAMPLING_KEYS if body.get(k) is not None}
+
+
+_CLINE_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
+
+
+def _cline_sampling_from(body: dict) -> dict:
+    """Cline mirrors the NVIDIA/AMD sampling surface (reasoning_effort)."""
+    return {k: body[k] for k in _CLINE_SAMPLING_KEYS if body.get(k) is not None}
 
 
 def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tokens=None, max_completion_tokens=None, sampling: dict | None = None):
@@ -5661,6 +5693,565 @@ async def amd_stream_with_retry(
     )
 
 
+# ── Cline direct transport (mirrors AMD) ──
+
+# Fail-fast: if this many *consecutive* 429s happen without a single key
+# succeeding, the whole pool is saturated with rate limits. Returning a clear
+# 429 to the client beats silently looping every key with backoff for minutes
+# (which looks like "thinking" to the client). A "consecutive" run is broken by
+# any success OR any non-429 (e.g. a socket error that still tries the pool).
+CLINE_POOL_429_FAILFAST = 12
+
+# Dynamic discovery cache for GET /models on the Cline endpoint.
+# _CLINE_DYNAMIC_IDS holds verbatim upstream IDs (no cline/ prefix); a 0.0
+# stamp means "never fetched successfully". Never wiped on empty/failure —
+# the hardcoded cline_models() fallback always applies. Note the live
+# endpoint omits the cline-pass/* IDs, so the static fallback is mandatory:
+# dynamic IDs are MERGED with it, never a replacement.
+_CLINE_DYNAMIC_IDS: list[str] = []
+_CLINE_DYNAMIC_AT: float = 0.0
+_CLINE_DYNAMIC_TTL = 3600.0
+
+# Identity headers every Cline request must carry (desktop-client handshake).
+_CLINE_CLIENT_TYPE = "cline-desktop"
+_CLINE_USER_AGENT = "Cline/3.5.54"
+
+# Hint appended when Cline reports an empty balance (402): the key exists but
+# needs a top-up or a subscription at app.cline.bot.
+_CLINE_TOP_UP_HINT = " (empty balance — top up at app.cline.bot / not subscribed)"
+
+
+def cline_request_body(model, messages, stream, tools, tool_choice, max_tokens=None, max_completion_tokens=None, sampling=None):
+    """Build a standard OpenAI-compatible body for the Cline endpoint.
+
+    Cline is OpenAI-compatible for /chat/completions; like AMD we only
+    normalize roles and don't inject any reasoning_content.
+    """
+    body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
+    if tools:
+        body["tools"] = tools
+    if tool_choice:
+        if tool_choice in ("auto", "none"):
+            body["tool_choice"] = tool_choice
+        else:
+            body["tool_choice"] = "auto"
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    if max_completion_tokens is not None:
+        body["max_completion_tokens"] = max_completion_tokens
+    if sampling:
+        body.update(sampling)
+    return body
+
+
+def _cline_headers(key: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+        "X-CLIENT-TYPE": _CLINE_CLIENT_TYPE,
+        "User-Agent": _CLINE_USER_AGENT,
+    }
+
+
+def _cline_client(streaming: bool):
+    from cline_pool import (
+        CLINE_BASE_URL,
+        CLINE_CONNECT_TIMEOUT,
+        CLINE_READ_TIMEOUT,
+        CLINE_STREAM_READ_TIMEOUT,
+    )
+    # trust_env=False: Cline calls go directly to api.cline.bot and must
+    # NOT be routed through the SOCKS proxy pool / system HTTP proxy.
+    return httpx.AsyncClient(
+        base_url=CLINE_BASE_URL,
+        timeout=httpx.Timeout(
+            connect=CLINE_CONNECT_TIMEOUT,
+            read=CLINE_STREAM_READ_TIMEOUT if streaming else CLINE_READ_TIMEOUT,
+            write=CLINE_STREAM_READ_TIMEOUT if streaming else CLINE_READ_TIMEOUT,
+            pool=CLINE_CONNECT_TIMEOUT,
+        ),
+        proxy=None,
+        trust_env=False,
+    )
+
+
+def _cline_rate_limit_response(err_msg: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": err_msg + " (cline key rate limit)",
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded",
+            }
+        },
+    )
+
+
+def _cline_balance_response(err_msg: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=402,
+        content={
+            "error": {
+                "message": err_msg + _CLINE_TOP_UP_HINT,
+                "type": "billing_error",
+                "code": "insufficient_balance",
+            }
+        },
+    )
+
+
+async def _cline_fetch_dynamic_ids() -> list[str]:
+    """GET the Cline /models list with a pooled key (dynamic discovery).
+
+    Returns the merged static-fallback + verbatim upstream IDs on success;
+    on any failure (or empty pool) returns the static cline_models()
+    fallback (merged with previously cached dynamics when present). Never
+    wipes the cached dynamic list on failure — the hardcoded fallback
+    (which carries the cline-pass/* IDs the live endpoint omits) always
+    applies.
+    """
+    global _CLINE_DYNAMIC_IDS, _CLINE_DYNAMIC_AT
+    now = time.time()
+    if _CLINE_DYNAMIC_IDS and now - _CLINE_DYNAMIC_AT < _CLINE_DYNAMIC_TTL:
+        return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+    if not cline_keys.ready:
+        return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+    key = cline_keys.select()
+    if key is None:
+        return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+    client = _cline_client(streaming=False)
+    try:
+        try:
+            resp = await client.get("/models", headers=_cline_headers(key))
+        except Exception as e:
+            _log(f"[cline] Dynamic /models fetch failed: {_exc_desc(e)}")
+            return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+        try:
+            raw = await resp.aread()
+        except Exception as e:
+            _log(f"[cline] Dynamic /models read failed: {_exc_desc(e)}")
+            return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+        if resp.status_code >= 400:
+            _log(f"[cline] Dynamic /models HTTP {resp.status_code}")
+            if resp.status_code in (401, 403):
+                cline_keys.report_capped(key, "", raw.decode("utf-8", errors="replace") if raw else "")
+            else:
+                _report_cline_status(key, resp.status_code)
+            return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+        ids: list[str] = []
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, list):
+            for entry in data:
+                mid = entry.get("id") if isinstance(entry, dict) else None
+                if mid:
+                    ids.append(str(mid))
+        if ids:
+            cline_keys.report_success(key)
+            _CLINE_DYNAMIC_IDS = sorted(set(ids))
+            _CLINE_DYNAMIC_AT = now
+            return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+        return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+async def cline_request_with_retry(
+    req_body: dict,
+    user: str,
+    model: str,
+    max_retries: int = None,
+):
+    """Buffered Cline call with key rotation on consecutive 429s.
+
+    Mirrors amd_request_with_retry. Returns the parsed OpenAI completion
+    dict, a JSONResponse error, or None if the client gave up.
+    """
+    attempts = max_retries if max_retries is not None else MAX_RETRIES
+    last_error = None
+    last_key = None
+    last_status = None
+    last_body = ""
+    key_limit = len(cline_keys.keys) or 1
+    # Consecutive pool-wide 429s (not broken by a success or non-429). When this
+    # reaches CLINE_POOL_429_FAILFAST the whole pool is saturated → fail fast
+    # instead of looping every key with backoff for minutes ("thinking").
+    consecutive_429 = 0
+    # Sweep the whole pool: each iteration picks the next usable key (the pool
+    # advances internally), so a model that 404s for some keys (key lacks
+    # access) but works for another eventually succeeds. Rate limits rotate and
+    # cool down the offending key.
+    for attempt in range(key_limit + attempts):
+        key = cline_keys.select(model)
+        if key is None:
+            return _cline_rate_limit_response("all Cline keys are in rate-limit cooldown")
+        client = _cline_client(streaming=False)
+        headers = _cline_headers(key)
+        try:
+            try:
+                resp = await client.post(
+                    "/chat/completions", json=req_body, headers=headers
+                )
+            except Exception as e:
+                last_error = e
+                _log(f"[cline] Request failed (attempt {attempt}, key ...{key[-8:] if len(key) >= 8 else key}): {_exc_desc(e)}")
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": f"Cline request failed: {_exc_desc(e)}", "type": "upstream_error"}},
+                )
+
+            body_bytes = await resp.aread()
+            body_text = body_bytes.decode("utf-8", errors="replace")
+            last_key = key
+            last_status = resp.status_code
+            last_body = body_text
+            try:
+                data = json.loads(body_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+
+            is_429 = resp.status_code == 429
+            is_rate_limit = is_429 or "FreeUsageLimitError" in body_text or (
+                "erate" in body_text and "429" in body_text
+            ) or "free limit reached" in body_text.lower()
+            if is_rate_limit:
+                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                cline_keys.report_capped(key, model, body_text)
+                hint = cline_keys.nearest_reset_hint(model)
+                _log(f"[cline] 429 on key ...{key[-8:] if len(key) >= 8 else key} (attempt {attempt}): {err_msg} capped")
+                consecutive_429 += 1
+                # Whole pool saturated with rate limits → fail fast with a clear
+                # 429 rather than silently looping every key for minutes.
+                if consecutive_429 >= CLINE_POOL_429_FAILFAST:
+                    _log(f"[cline] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+                    msg = f"Cline pool rate-limited ({consecutive_429} consecutive 429s)"
+                    if hint:
+                        msg += f"; {hint}"
+                    else:
+                        msg += "; try again in a moment"
+                    return _cline_rate_limit_response(msg)
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return _cline_rate_limit_response(err_msg)
+
+            if resp.status_code == 402:
+                err_msg = (data.get("error") or {}).get("message") or "Empty balance"
+                _log(f"[cline] 402 on key ...{key[-8:] if len(key) >= 8 else key}: {err_msg}")
+                _report_cline_status(key, resp.status_code)
+                return _cline_balance_response(err_msg)
+
+            if resp.status_code >= 400:
+                consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
+                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                is_context = _is_context_limit_error(data, body_text)
+                bare_500 = _is_bare_internal_error(resp.status_code, data, body_text)
+                _log(f"[cline] Error {resp.status_code} (key ...{key[-8:] if len(key) >= 8 else key}): {err_msg} body={body_text[:200]!r}")
+                if resp.status_code in (401, 403):
+                    # Bad/revoked key — rotate away (not rate-limit but unusable).
+                    cline_keys.report_capped(key, model, body_text)
+                if is_context:
+                    # Context window exhaustion is per-model/request, not key.
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg, "type": "context_window_error"}},
+                    )
+                if bare_500:
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg + " (model appears down upstream; try another Cline model)", "type": "upstream_error"}},
+                    )
+                if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg + " (backend temporarily unavailable; try again shortly)", "type": "upstream_error"}},
+                    )
+                if _is_free_tier_gate_error(data, body_text) or _is_promotion_ended_error(data, body_text, resp.status_code, model):
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg, "type": "upstream_error"}},
+                    )
+                # 404 (model not authorized for this key) → advance to the next
+                # key with no delay; a different key may have access.
+                if resp.status_code < 500 and attempt < key_limit + attempts - 1:
+                    continue
+                # 5xx → escalating key cooldown (504 fast-breaks, no cycling);
+                # then transient retry with backoff.
+                if not _report_cline_status(key, resp.status_code):
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": err_msg, "type": "upstream_error"}},
+                    )
+                if attempt < key_limit + attempts - 1:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content={"error": {"message": err_msg, "type": "upstream_error"}},
+                )
+
+            cline_keys.report_success(key)
+            consecutive_429 = 0
+            usage = data.get("usage") or {}
+            if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
+                _add_tokens(model,
+                    usage.get("prompt_tokens") or 0,
+                    usage.get("completion_tokens") or 0,
+                    usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                    usage.get("prompt_cache_miss_tokens") or 0,
+                )
+            return data
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    last_err = f"Cline error after retries (last key ...{last_key[-8:] if last_key and len(last_key) >= 8 else (last_key or 'none')}: HTTP {last_status})"
+    if last_error:
+        last_err += f": {_exc_desc(last_error)}"
+    return JSONResponse(
+        status_code=last_status or 502,
+        content={"error": {"message": last_err, "type": "upstream_error"}},
+    )
+
+
+async def cline_stream_with_retry(
+    req_body: dict,
+    user: str,
+    model: str,
+    max_retries: int = None,
+):
+    """Streaming Cline call with key rotation on consecutive 429s.
+
+    Mirrors amd_stream_with_retry. Yields OpenAI SSE lines. A key that 429s
+    rotates away (cooldown) and the request is retried with the next key.
+    """
+    attempts = max_retries if max_retries is not None else MAX_RETRIES
+    last_error = None
+    key_limit = len(cline_keys.keys) or 1
+    used_keys_in_request = 0
+    # Consecutive pool-wide 429s → fail fast when the whole pool is saturated.
+    consecutive_429 = 0
+    # Track stream throughput so we don't replay once bytes reached the client.
+    streamed_any = False
+
+    attempt = 0
+    while attempt <= attempts + key_limit * 2:
+        key = cline_keys.select(model)
+        if key is None:
+            yield _openai_stream_error(
+                "all Cline keys are in rate-limit cooldown",
+                "rate_limit_error", "rate_limit_exceeded",
+            )
+            return
+        used_keys_in_request += 1
+        client = _cline_client(streaming=True)
+        try:
+            upstream_request = client.build_request(
+                "POST", "/chat/completions", json=req_body,
+                headers=_cline_headers(key),
+            )
+            resp = await client.send(upstream_request, stream=True)
+        except Exception as e:
+            last_error = e
+            _log(f"[cline] Stream request failed (attempt {attempt}, key ...{key[-8:] if len(key) >= 8 else key}): {_exc_desc(e)}")
+            await client.aclose()
+            if attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error(f"Stream request failed: {_exc_desc(e)}", "upstream_error", "transport_error")
+            return
+
+        if resp.status_code == 402:
+            try:
+                raw = await resp.aread()
+                try:
+                    data402 = json.loads(raw) if raw else {}
+                    err_msg402 = (data402.get("error") or {}).get("message") or "Empty balance"
+                except Exception:
+                    err_msg402 = "Empty balance"
+            except Exception:
+                err_msg402 = "Empty balance"
+            _report_cline_status(key, 402)
+            await resp.aclose()
+            await client.aclose()
+            yield _openai_stream_error(err_msg402 + _CLINE_TOP_UP_HINT, "billing_error", "insufficient_balance")
+            return
+
+        if resp.status_code == 429:
+            try:
+                raw = await resp.aread()
+                try:
+                    data = json.loads(raw)
+                    err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                except Exception:
+                    err_msg = "Rate limit exceeded"
+                body_text = raw.decode("utf-8", errors="replace") if raw else ""
+            except Exception as e:
+                err_msg = f"Rate limit ({_exc_desc(e)})"
+                body_text = ""
+            cline_keys.report_capped(key, model, body_text)
+            hint = cline_keys.nearest_reset_hint(model)
+            _log(f"[cline] Stream 429 on key ...{key[-8:] if len(key) >= 8 else key} (attempt {attempt}): {err_msg} capped")
+            await resp.aclose()
+            await client.aclose()
+            consecutive_429 += 1
+            # Whole pool saturated → fail fast with a clear 429 instead of
+            # silently looping every key for minutes (looks like "thinking").
+            if consecutive_429 >= CLINE_POOL_429_FAILFAST:
+                _log(f"[cline] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+                msg = f"Cline pool rate-limited ({consecutive_429} consecutive 429s)"
+                if hint:
+                    msg += f"; {hint}"
+                else:
+                    msg += "; try again in a moment"
+                yield _openai_stream_error(msg, "rate_limit_error", "rate_limit_exceeded")
+                return
+            attempt += 1
+            await _backoff(attempt)
+            continue
+
+        if resp.status_code >= 400:
+            try:
+                raw = await resp.aread()
+            except Exception:
+                raw = b""
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            body_text = raw.decode("utf-8", errors="replace")
+            consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
+            _log(f"[cline] Stream error {resp.status_code} (key ...{key[-8:] if len(key) >= 8 else key}): {err_msg}")
+            if resp.status_code in (401, 403):
+                cline_keys.report_capped(key, model, body_text)
+            await resp.aclose()
+            await client.aclose()
+            # No bytes have streamed yet -> safe to try another key. A 404 means
+            # this key lacks the model; a 5xx may be transient. Sweep the pool.
+            # 5xx records escalating key cooldown (504 fast-breaks, no cycling).
+            if resp.status_code < 500 and attempt < attempts + key_limit:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            if resp.status_code >= 500:
+                if _is_bare_internal_error(resp.status_code, data, body_text):
+                    yield _openai_stream_error(err_msg + " (model appears down upstream; try another Cline model)", "upstream_error", str(resp.status_code))
+                    return
+                if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                    yield _openai_stream_error(err_msg + " (backend temporarily unavailable; try again shortly)", "upstream_error", str(resp.status_code))
+                    return
+                if _is_free_tier_gate_error(data, body_text) or _is_promotion_ended_error(data, body_text, resp.status_code, model):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                if not _report_cline_status(key, resp.status_code):
+                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+                    return
+                if attempt < attempts + key_limit * 2:
+                    attempt += 1
+                    await _backoff(attempt)
+                    continue
+            yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
+            return
+
+        # Success — stream it through
+        cline_keys.report_success(key)
+        consecutive_429 = 0
+        stream_completed = False
+        try:
+            try:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        stream_completed = True
+                        yield line + "\n\n"
+                        streamed_any = True
+                        break
+                    try:
+                        piece = json.loads(payload)
+                    except Exception:
+                        piece = {}
+                    if not isinstance(piece, dict):
+                        continue
+                    # In-stream error (e.g. rate limit surfaced mid-body)
+                    ev = _first_chunk_error(line)
+                    if ev:
+                        err_msg, is_rate_limit = ev
+                        if is_rate_limit:
+                            cline_keys.report_capped(key, model, payload)
+                            hint = cline_keys.nearest_reset_hint(model)
+                            _log(f"[cline] Stream body rate-limit on key ...{key[-8:] if len(key) >= 8 else key}: {err_msg} capped")
+                            if hint:
+                                err_msg = f"{err_msg} ({hint})"
+                            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
+                        else:
+                            yield _openai_stream_error(err_msg)
+                        return
+                    if '"usage"' in line:
+                        u = piece.get("usage") or {}
+                        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                            _add_tokens(model,
+                                u.get("prompt_tokens") or 0,
+                                u.get("completion_tokens") or 0,
+                                u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                                u.get("prompt_cache_miss_tokens") or 0,
+                            )
+                    yield line + "\n\n"
+                    streamed_any = True
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
+                _log(f"[cline] Stream interrupted (key ...{key[-8:] if len(key) >= 8 else key}): {_exc_desc(e)}")
+                last_error = e
+                if not streamed_any and attempt < attempts + key_limit * 2:
+                    attempt += 1
+                    await _backoff(attempt)
+                    continue
+                yield _openai_stream_error(_transport_error_message(e), "upstream_error", "transport_error")
+                return
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+        if not stream_completed:
+            _log(f"[cline] Stream ended before [DONE] on key ...{key[-8:] if len(key) >= 8 else key}")
+            if not streamed_any and attempt < attempts + key_limit * 2:
+                attempt += 1
+                await _backoff(attempt)
+                continue
+            yield _openai_stream_error("Cline stream ended before completion", "upstream_error", "incomplete_stream")
+            return
+        return
+
+    yield _openai_stream_error(
+        f"connection error: Cline stream failed after retries: {_exc_desc(last_error)}",
+        "upstream_error", "transport_error",
+    )
+
+
 # ── Anthropic Messages → OpenAI conversion ────────────────────────
 
 def _anthropic_thinking(blocks) -> str:
@@ -5891,6 +6482,16 @@ async def _ollama_names() -> list[str]:
             if nid not in seen:
                 names.append(nid)
                 seen.add(nid)
+    if cline_keys.ready:
+        try:
+            cline_ids = await _cline_fetch_dynamic_ids()
+        except Exception:
+            cline_ids = cline_models()
+        for mid in cline_ids:
+            nid = f"cline/{mid}"
+            if nid not in seen:
+                names.append(nid)
+                seen.add(nid)
     return names
 
 
@@ -5899,6 +6500,8 @@ def _ollama_details(name: str) -> dict:
         canon = nvidia_model_id(name)
     elif is_amd_model(name):
         canon = amd_model_id(name)
+    elif is_cline_model(name):
+        canon = cline_model_id(name)
     else:
         canon = _normalize_model(name) or ""
     meta = _models_meta.get(canon) or {}
@@ -5976,6 +6579,12 @@ async def ollama_show(request: Request):
             return JSONResponse(
                 status_code=503,
                 content={"error": "No AMD API keys loaded (amd-api-keys.txt empty/missing)"},
+            )
+    elif is_cline_model(name):
+        if not cline_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "No Cline API keys loaded (cline-api-keys.txt empty/missing)"},
             )
     elif not await _ensure_model_known(_normalize_model(name)):
         return JSONResponse(status_code=404, content={"error": f'model "{name}" not found'})
@@ -6196,6 +6805,26 @@ async def _ollama_upstream(request, user, model_raw, oai_messages, tools, stream
         if stream:
             return ("sse", amd_stream_with_retry(req_body, user, amd_model))
         data = await amd_request_with_retry(req_body, user, amd_model)
+        if isinstance(data, JSONResponse):
+            return ("error", (_ollama_status(data), _ollama_message(data)))
+        if data is None:
+            return ("error", (502, "Client disconnected"))
+        if not data.get("choices"):
+            return ("error", (502, "Invalid upstream response"))
+        return ("data", data)
+
+    if is_cline_model(model_raw):
+        if not cline_keys.ready:
+            return ("error", (503, "No Cline API keys loaded (cline-api-keys.txt empty/missing)"))
+        cline_model = cline_model_id(model_raw)
+        norm_messages = _normalize_messages(oai_messages) or []
+        req_body = cline_request_body(
+            cline_model, norm_messages, stream, tools, None,
+            max_tokens, None, sampling,
+        )
+        if stream:
+            return ("sse", cline_stream_with_retry(req_body, user, cline_model))
+        data = await cline_request_with_retry(req_body, user, cline_model)
         if isinstance(data, JSONResponse):
             return ("error", (_ollama_status(data), _ollama_message(data)))
         if data is None:
@@ -6541,6 +7170,17 @@ async def list_models(request: Request):
             amd_ids = amd_models()
         for mid in amd_ids:
             data.append({"id": f"amd/{mid}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
+    # Cline models exposed behind the cline/ prefix.
+    # Dynamic discovery via GET /models when the pool is ready, merged with
+    # the hardcoded cline_models() fallback (which carries the cline-pass/*
+    # IDs the live endpoint omits) — never wiped on empty.
+    if cline_keys.ready:
+        try:
+            cline_ids = await _cline_fetch_dynamic_ids()
+        except Exception:
+            cline_ids = cline_models()
+        for mid in cline_ids:
+            data.append({"id": f"cline/{mid}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
     return {"object": "list", "data": data, "models_checked_at": _models_checked_at}
 
 
@@ -6617,6 +7257,34 @@ async def chat_completions(request: Request):
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
         data = await amd_request_with_retry(req_body, user, amd_model)
+        if isinstance(data, JSONResponse):
+            return data
+        if data is None:
+            return JSONResponse(status_code=502, content={"error": {"message": "Client disconnected", "type": "upstream_error"}})
+        if not data.get("choices"):
+            return JSONResponse(status_code=502, content={"error": {"message": "Invalid upstream response", "type": "upstream_error"}})
+        return data
+
+    # Cline direct route: models addressed with the cline/ prefix
+    if is_cline_model(model):
+        if not cline_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": "No Cline API keys loaded (cline-api-keys.txt empty/missing)", "type": "upstream_error"}},
+            )
+        cline_model = cline_model_id(model)
+        norm_messages = _normalize_messages(messages) or []
+        req_body = cline_request_body(
+            cline_model, norm_messages, stream, tools, tool_choice,
+            body.get("max_tokens"), body.get("max_completion_tokens"), _cline_sampling_from(body),
+        )
+        if stream:
+            return StreamingResponse(
+                cline_stream_with_retry(req_body, user, cline_model),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        data = await cline_request_with_retry(req_body, user, cline_model)
         if isinstance(data, JSONResponse):
             return data
         if data is None:
@@ -6834,6 +7502,60 @@ async def messages(request: Request):
                 yield f"event: message_stop\ndata: {stop_payload}\n\n"
             return StreamingResponse(
                 _amd_anthropic_sse(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+            )
+        return anth
+
+    # Cline direct route (Anthropic format): convert to OpenAI, call Cline,
+    # convert the completion back to Anthropic. Streams are bridged through
+    # the buffered path (same guarantee as the AMD route).
+    if is_cline_model(model):
+        if not cline_keys.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "No Cline API keys loaded"}},
+            )
+        cline_model = cline_model_id(model)
+        oai_cline_messages, cline_tools = anthropic_to_openai(body)
+        oai_cline_messages = _normalize_messages(oai_cline_messages) or []
+        input_tokens = len(json.dumps(oai_cline_messages)) // 4
+        cline_req_body = cline_request_body(
+            cline_model, oai_cline_messages, False, cline_tools, None,
+            body.get("max_tokens"), body.get("max_completion_tokens"), _cline_sampling_from(body),
+        )
+        cline_data = await cline_request_with_retry(cline_req_body, user, cline_model)
+        if isinstance(cline_data, JSONResponse):
+            return cline_data
+        if cline_data is None:
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
+            )
+        if not cline_data.get("choices"):
+            return JSONResponse(
+                status_code=502,
+                content={"type": "error", "error": {"type": "upstream_error", "message": "Invalid upstream response"}},
+            )
+        anth = openai_to_anthropic(cline_data, cline_model, input_tokens)
+        if stream:
+            async def _cline_anthropic_sse():
+                # Stream the already-complete buffered Anthropic conversion.
+                start_payload = json.dumps({"type": "message_start", "message": anth})
+                yield f"event: message_start\ndata: {start_payload}\n\n"
+                content = anth.get("content", [])
+                for idx, block in enumerate(content):
+                    cbs_payload = json.dumps({"type": "content_block_start", "index": idx, "content_block": block})
+                    yield f"event: content_block_start\ndata: {cbs_payload}\n\n"
+                    if block.get("type") == "text":
+                        delta_payload = json.dumps({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}})
+                        yield f"event: content_block_delta\ndata: {delta_payload}\n\n"
+                    cbstop_payload = json.dumps({"type": "content_block_stop", "index": idx})
+                    yield f"event: content_block_stop\ndata: {cbstop_payload}\n\n"
+                stop_payload = json.dumps({"type": "message_stop"})
+                yield f"event: message_stop\ndata: {stop_payload}\n\n"
+            return StreamingResponse(
+                _cline_anthropic_sse(),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
@@ -7378,6 +8100,8 @@ async def health(request: Request):
         "nvidia_models": [f"nvidia/{m}" for m in nvidia_models()] if nvidia_keys.ready else [],
         "amd_keys": len(amd_keys.keys) if amd_keys.ready else 0,
         "amd_models": [f"amd/{m}" for m in amd_models()] if amd_keys.ready else [],
+        "cline_keys": len(cline_keys.keys) if cline_keys.ready else 0,
+        "cline_models": [f"cline/{m}" for m in cline_models()] if cline_keys.ready else [],
         "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models", "/api/tags", "/api/show", "/api/chat", "/api/generate"],
     }
 

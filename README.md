@@ -259,6 +259,74 @@ curl http://localhost:6446/health   # amd_keys: <count>, amd_models: [...]
 curl http://localhost:6446/v1/models # amd/* entries list available TokenFactory routes
 ```
 
+## Cline
+
+In addition to the Zen-tier, NVIDIA NIM, and AMD TokenFactory models, the
+proxy can serve models directly from
+[Cline](https://api.cline.bot/api/v1) (OpenAI-compatible, SSE streaming).
+Address a Cline model with the `cline/` prefix, e.g.
+`cline/cline-pass/glm-5.3`. Model IDs pass through unchanged — the `cline/`
+routing prefix is stripped but the upstream ID (including the `cline-pass/`
+segment) is never rewritten.
+
+This requires `cline-api-keys.txt` in the same folder as `server.py` — one
+key per line (any non-empty line not starting with `#`; the Cline key format
+is not strict). Get a key at app.cline.bot under Settings -> API Keys. The
+proxy sends the desktop-client identity headers (`X-CLIENT-TYPE:
+cline-desktop`, `User-Agent: Cline/3.5.54`) on every Cline request and
+auto-rotates the key file on each request.
+
+```bash
+curl http://localhost:6446/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "cline/cline-pass/glm-5.3",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+Supported canonical IDs (also work as `cline/<id>`):
+
+- `cline/cline-pass/glm-5.3`
+- `cline/cline-pass/glm-5.3-flash`
+- `cline/cline-pass/kimi-k3`
+- `cline/cline-pass/deepseek-v4-pro`
+- `cline/cline-pass/deepseek-v4.1-flash`
+- `cline/cline-pass/mimo-v2.5`
+- `cline/cline-pass/mimo-v2.5-pro`
+- `cline/cline-pass/minimax-m3`
+- `cline/cline-pass/muse-spark-1.3-contributor`
+- `cline/cline-pass/qwen3.8-max`
+- `cline/cline-pass/qwen3.7-max`
+- `cline/cline-pass/qwen3.7-plus`
+- `cline/anthropic/claude-sonnet-4-6` (usage billing)
+- `cline/google/gemini-2.5-pro` (usage billing)
+- `cline/deepseek/deepseek-chat` (usage billing)
+- `cline/openai/gpt-4o` (usage billing)
+- `cline/minimax/minimax-m2.5` (usage billing)
+
+Friendly slugs (`cline/glm-5.3`, `cline/kimi-k3`) and bare-suffix IDs resolve
+to the canonical Cline IDs. Retired IDs (`glm-5.2`, `kimi-k2.7-code`,
+`kimi-k2.6`, `deepseek-v4-flash`) have no aliases and pass through as-is so
+Cline errors on them itself. `GET /v1/models` dynamically discovers IDs from
+the Cline `/models` endpoint when a key is loaded, merged with the hardcoded
+list (which carries the `cline-pass/*` IDs the live endpoint omits) —
+never wiped on empty. `POST /v1/messages` (Anthropic) is supported the same
+way as the AMD route.
+
+Error notes: a `402` means the key has an empty balance (hint: top up at
+app.cline.bot / not subscribed). A `429` whose body says `free limit reached
+on model ... try again in ...` parks that (key, model) pair until the parsed
+reset time; capped keys sort last but are still tried.
+
+Check key status with:
+
+```
+curl http://localhost:6446/health   # cline_keys: <count>, cline_models: [...]
+curl http://localhost:6446/v1/models # cline/* entries list available Cline routes
+```
+
 - **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy gets one transport retry, then is blacklisted after its second transport failure; `429` responses temporarily skip the current proxy so the caller can retry through another IP.
 - **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
 
