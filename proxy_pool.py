@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -115,6 +116,62 @@ PROXY_PORT_FILTER_ENABLED = os.environ.get(
     "OPENCODE_PROXY_PORT_FILTER", "true"
 ).lower() not in ("0", "false", "no", "off")
 ALLOWED_PROXY_PORTS = frozenset((4145, 1080))
+
+# Geo gate for pooled SOCKS5 exits: set OPENCODE_PROXY_COUNTRY to require a
+# country (e.g. US). Default is UNRESTRICTED (ANY) — any exit that passes the
+# real Zen probe joins the pool. The per-proxy country is still looked up once
+# and cached (persisted in proxy-pool-cache.json) for observability; definite
+# non-required countries are only blacklisted when the gate is enabled.
+# Direct fallback stays opt-in only (server-side ALLOW_DIRECT_FALLBACK).
+PROXY_COUNTRY = (os.environ.get("OPENCODE_PROXY_COUNTRY", "ANY") or "ANY").strip().upper()
+PROXY_COUNTRY_DISABLED = PROXY_COUNTRY in ("", "ANY", "ALL", "*")
+GEO_CHECK_URL = os.environ.get(
+    "OPENCODE_PROXY_GEO_URL", "http://ip-api.com/json/?fields=status,countryCode"
+)
+try:
+    GEO_TIMEOUT = float(os.environ.get("OPENCODE_PROXY_GEO_TIMEOUT", "5"))
+except (TypeError, ValueError):
+    GEO_TIMEOUT = 5.0
+
+# pi-freeflow fingerprint for the verify probe (must match server.py):
+# UA opencode/1.18.34 + full x-opencode-* set + stable ses_ session.
+# No Authorization, ever (Zen free tier is keyless).
+import hashlib as _hashlib
+
+_ZEN_PROJECT_ID = _hashlib.sha1(b"git-remote:github.com/anomalyco/opencode").hexdigest()
+_OC_VERSION = os.environ.get("OPENCODE_VERSION", "1.18.34")
+_ZEN_ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_VERIFY_SESSION: str | None = None
+
+
+def _verify_session() -> str:
+    global _VERIFY_SESSION
+    if not _VERIFY_SESSION:
+        import time as _t
+
+        ts = int(_t.time() * 1000)
+        time_part = format(((ts << 12) + 1) & 0xFFFFFFFFFFFF, "012x")
+        rand = "".join(_ZEN_ID_CHARS[b % 62] for b in secrets.token_bytes(14))
+        _VERIFY_SESSION = f"ses_{time_part}{rand}"
+    return _VERIFY_SESSION
+
+
+def _verify_headers() -> dict:
+    sid = _verify_session()
+    import time as _t2
+
+    ts2 = int(_t2.time() * 1000)
+    time_part2 = format(((ts2 << 12) + 2) & 0xFFFFFFFFFFFF, "012x")
+    rand2 = "".join(_ZEN_ID_CHARS[b % 62] for b in secrets.token_bytes(14))
+    return {
+        "User-Agent": f"opencode/{_OC_VERSION}",
+        "x-opencode-client": "cli",
+        "x-opencode-project": _ZEN_PROJECT_ID,
+        "x-opencode-request": f"msg_{time_part2}{rand2}",
+        "x-opencode-session": sid,
+        "x-opencode-session-id": sid,
+        "x-session-affinity": sid,
+    }
 
 CACHE_FILE = _data_dir / "proxy-pool-cache.json"
 
@@ -510,12 +567,41 @@ class ProxyPool:
 
         self._trigger_refill()
 
+    async def _proxy_country(self, client: httpx.AsyncClient) -> str:
+        """Best-effort exit-country lookup through an already-proxied client.
+
+        Returns the 2-letter country code, or "" when the lookup fails. A
+        failed lookup is NOT proof of a non-required exit, so callers fail
+        open (allow the Zen probe); only a definite non-required country
+        rejects (and only when the PROXY_COUNTRY gate is enabled).
+        """
+        try:
+            r = await asyncio.wait_for(client.get(GEO_CHECK_URL), timeout=GEO_TIMEOUT + 2)
+            if r.status_code != 200:
+                return ""
+            data = r.json()
+            if not isinstance(data, dict) or data.get("status") == "fail":
+                return ""
+            cc = str(data.get("countryCode") or "").strip().upper()
+            return cc if len(cc) == 2 and cc.isalpha() else ""
+        except Exception:
+            return ""
+
+    def _reject_non_us(self, addr: str, country: str) -> bool:
+        """Blacklist a definite non-required exit as region-blocked."""
+        self.blacklist[addr] = time.time() + BLACKLIST_TTL
+        _log(f"Verify {addr}: country={country} (need {PROXY_COUNTRY}); blacklisted as region-block")
+        return False
+
     async def _verify(self, proxy: dict) -> bool:
-        """Full-path check: SOCKS5 tunnel + real HTTPS request through the proxy.
+        """Full-path check: optional country gate + SOCKS5 tunnel + real HTTPS request.
 
         A bare SOCKS5 CONNECT passes proxies that then blackhole, throttle, or
         break TLS on real traffic; requiring a 2xx from the actual Zen endpoint
-        keeps those out of the hot buffer. The httpx phase timeouts do NOT
+        keeps those out of the hot buffer. When PROXY_COUNTRY is set, the exit
+        must geolocate there first (cached per candidate after the first
+        lookup); by default the gate is off and any exit passing the Zen probe
+        joins the pool. The httpx phase timeouts do NOT
         bound the whole check (SOCKS handshake / DNS / TLS can stall beyond
         them), so wait_for is the hard deadline: one stalled proxy must never
         block an entire verify batch.
@@ -527,21 +613,34 @@ class ProxyPool:
             timeout = httpx.Timeout(VERIFY_TIMEOUT)
             started = time.monotonic()
             async with httpx.AsyncClient(proxy=url, verify=False, timeout=timeout) as c:
+                if not PROXY_COUNTRY_DISABLED:
+                    cc = str(proxy.get("country") or "").strip().upper()
+                    if cc and cc != PROXY_COUNTRY:
+                        return self._reject_non_us(addr, f"cached {cc}")
+                    if not cc:
+                        cc = await self._proxy_country(c)
+                        if cc:
+                            proxy["country"] = cc
+                            self._stats_dirty = True
+                            if cc != PROXY_COUNTRY:
+                                return self._reject_non_us(addr, cc)
+                        else:
+                            _log(f"Verify {addr}: country unknown (geo lookup failed); allowing Zen probe")
                 r = await c.get(
                     "https://opencode.ai/zen/v1/models",
-                    headers={
-                        "User-Agent": "opencode/1.18.31",
-                        "x-opencode-client": "cli",
-                    },
+                    headers=_verify_headers(),
                 )
                 if 200 <= r.status_code < 300:
                     self._record_latency(addr, time.monotonic() - started)
+                    _log(f"Verify OK {addr} (country={proxy.get('country') or ('any' if PROXY_COUNTRY_DISABLED else '?')})")
                     return True
                 return False
 
         async with self._verify_sem:
             try:
-                return await asyncio.wait_for(_check(), timeout=VERIFY_TIMEOUT + 2)
+                # Geo lookup runs inside the check, so the hard deadline
+                # covers both phases.
+                return await asyncio.wait_for(_check(), timeout=VERIFY_TIMEOUT + GEO_TIMEOUT + 4)
             except Exception:
                 return False
 

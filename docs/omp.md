@@ -16,13 +16,6 @@ Model metadata (context window, max output, reasoning, modalities) mirrors what 
 
 > `ling-3.0-flash-free` and `north-mini-code-free` are intentionally not configured here: the former is gone from the free tier upstream (404 → paid `inclusionai/ling-3.0-flash`), and the latter returns opaque `400 Provider returned error` on multi-turn tool calls. See `README.md`.
 
-NVIDIA NIM models exposed by the proxy (`nvidia/*`, e.g. `nvidia/kimi-k3`) ride
-the same provider — reference them as `opencode-local/nvidia/kimi-k3:high`.
-They use plain OpenAI messages (no reasoning-content round-trip requirement),
-and the proxy forwards `reasoning_effort` (`low`/`high`/`max`) on the NVIDIA
-route, so the per-role `:low`/`:high`/`:max` suffixes work as-is. Kimi-K3 is
-1M context / 131K max output, thinking always on.
-
 ```yaml
 providers:
   opencode-local:
@@ -89,13 +82,20 @@ providers:
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 1000000
         maxTokens: 128000
-      - id: ling-3.0-flash-fin-free
-        name: ling-3.0-flash-fin-free
+      - id: longcat-2.5-preview-free
+        name: Longcat 2.5 Preview Free
         reasoning: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        contextWindow: 262144
-        maxTokens: 32768
+        contextWindow: 200000
+        maxTokens: 32000
+      - id: stealth/space-bunny-alpha
+        name: Space Bunny Alpha
+        reasoning: true
+        input: [text, image]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 1048576
+        maxTokens: 524288
       - id: big-pickle
         name: Big Pickle
         reasoning: true
@@ -103,13 +103,13 @@ providers:
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 200000
         maxTokens: 32000
-      - id: jev-1.13-free
-        name: jev-1.13-free
+      - id: fledge-alpha-free
+        name: Fledge Alpha Free
         reasoning: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        contextWindow: 128000
-        maxTokens: 16384
+        contextWindow: 1048576
+        maxTokens: 131072
 ```
 
 Notes on the `compat` knobs (validated against the Zen gateway behavior the proxy fronts):

@@ -53,15 +53,18 @@ The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/mode
 - `muse-spark-1.3-contributor-free` / `muse-spark-1.2-contributor-free` (text + image, routed to `/zen/v1/responses`)
 - `nemotron-3.5-lightning-free` / `nemotron-3-ultra-free` (text, reasoning)
 - `big-pickle` (reasoning model, text-only)
-- `jev-1.13-free`, `ling-3.0-flash-fin-free` (auto-discovered)
+- `fledge-alpha-free` (text, 1M context, 131K output)
+- `longcat-2.5-preview-free`, `stealth/space-bunny-alpha` (auto-discovered)
 
-> Removed from the curated set (still auto-discovered if the Zen API lists them):
+> Removed from the curated set (blocked upstream, plus a persistent dead-model denylist in `data/dead-models.json` for retired `-free` ids):
 > `deepseek-v4-flash-free` — listed by the Zen API but currently returns
 > `Error from provider (Console): Upstream request failed: Model is unavailable.`;
 > `north-mini-code-free` — opaque `400 Provider returned error` on multi-turn
-> tool calls; and `ling-3.0-flash-free` — no longer on the free tier upstream
-> (404: "use this slug instead: inclusionai/ling-3.0-flash"). These three ids are
-> filtered from discovery and every listing/request path, so clients never see them.
+> tool calls; `ling-3.0-flash-free` — no longer on the free tier upstream
+> (404: "use this slug instead: inclusionai/ling-3.0-flash"); and
+> `ling-3.0-flash-fin-free` — FreeTier-gated on the chat path on all exits
+> (403). These four ids are filtered from discovery and every
+> listing/request path, so clients never see them.
 
 ## API
 
@@ -145,185 +148,96 @@ Your tool (opencode CLI, Cursor, curl, etc.)
 
 > **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
 
-## NVIDIA NIM models
+## Cline (free tier + key slots)
 
-In addition to the free Zen-tier models, the proxy can serve models directly
-from [NVIDIA NIM](https://integrate.api.nvidia.com). Address an NVIDIA model with
-the `nvidia/` (or `nvimin/`) prefix, e.g. `nvidia/deepseek-v4-pro-0813`.
+In addition to the Zen-tier models, the
+proxy serves Cline models directly from
+[Cline](https://api.cline.bot/api/v1) (OpenAI-compatible, SSE streaming,
+direct-only — never through the SOCKS pool). Address a Cline model with the
+`cline/` prefix, e.g. `cline/cline-free/kimi-k3`. Model IDs pass through
+unchanged — the `cline/` routing prefix is stripped but the upstream ID
+(including the `cline-free/` segment) is never rewritten; requests send IDs
+verbatim.
 
-This requires `nvidia-api-keys.txt` in the same folder as `server.py` — one
-`nvapi-...` key per line. Add your own keys there (the file ships with a set of
-free-tier keys that are validated and cleaned periodically). The proxy auto-rotates
-that file on each request.
+### Free tier: device login
+
+The free tier uses per-user login slots (a faithful port of pi-freeflow's
+Cline FREE tier). Log in with the device flow — no pasting tokens:
+
+```bash
+python cline_login.py [--slot default]
+```
+
+This prints a code + browser URLs; approve in the browser and the login is
+saved into `cline-pool.json` (repo root, gitignored, 0600, with a
+largest-wins `.bak` recovery copy). Log in once per Cline account; requests
+rotate across all saved slots (active-slot first, daily-capped slots last —
+capped slots are still tried). A slot that serves a turn becomes active, its
+usage counters bump, and its cap clears. Stale bearers refresh once
+pre-attempt (transient faults keep the stale bearer); a 401/403 refreshes
+once then retries, skipping the slot on a dead grant. Duplicate accounts are
+refused (same WorkOS account id, else email, else identical bearer).
+
+Free canonical IDs (served by login slots, daily caps per account):
+
+- `cline/cline-free/deepseek-v4.1-flash`
+- `cline/cline-free/muse-spark-1.3-contributor`
+- `cline/z-ai/glm-5.3-flash`
+- `cline/cline-free/kimi-k3`
+- `cline/cline-free/solar-pro4`
+
+Friendly slugs (`cline/deepseek-v4.1-flash`, `cline/solar-pro4`,
+`cline/kimi-k3`) resolve to the canonical free IDs. Every Cline request
+carries the full desktop-client identity set (`HTTP-Referer:
+https://cline.bot`, `X-Title: Cline`, `X-IS-MULTIROOT: false`,
+`X-CLIENT-TYPE: cline-desktop`, `X-CLIENT-VERSION: 3.5.54`, `User-Agent:
+Cline/3.5.54`) — required: `cline-free/*` answers 403 to a bare bearer.
 
 ```bash
 curl http://localhost:6446/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "nvidia/deepseek-v4-pro-0813",
+    "model": "cline/cline-free/kimi-k3",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
 ```
 
-Supported model aliases (also work as `nvidia/<alias>`):
+### Key slots (paying keys)
 
-- `nvidia/deepseek-v4-pro-0813`
-- `nvidia/deepseek-v4-flash-0731`
-- `nvidia/llama-3.2-11b-vision-instruct` (also exposed to the Anthropic
-  `POST /v1/messages` endpoint, with OpenAI↔Anthropic conversions applied)
+`cline-api-keys.txt` (same folder as `server.py`) still works: one key per
+line (any non-empty line not starting with `#`; `workos:`, JWT, `clp_`, and
+`sk_` forms accepted). Keys auto-import as `key-N` slots (no refresh/expiry),
+merged with the JSON pool and deduped by token. Key slots serve the
+ClinePass + usage-billing IDs:
 
-Any model id that already contains a `/` after the prefix (e.g.
-`nvidia/deepseek-ai/deepseek-v4-pro-0813`) is passed through to the NIM slug
-verbatim, so the full catalog of 80+ NIM models is usable.
+- `cline/cline-pass/glm-5.3`, `cline-pass/glm-5.3-flash`,
+  `cline-pass/kimi-k3`, `cline-pass/deepseek-v4-pro`,
+  `cline-pass/deepseek-v4.1-flash`, `cline-pass/mimo-v2.5`,
+  `cline-pass/mimo-v2.5-pro`, `cline-pass/minimax-m3`,
+  `cline-pass/muse-spark-1.3-contributor`, `cline-pass/qwen3.8-max`,
+  `cline-pass/qwen3.7-max`, `cline-pass/qwen3.7-plus`
+- `cline/anthropic/claude-sonnet-4-6`, `cline/google/gemini-2.5-pro`,
+  `cline/deepseek/deepseek-chat`, `cline/openai/gpt-4o`,
+  `cline/minimax/minimax-m2.5` (usage billing)
 
-### NVIDIA key rotation
+The paying IDs keep working as passthrough for key slots. Retired IDs
+(`glm-5.2`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-flash`) have no
+aliases and pass through as-is so Cline errors on them itself.
+`GET /v1/models` dynamically discovers IDs from the Cline `/models` endpoint
+when a slot is loaded, merged with the hardcoded list (which carries the
+`cline-pass/*` IDs the live endpoint omits) — never wiped on empty.
+`POST /v1/messages` (Anthropic) is supported the same way (convert to OpenAI, call Cline, convert back).
 
-NVIDIA free-tier `nvapi-*` keys are capped at ~40 RPM/account and are gated
-per-model on the free tier. The proxy rotates keys automatically:
+Error map: `401/403` auth, `429` rate-limit (a body saying `free limit
+reached on model ... try again in ...` parks that slot+requested-model until
+the parsed reset; bare numbers mean hours), `402` exhausted (hint: top up at
+app.cline.bot / not subscribed), `5xx` server.
 
-- Keys are handed out round-robin from `nvidia-api-keys.txt`.
-- Only well-formed keys load: NVIDIA `nvapi-*` keys are a **fixed 70 characters**
-  (the `nvapi-` prefix plus a 64-char body of `[A-Za-z0-9_-]`). Anything shorter
-  or longer is skipped at load time and rejected by the key hunter's validator.
-- A request that hits a **rate limit (429 / `FreeUsageLimitError`)** immediately
-  cools that key down. The cooldown grows **exponentially per key**
-  (60s → 120s → 240s → … capped at 10 minutes), so a key that keeps getting
-  rate-limited backs off progressively and stops being offered, letting the
-  rest of the pool stay usable.
-- If **12 consecutive 429s** happen (the whole pool is saturated by the shared
-  free-tier quota), the proxy fails fast with a clear `rate limit exceeded`
-  error instead of silently looping every key with backoff for minutes.
-- A per-key **404** (this key is not entitled to the model) advances to the next
-  key immediately so the whole pool is tried before failing.
-- NVIDIA read/stream timeouts are generous (600s) so long-thinking models
-  (deepseek-v4-pro / -flash) that stay silent for minutes aren't killed mid-reasoning.
-- `POST /v1/messages` (Anthropic) is supported: the proxy converts to OpenAI
-  format, calls NIM, and converts the result back to Anthropic SSE.
-
-Check key status with:
+Check slot status with:
 
 ```
-curl http://localhost:6446/health   # nvidia_keys: <count>, nvidia_models: [...]
-curl http://localhost:6446/v1/models # nvidia/* entries list available NIM routes
-```
-
-> Free-tier NIM keys have tight per-model quotas; for heavy/long-thinking
-> models a 404 may mean quota exhaustion for that model on that key, in which
-> case a different key in the file is used. Replace `nvidia-api-keys.txt` with
-> your own paid-tier keys for higher limits.
-
-## AMD Radeon TokenFactory
-
-In addition to the Zen-tier and NVIDIA NIM models, the proxy can serve models
-directly from [AMD Radeon TokenFactory](https://developer.amd.com.cn/radeon).
-Address an AMD model with the `amd/` (or `radeon/`) prefix, e.g.
-`amd/DeepSeek-V4-Flash`.
-
-This requires `amd-api-keys.txt` in the same folder as `server.py` — one
-`rc-...` key per line. Keys are a fixed 51 characters: `rc-` plus a 48-char
-hex body (`[0-9a-f]`). The proxy auto-rotates that file on each request.
-
-```bash
-curl http://localhost:6446/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "amd/DeepSeek-V4-Flash",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": true
-  }'
-```
-
-Supported canonical IDs (also work as `amd/<id>`):
-
-- `amd/DeepSeek-V4-Flash` (Cline `defaultModelId`)
-- `amd/DeepSeek-V4-Flash-Vision-Exp`
-- `amd/DeepSeek-V4.1-Flash`
-- `amd/GLM-5.3-Flash`
-- `amd/MinerU2.5-Pro`
-- `amd/MiniCPM5-2B`
-- `amd/Qwen3.8-27B`
-- `amd/Qwen3.8-Flash-Next`
-
-Friendly slugs (`amd/deepseek-v4-flash`) and legacy IDs
-(`DeepSeek-V4-Flash-0731`, `MiniCPM-V46`, `MiniCPM5-1B`, `Qwen3.6-35B-A3B`)
-resolve to the canonical verbatim TokenFactory IDs. `GET /v1/models`
-dynamically discovers IDs from the TokenFactory `/models` endpoint when a key
-is loaded, falling back to the hardcoded list on failure. `POST /v1/messages`
-(Anthropic) is supported the same way as the NVIDIA route.
-
-Check key status with:
-
-```
-curl http://localhost:6446/health   # amd_keys: <count>, amd_models: [...]
-curl http://localhost:6446/v1/models # amd/* entries list available TokenFactory routes
-```
-
-## Cline
-
-In addition to the Zen-tier, NVIDIA NIM, and AMD TokenFactory models, the
-proxy can serve models directly from
-[Cline](https://api.cline.bot/api/v1) (OpenAI-compatible, SSE streaming).
-Address a Cline model with the `cline/` prefix, e.g.
-`cline/cline-pass/glm-5.3`. Model IDs pass through unchanged — the `cline/`
-routing prefix is stripped but the upstream ID (including the `cline-pass/`
-segment) is never rewritten.
-
-This requires `cline-api-keys.txt` in the same folder as `server.py` — one
-key per line (any non-empty line not starting with `#`; the Cline key format
-is not strict). Get a key at app.cline.bot under Settings -> API Keys. The
-proxy sends the desktop-client identity headers (`X-CLIENT-TYPE:
-cline-desktop`, `User-Agent: Cline/3.5.54`) on every Cline request and
-auto-rotates the key file on each request.
-
-```bash
-curl http://localhost:6446/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "cline/cline-pass/glm-5.3",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": true
-  }'
-```
-
-Supported canonical IDs (also work as `cline/<id>`):
-
-- `cline/cline-pass/glm-5.3`
-- `cline/cline-pass/glm-5.3-flash`
-- `cline/cline-pass/kimi-k3`
-- `cline/cline-pass/deepseek-v4-pro`
-- `cline/cline-pass/deepseek-v4.1-flash`
-- `cline/cline-pass/mimo-v2.5`
-- `cline/cline-pass/mimo-v2.5-pro`
-- `cline/cline-pass/minimax-m3`
-- `cline/cline-pass/muse-spark-1.3-contributor`
-- `cline/cline-pass/qwen3.8-max`
-- `cline/cline-pass/qwen3.7-max`
-- `cline/cline-pass/qwen3.7-plus`
-- `cline/anthropic/claude-sonnet-4-6` (usage billing)
-- `cline/google/gemini-2.5-pro` (usage billing)
-- `cline/deepseek/deepseek-chat` (usage billing)
-- `cline/openai/gpt-4o` (usage billing)
-- `cline/minimax/minimax-m2.5` (usage billing)
-
-Friendly slugs (`cline/glm-5.3`, `cline/kimi-k3`) and bare-suffix IDs resolve
-to the canonical Cline IDs. Retired IDs (`glm-5.2`, `kimi-k2.7-code`,
-`kimi-k2.6`, `deepseek-v4-flash`) have no aliases and pass through as-is so
-Cline errors on them itself. `GET /v1/models` dynamically discovers IDs from
-the Cline `/models` endpoint when a key is loaded, merged with the hardcoded
-list (which carries the `cline-pass/*` IDs the live endpoint omits) —
-never wiped on empty. `POST /v1/messages` (Anthropic) is supported the same
-way as the AMD route.
-
-Error notes: a `402` means the key has an empty balance (hint: top up at
-app.cline.bot / not subscribed). A `429` whose body says `free limit reached
-on model ... try again in ...` parks that (key, model) pair until the parsed
-reset time; capped keys sort last but are still tried.
-
-Check key status with:
-
-```
-curl http://localhost:6446/health   # cline_keys: <count>, cline_models: [...]
+curl http://localhost:6446/health   # cline_slots: <count>, cline_models: [...]
 curl http://localhost:6446/v1/models # cline/* entries list available Cline routes
 ```
 
@@ -377,14 +291,6 @@ models):
           "attachment": true,
           "modalities": { "input": ["text", "image"], "output": ["text"] },
           "limit": { "context": 200000, "output": 32000 }
-        },
-        "nvidia/kimi-k3": {
-          "name": "Kimi K3 (NVIDIA)",
-          "id": "nvidia/kimi-k3",
-          "reasoning": true,
-          "attachment": true,
-          "modalities": { "input": ["text", "image"], "output": ["text"] },
-          "limit": { "context": 131072, "output": 32768 }
         }
       }
     }
@@ -395,7 +301,7 @@ models):
 Notes:
 
 - The `id` must match the model the proxy serves (Zen free slugs like
-  `big-pickle`, or `nvidia/<alias>` for NIM models). The picker key is
+  `big-pickle`, or `cline/<id>` for Cline models). The picker key is
   `local-openai/<id>`.
 - `modalities.input` with `"image"` (plus `attachment: true`) is what makes
   opencode allow image attachments; models without it are text-only and opencode
@@ -433,7 +339,7 @@ modelRoles:
   vision: opencode-local/space-bunny-free:auto
 ```
 
-NVIDIA models ride the same provider (`opencode-local/nvidia/kimi-k3:auto`).
+Cline models ride the same provider (`opencode-local/cline/cline-free/kimi-k3:auto`).
 
 ## License
 

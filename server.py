@@ -30,14 +30,19 @@ from proxy_pool import (
     STREAM_READ_TIMEOUT,
 )
 
-from nvidia_pool import pool as nvidia_keys
-from nvidia_proxy import is_nvidia_model, nvidia_model_id, nvidia_models
-
-from amd_pool import pool as amd_keys
-from amd_proxy import is_amd_model, amd_model_id, amd_models
-
 from cline_pool import pool as cline_keys
-from cline_proxy import is_cline_model, cline_model_id, cline_models
+from cline_pool import CLINE_BASE_URL
+from cline_pool import all_accounts as cline_all_accounts
+from cline_proxy import (
+    CLINE_RECOMMENDED_URL,
+    is_cline_model,
+    cline_model_id,
+    cline_models,
+    cline_free_models,
+    is_free_id,
+    parse_recommended_free,
+    set_dynamic_free_ids,
+)
 
 _BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -136,10 +141,30 @@ def _spawn_background(coro):
     return asyncio.ensure_future(coro)
 
 
+async def _cline_startup_discovery():
+    """Startup Cline discovery pass mirroring the Zen [models] log.
+
+    Cline discovery is otherwise lazy (first list_models/chat call), so
+    without this there is no Cline model list at boot.
+    """
+    try:
+        await _cline_fetch_dynamic_ids()  # warm the dynamic cache; log stays free-only
+        await _cline_fetch_recommended_free()  # warm the live free rotation
+        try:
+            nslots = cline_keys.slot_count() if cline_keys.ready else 0
+        except Exception:
+            nslots = 0
+        free = cline_free_models()
+        _log(f"[cline] Discovered {len(free)} free models ({nslots} slot(s)): {', '.join(free)} (paid excluded, e.g. cline-free/kimi-k3 / cline-free/solar-pro4 / z-ai/glm-5.3-flash when absent from live free[])")
+    except Exception as e:
+        _log(f"[cline] Startup discovery failed: {_exc_desc(e)}")
+
+
 @asynccontextmanager
 async def _lifespan(app: Starlette):
     # Start background model discovery
     _spawn_background(_periodic_model_refresh())
+    _spawn_background(_cline_startup_discovery())
     if PROXY_POOL_ENABLED:
         _log("Proxy pool enabled, loading SOCKS5 proxies in background...")
         _spawn_background(proxy_pool.load())
@@ -177,12 +202,16 @@ def _json(fn):
 
 PORT = args.port or int(os.environ.get("PORT", "6446"))
 HOST = args.host or os.environ.get("HOST", "0.0.0.0")
-OC_VERSION = "1.18.31"
-PROXY_VERSION = "20"
+OC_VERSION = "1.18.34"
+# v23: FreeTier gate lines carry req= body digest for forensics.
+# v24: tool-argument schema repair (items<->list, nested renames) + stale-prefix
+#      salvage, per-model effort ceilings, injected-placeholder strip, dead
+#      backend retirement, parallel tool-call separation.
+PROXY_VERSION = "24"
 # Native OpenCode project id: sha1 hex of "git-remote:<normalized remote>".
-# The console/gate inspects x-opencode-project; the real CLI hashes the
-# user's project remote (verified against upstream packages/core/project.ts).
-_ZEN_PROJECT_ID = hashlib.sha1(b"git-remote:github.com/JulienMaille/opencode-free-proxy").hexdigest()
+# pi-freeflow pins the reference client project so the gate sees a registered
+# OpenCode project (anomalyco/opencode); a per-clone hash is fingerprintable.
+_ZEN_PROJECT_ID = hashlib.sha1(b"git-remote:github.com/anomalyco/opencode").hexdigest()
 
 # ── API Keys ──────────────────────────────────────────────────────
 
@@ -540,6 +569,29 @@ _reasoning_file = _BASE_DIR / "reasoning_cache.json"
 # _reasoning_cache: session -> content-hash -> {"text", "at"}
 _reasoning_cache: dict[str, dict[str, dict]] = {}
 
+# ── Issuer affinity + rejected-reasoning recovery (Zen responses) ──
+# Upstream signs each reasoning ``encrypted_content`` blob to the backend that
+# produced it. When a later turn of the same conversation reaches a different
+# backend (proxy exit rotation), the replayed history is rejected with a 400:
+# "reasoning `encrypted_content` was not issued to this caller" or "referenced
+# reasoning item 'rs_...' was not found or has expired". Without affinity the
+# session dies on every exit rotation.
+#
+# _conv_affinity: conversation key -> (relay_addr, expires_at). Remembers which
+# exit issued a conversation's reasoning so a turn routed to a different exit
+# can drop the caller-bound blobs before sending.
+_CONV_AFFINITY_TTL = 12 * 3600
+_CONV_AFFINITY_MAX = 1024
+_conv_affinity: dict[str, tuple[str, float]] = {}
+
+# _rejected_reasoning: conversation key -> (blob-hash set, expires_at). Hashes
+# of encrypted_content blobs that upstream already rejected for this
+# conversation; stripped pre-emptively from later turns on the new exit.
+_REJECTED_REASONING_TTL = 12 * 3600
+_REJECTED_REASONING_MAX_KEYS = 1024
+_REJECTED_REASONING_MAX_BLOBS = 4096
+_rejected_reasoning: dict[str, tuple[set[str], float]] = {}
+
 
 def _load_reasoning():
     global _reasoning_cache
@@ -748,6 +800,31 @@ def _exc_desc(e: Exception | None) -> str:
         depth += 1
     return " (caused by ".join(parts) + ")" * (len(parts) - 1) if len(parts) > 1 else parts[0]
 
+
+def _as_dict(payload, default=None):
+    """Coerce a json.loads result to dict (upstream may return a JSON string/list)."""
+    if isinstance(payload, dict):
+        return payload
+    return {} if default is None else default
+
+
+def _upstream_error(data):
+    """Upstream error value as dict ({} when absent or non-dict).
+
+    A plain-string ``{"error": "<msg>"}`` payload is wrapped as
+    ``{"message": <msg>}`` so the message survives instead of degrading
+    to a bare ``HTTP <status>``.
+    """
+    if not isinstance(data, dict):
+        return {}
+    err = data.get("error")
+    if isinstance(err, dict):
+        return err
+    if isinstance(err, str) and err.strip():
+        return {"message": err}
+    return {}
+
+
 def _first_chunk_error(raw_line: str) -> tuple[str, bool] | None:
     """Classify an SSE chunk that is an upstream error payload.
 
@@ -767,9 +844,15 @@ def _first_chunk_error(raw_line: str) -> tuple[str, bool] | None:
     except json.JSONDecodeError:
         return None
     if "FreeUsageLimitError" in trimmed or parsed.get("error") or parsed.get("type") == "error":
-        err = parsed.get("error") or {}
+        err = _upstream_error(parsed)
         if isinstance(err, dict):
-            msg = err.get("message") or parsed.get("message") or "Upstream error"
+            raw_err = parsed.get("error")
+            msg = (
+                err.get("message")
+                or (str(raw_err) if isinstance(raw_err, str) and raw_err.strip() else None)
+                or parsed.get("message")
+                or "Upstream error"
+            )
             kind = f"{err.get('code', '')} {err.get('type', '')}"
         else:
             msg = parsed.get("message") or str(err) or "Upstream error"
@@ -874,11 +957,176 @@ def _is_bare_internal_error(status_code: int, data: dict | None = None, body: st
     return len((body or "").strip()) < 200
 
 
+def _responses_conversation_key(resp_body: dict) -> str | None:
+    """Stable per-conversation key for issuer affinity.
+
+    Uses ``prompt_cache_key`` when present (the client sets it once per
+    conversation), else the sha256 of the first user message content. Returns
+    None when the body carries no usable identity.
+    """
+    if not isinstance(resp_body, dict):
+        return None
+    pck = resp_body.get("prompt_cache_key")
+    if isinstance(pck, str) and pck:
+        return f"pck:{pck}"
+    inp = resp_body.get("input")
+    if isinstance(inp, list):
+        for item in inp:
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content:
+                return "sha256:" + hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ("input_text", "text") and part.get("text"):
+                        return "sha256:" + hashlib.sha256(part["text"].encode("utf-8", errors="replace")).hexdigest()
+    return None
+
+
+def _is_reasoning_caller_mismatch(body_text: str) -> bool:
+    """True when upstream rejected a reasoning blob signed to another backend."""
+    return bool(re.search(r"encrypted_content.{0,32}?was not issued to this caller", body_text, re.IGNORECASE))
+
+
+def _is_expired_reasoning_reference(body_text: str) -> bool:
+    """True when upstream can no longer resolve a referenced reasoning item."""
+    return bool(re.search(r"referenced reasoning item.{0,256}?was not found or has expired", body_text, re.IGNORECASE))
+
+
+def _iter_reasoning_items(resp_body: dict):
+    """Yield every reasoning item dict under input / input_messages."""
+    for field in ("input", "input_messages"):
+        items = resp_body.get(field) if isinstance(resp_body, dict) else None
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                yield item
+
+
+def _strip_reasoning_encryption(resp_body: dict) -> dict:
+    """Deep-copy the body with caller-bound reasoning state removed.
+
+    Drops ``encrypted_content`` from every reasoning item (the blob upstream
+    signs to the issuing backend) and ``previous_response_id`` (which chains
+    to reasoning the new exit cannot verify). The input items themselves stay:
+    the conversation history is still valid, only the unverifiable signatures
+    go.
+    """
+    body = copy.deepcopy(resp_body)
+    for item in _iter_reasoning_items(body):
+        item.pop("encrypted_content", None)
+    body.pop("previous_response_id", None)
+    return body
+
+
+def _strip_all_reasoning_items(resp_body: dict) -> dict:
+    """Deep-copy the body with every reasoning item removed (expired reference).
+
+    Stronger than :func:`_strip_reasoning_encryption`: when upstream can no
+    longer resolve a referenced reasoning item at all, the whole item (not
+    just the blob) plus ``previous_response_id`` must go.
+    """
+    body = copy.deepcopy(resp_body)
+    for field in ("input", "input_messages"):
+        items = body.get(field)
+        if not isinstance(items, list):
+            continue
+        body[field] = [i for i in items if not (isinstance(i, dict) and i.get("type") == "reasoning")]
+    body.pop("previous_response_id", None)
+    return body
+
+
+def _sweep_rejected_reasoning(now: float) -> None:
+    expired = [k for k, v in _rejected_reasoning.items() if now > v[1]]
+    for k in expired:
+        _rejected_reasoning.pop(k, None)
+
+
+def _remember_rejected_reasoning(key: str, resp_body: dict) -> None:
+    """Hash each encrypted_content blob upstream rejected for this conversation."""
+    if not key or not isinstance(resp_body, dict):
+        return
+    blobs = set()
+    for item in _iter_reasoning_items(resp_body):
+        blob = item.get("encrypted_content")
+        if isinstance(blob, str) and blob:
+            blobs.add(hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest())
+    if not blobs:
+        return
+    now = time.time()
+    _sweep_rejected_reasoning(now)
+    entry = _rejected_reasoning.get(key)
+    if entry is None:
+        if len(_rejected_reasoning) >= _REJECTED_REASONING_MAX_KEYS:
+            oldest = min(_rejected_reasoning, key=lambda k: _rejected_reasoning[k][1])
+            _rejected_reasoning.pop(oldest, None)
+        hashes = set(blobs)
+        exp = now + _REJECTED_REASONING_TTL
+    else:
+        hashes, exp = entry
+        hashes.update(blobs)
+    while len(hashes) > _REJECTED_REASONING_MAX_BLOBS:
+        hashes.pop()  # arbitrary eviction; the set is a safety net, not a ledger
+    _rejected_reasoning[key] = (hashes, exp)
+
+
+def _strip_rejected_reasoning(key: str, resp_body: dict) -> dict:
+    """Drop reasoning items whose blob hash upstream already rejected.
+
+    Returns the original body unchanged when nothing matches (no copy); a
+    deep-copy with the rejected items removed otherwise.
+    """
+    entry = _rejected_reasoning.get(key) if key else None
+    if not entry:
+        return resp_body
+    hashes, exp = entry
+    if time.time() > exp:
+        _rejected_reasoning.pop(key, None)
+        return resp_body
+    if not hashes:
+        return resp_body
+    body = copy.deepcopy(resp_body)
+    changed = False
+    for field in ("input", "input_messages"):
+        items = body.get(field)
+        if not isinstance(items, list):
+            continue
+        kept = []
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                blob = item.get("encrypted_content")
+                if isinstance(blob, str) and blob:
+                    h = hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
+                    if h in hashes:
+                        changed = True
+                        continue
+            kept.append(item)
+        if changed:
+            body[field] = kept
+    return body
+
+
+def _affinity_remember(key: str, relay: str) -> None:
+    """Record that this conversation's reasoning was issued by ``relay``."""
+    now = time.time()
+    expired = [k for k, v in _conv_affinity.items() if now > v[1]]
+    for k in expired:
+        _conv_affinity.pop(k, None)
+    if key not in _conv_affinity and len(_conv_affinity) >= _CONV_AFFINITY_MAX:
+        oldest = min(_conv_affinity, key=lambda k: _conv_affinity[k][1])
+        _conv_affinity.pop(oldest, None)
+    _conv_affinity[key] = (relay, now + _CONV_AFFINITY_TTL)
+
+
 def _is_backend_unavailable_error(status_code: int, data: dict | None = None, body: str = "") -> bool:
     """Recognize the model-backend-down 503: Zen Console returns [backend_unavailable]
-    when the model's upstream backend is temporarily down. Identical on every proxy
-    exit (same upstream), so rotating/cooldowns only burn attempts and penalize
-    healthy exits. Fail fast and let the caller retry on its own timing."""
+    when the model's upstream backend is temporarily down, or
+    "Upstream request failed: Endpoint is unavailable." when the model endpoint
+    itself is down (observed for longcat-2.5-preview-free). Identical on every
+    proxy exit (same upstream), so rotating/cooldowns only burn attempts and
+    penalize healthy exits. Fail fast and let the caller retry on its own timing."""
     if status_code != 503:
         return False
     text = (body or "").lower()
@@ -887,37 +1135,10 @@ def _is_backend_unavailable_error(status_code: int, data: dict | None = None, bo
         error = data.get("error") if isinstance(data, dict) else None
         if isinstance(error, dict):
             msg = f"{error.get('message') or ''} {error.get('type') or ''}"
-        if "backend_unavailable" not in msg.lower():
+        hay = f"{msg} {text}".lower()
+        if "backend_unavailable" not in hay and "endpoint is unavailable" not in hay:
             return False
     return True
-
-
-def _is_degraded_error(data: dict | None = None, body: str = "") -> bool:
-    """Recognize NVIDIA NIM 'DEGRADED function cannot be invoked' 400s.
-
-    NVIDIA returns this when a model deployment is temporarily degraded (often
-    a ``{"status":400,"title":"Bad Request","detail":"...DEGRADED..."}`` body).
-    It is deployment-level, NOT key-dependent: every key in the pool returns
-    the same 400, so retrying/rotating keys only burns the whole pool on
-    backoff. It must fail fast and terminal instead.
-    """
-    error = data.get("error") if isinstance(data, dict) else None
-    text = "".join(
-        str(value)
-        for value in (
-            error.get("message") if isinstance(error, dict) else error,
-            error.get("detail") if isinstance(error, dict) else None,
-            data.get("detail") if isinstance(data, dict) else None,
-            data.get("title") if isinstance(data, dict) else None,
-            body,
-        )
-        if value is not None
-    ).lower()
-    return (
-        "degraded function" in text
-        or "cannot be invoked" in text
-        or ("degraded" in text and "function" in text)
-    )
 
 
 def _is_region_error(data: dict | None = None, body: str = "") -> bool:
@@ -1011,7 +1232,7 @@ def _is_free_tier_gate_error(data: dict | None = None, body: str = "") -> bool:
         if body and ("FreeTierError" in body or "can only be used from within OpenCode" in body):
             return True
         if data:
-            err = data.get("error") or {}
+            err = _upstream_error(data)
             msg = f"{err.get('type') or ''} {err.get('message') or ''}" if isinstance(err, dict) else str(err)
             return "FreeTierError" in msg or "can only be used from within OpenCode" in msg
     except Exception:
@@ -1064,14 +1285,15 @@ _models_meta: dict[str, dict] = {}  # model_id -> {name, limit, modalities}
 _dead_models: set[str] = set()  # ids rejected upstream (free promotion ended); excluded from rediscovery
 # Free-tier ids whose name does not carry a "-free" suffix (models.dev cost == 0),
 # kept alongside name-tagged models so discovery doesn't drop them.
-_FREE_MODEL_EXTRA: set[str] = {"big-pickle"}
+_FREE_MODEL_EXTRA: set[str] = {"big-pickle", "stealth/space-bunny-alpha"}
 # Upstream lists these ids but they always fail: deepseek-v4-flash-free
 # returns "Model is unavailable", north-mini-code-free 400s on multi-turn tool
-# calls, ling-3.0-flash-free left the free tier (404, paid slug instead).
+# calls, ling-3.0-flash-free left the free tier (404, paid slug instead),
+# ling-3.0-flash-fin-free is FreeTier-gated on chat path on all exits (403).
 # Filtered from discovery AND from every listing/request path so clients never
 # see them. Volatile upstream state lives here (not DEAD_IDS): a restart
 # re-discovers when upstream heals, and session retire still applies below.
-_MODELS_BLOCKED: set[str] = {"deepseek-v4-flash-free", "north-mini-code-free", "ling-3.0-flash-free"}
+_MODELS_BLOCKED: set[str] = {"deepseek-v4-flash-free", "north-mini-code-free", "ling-3.0-flash-free", "ling-3.0-flash-fin-free"}
 _MODELS_BLOCKED_LOWER: frozenset[str] = frozenset(m.lower() for m in _MODELS_BLOCKED)
 # Precise free filter (port of pi-opencode-free FREE_REGEX): optional
 # `opencode/` prefix + mandatory `-free` suffix, case-insensitive.
@@ -1098,8 +1320,8 @@ def _is_blocked_model(model: str | None) -> bool:
 
 
 def _served_models() -> list[str]:
-    """Discovered free ids minus the always-failing blocklist."""
-    return [m for m in _models_cache if not _is_blocked_model(m)]
+    """Discovered free ids minus the always-failing blocklist (alphabetical)."""
+    return sorted([m for m in _models_cache if not _is_blocked_model(m)], key=str.lower)
 
 
 # ── Persistent dead-model denylist (pi-freeflow DEAD_MODEL_IDS pattern) ──
@@ -1196,7 +1418,9 @@ async def _fetch_free_models():
     global _models_cache, _models_meta, _models_checked_at
     try:
         async with httpx.AsyncClient() as c:
-            zen_headers = {"User-Agent": f"opencode/{OC_VERSION}", "x-opencode-client": "cli"}
+            # Full real-client header set (same as every Zen call path);
+            # discovery shares the stable "discovery" session id.
+            zen_headers = _zen_headers("discovery")
 
             async def _get_zen():
                 return await c.get(
@@ -1314,9 +1538,19 @@ async def _periodic_model_refresh():
     never requested.
     """
     await _fetch_free_models()
+    # Keep the Cline free rotation warm even with no chat traffic: a model
+    # rotated into free[] must be usable without waiting for a /v1/models hit.
+    try:
+        await _cline_maybe_refresh_free()
+    except Exception:
+        pass
     while True:
         await asyncio.sleep(_MODELS_REFRESH_SECS)
         await _fetch_free_models()
+        try:
+            await _cline_maybe_refresh_free()
+        except Exception:
+            pass
 
 async def _ensure_model_known(model: str) -> bool:
     """Return True once ``model`` is in the discovered free list.
@@ -1359,7 +1593,37 @@ def _has_promotion_phrase(data: dict | None = None, body: str = "") -> bool:
         return False
 
 
-def _mark_model_dead(model: str | None, persistent: bool = True) -> bool:
+_BACKEND_DOWN_RETIRE_AFTER = 3
+_BACKEND_DOWN_WINDOW = 3600.0
+_backend_down_hits: dict[str, list] = {}
+
+
+def _note_backend_unavailable(model: str | None) -> None:
+    """Count a model-backend-down sighting; retire the model past the threshold.
+
+    Zen answers ``503 Endpoint is unavailable`` for a model whose own endpoint
+    is gone. Retiring it keeps it out of the served list and stops every turn
+    from paying the fail-fast round trip. The threshold matters: a single
+    transient 503 must not brick a healthy model across restarts, so the
+    sightings must repeat inside a window before the id is persisted
+    (pi-freeflow 50696fd / 1.33.0 removes dead upstreams permanently).
+    """
+    if not model:
+        return
+    now = time.time()
+    ent = _backend_down_hits.get(model)
+    if not ent or now - ent[1] > _BACKEND_DOWN_WINDOW:
+        _backend_down_hits[model] = [1, now]
+        return
+    ent[0] += 1
+    if ent[0] >= _BACKEND_DOWN_RETIRE_AFTER:
+        # Clear the counter so the retirement is logged once, not per turn.
+        _backend_down_hits.pop(model, None)
+        _log(f"[zen] Model {model}: backend unavailable {_BACKEND_DOWN_RETIRE_AFTER}x in window — retiring from served list")
+        _mark_model_dead(model, persistent=True, reason="endpoint unavailable upstream")
+
+
+def _mark_model_dead(model: str | None, persistent: bool = True, reason: str | None = None) -> bool:
     """Drop a model the upstream refuses with a promotion-ended ModelError.
 
     Removes it from the served list so clients get an immediate, clear
@@ -1369,6 +1633,7 @@ def _mark_model_dead(model: str | None, persistent: bool = True) -> bool:
     persistent=True (explicit promotion phrase) also adds to file-backed
     DEAD_IDS; persistent=False (bare 401 ModelError, no phrase) is
     session-only so a transient 401 cannot brick the model across restarts.
+    ``reason`` overrides the logged cause (e.g. a dead endpoint).
     """
     global _models_cache, _models_meta
     if not model or model in _dead_models or model in DEAD_IDS:
@@ -1382,7 +1647,7 @@ def _mark_model_dead(model: str | None, persistent: bool = True) -> bool:
     if model in _models_cache:
         _models_cache = [m for m in _models_cache if m != model]
         _models_meta.pop(model, None)
-    _log(f"[models] Retired {model} (upstream: free promotion ended){'' if persistent else ' [session-only]'}")
+    _log(f"[models] Retired {model} ({reason or 'upstream: free promotion ended'}){'' if persistent else ' [session-only]'}")
     return True
 
 
@@ -1406,10 +1671,16 @@ MODEL_ALIASES: dict[str, str] = {
     "longcat": "longcat-2.0-free",
     "longcat-2.0": "longcat-2.0-free",
     "hy3": "hy3-free",
-    "ling-flash": "ling-3.0-flash-fin-free",
+    "space-bunny": "space-bunny-free",
+    "space-bunny-alpha": "stealth/space-bunny-alpha",
+    "longcat-2.5": "longcat-2.5-preview-free",
+    "longcat-2.5-preview": "longcat-2.5-preview-free",
     "mimo-v2.6": "mimo-v2.6-flash-free",
     "mimo-v2.6-flash": "mimo-v2.6-flash-free",
     "jev": "jev-1.13-free",
+    "fledge-alpha": "fledge-alpha-free",
+    "ling-3.1-flash": "ling-3.1-flash-free",
+    "ling-3.1": "ling-3.1-flash-free",
 }
 
 
@@ -1820,7 +2091,7 @@ _ABORT_TEXT_MARKERS = (
 # checked before _ABORT_TEXT_MARKERS. Bare "disconnect" used to live in the marker
 # list and misclassified httpx RemoteProtocolError("Server disconnected without
 # sending a response") as "Client aborted", terminating the stream instead of
-# rotating the proxy exit and retrying. Mirrors proxy_pool/nvidia_pool is_cancelled.
+# rotating the proxy exit and retrying. Mirrors proxy_pool is_cancelled.
 _UPSTREAM_NOT_ABORT_MARKERS = (
     "server disconnect",
     "without sending a response",
@@ -1831,8 +2102,8 @@ _UPSTREAM_NOT_ABORT_MARKERS = (
 def _is_client_abort(exc: BaseException | None) -> bool:
     """True for client-side aborts: never mark the pool failed for these.
 
-    Mirrors proxy_pool.is_cancelled / nvidia_pool.is_cancelled so all three
-    pools agree on GeneratorExit/Disconnect/AbortError variants.
+    Mirrors proxy_pool.is_cancelled so both agree on
+    GeneratorExit/Disconnect/AbortError variants.
     """
     if exc is None:
         return False
@@ -1871,8 +2142,6 @@ def _strip_direct_headers(headers: dict | None) -> dict:
     in server.py / proxy_pool.py re-adds Authorization afterwards —
     proxy_pool.get_client() only sets base_url/timeout/proxy, never headers,
     and zen_request() builds Zen headers fresh with no Authorization key.
-    NVIDIA NIM path (_nvidia_headers) is the sole legit Bearer user and never
-    flows through this strip.
     """
     if not isinstance(headers, dict):
         return {}
@@ -1974,54 +2243,13 @@ def _report_upstream_status(addr: str | None, status: int | None) -> bool:
         return True
 
 
-def _report_nvidia_status(key: str | None, status: int | None) -> bool:
-    """Record an upstream HTTP status for escalating 5xx/504 key cooldown.
-
-    Delegates to nvidia_keys.report_http_status (429 keeps its dedicated
-    report_rate_limit sites). Returns True if the caller should roll to the
-    next key, False on 504 fast-break.
-    """
-    if not key or status is None:
-        return True
-    try:
-        code = int(status)
-    except Exception:
-        return True
-    if code == 429:
-        return True  # dedicated report_rate_limit path owns 429
-    try:
-        return nvidia_keys.report_http_status(key, code)
-    except Exception:
-        return True
-
-
-def _report_amd_status(key: str | None, status: int | None) -> bool:
-    """Record an upstream HTTP status for escalating 5xx/504 key cooldown.
-
-    Delegates to amd_keys.report_http_status (429 keeps its dedicated
-    report_rate_limit sites). Returns True if the caller should roll to the
-    next key, False on 504 fast-break.
-    """
-    if not key or status is None:
-        return True
-    try:
-        code = int(status)
-    except Exception:
-        return True
-    if code == 429:
-        return True  # dedicated report_rate_limit path owns 429
-    try:
-        return amd_keys.report_http_status(key, code)
-    except Exception:
-        return True
-
-
 def _report_cline_status(key: str | None, status: int | None) -> bool:
-    """Record an upstream HTTP status for escalating 5xx/504 key cooldown.
+    """Record an upstream HTTP status for the Cline slot pool.
 
     Delegates to cline_keys.report_http_status (429 keeps its dedicated
-    report_capped/report_rate_limit sites). Returns True if the caller
-    should roll to the next key, False on 504 fast-break.
+    report_capped sites). Always returns True (roll to the next slot):
+    the slot pool has no escalating per-key cooldown — caps carry the
+    rate-limit bookkeeping.
     """
     if not key or status is None:
         return True
@@ -2035,6 +2263,26 @@ def _report_cline_status(key: str | None, status: int | None) -> bool:
         return cline_keys.report_http_status(key, code)
     except Exception:
         return True
+
+
+def _map_cline_error(status) -> str:
+    """Machine-classified outcome of one Cline chat attempt (pi-freeflow port):
+    ok / auth (401/403) / rate-limit (429) / exhausted (402) / server (5xx)."""
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return "client"
+    if 200 <= code < 300:
+        return "ok"
+    if code in (401, 403):
+        return "auth"
+    if code == 429:
+        return "rate-limit"
+    if code == 402:
+        return "exhausted"
+    if code >= 500:
+        return "server"
+    return "client"
 
 
 def _log_direct_fallback(model, status):
@@ -2060,7 +2308,7 @@ async def _direct_buffered_post(path: str, req_body: dict, headers: dict, client
         return resp.status_code, {}, f"direct-fetch read failure: {_exc_desc(e)}"
     text = raw.decode("utf-8", errors="replace") if raw else ""
     try:
-        data = json.loads(raw) if raw else {}
+        data = _as_dict(json.loads(raw)) if raw else {}
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
         data = {}
     return resp.status_code, data, text
@@ -2214,8 +2462,7 @@ _SAMPLING_KEYS = ("temperature", "top_p", "stop")
 
 
 # prompt_cache_key passes through additively on the Zen path; retention is
-# never forwarded (stripped in zen_request). Kept out of _SAMPLING_KEYS so the
-# NVIDIA path is untouched.
+# never forwarded (stripped in zen_request).
 _ZEN_SAMPLING_KEYS = _SAMPLING_KEYS + ("prompt_cache_key",)
 
 
@@ -2224,41 +2471,214 @@ def _sampling_from(body: dict) -> dict:
     return {k: body[k] for k in _ZEN_SAMPLING_KEYS if body.get(k) is not None}
 
 
-_NVIDIA_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
-
-
-def _nvidia_sampling_from(body: dict) -> dict:
-    """NVIDIA NIM also accepts reasoning_effort (low/medium/high) on reasoning models."""
-    return {k: body[k] for k in _NVIDIA_SAMPLING_KEYS if body.get(k) is not None}
-
-
-_AMD_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
-
-
-def _amd_sampling_from(body: dict) -> dict:
-    """AMD TokenFactory mirrors the NVIDIA sampling surface (reasoning_effort)."""
-    return {k: body[k] for k in _AMD_SAMPLING_KEYS if body.get(k) is not None}
-
-
-_CLINE_SAMPLING_KEYS = _SAMPLING_KEYS + ("reasoning_effort",)
+# reasoning_effort is deliberately NOT forwarded to Cline. Its per-model
+# acceptance is unknown (no endpoint advertises it, and nothing in the code
+# maps it the way the Zen path maps effort for muse), so sending it
+# unconditionally means every client that sets it — OpenCode sets it on
+# essentially every request — 400s on each model that rejects the field: the
+# "some models work, some don't, only for some clients" signature.
+# Omitting it cannot break a model that works today (the upstream applies its
+# own default effort); forwarding it can. Widen only if a model is observed
+# to accept it.
+_CLINE_SAMPLING_KEYS = _SAMPLING_KEYS
 
 
 def _cline_sampling_from(body: dict) -> dict:
-    """Cline mirrors the NVIDIA/AMD sampling surface (reasoning_effort)."""
+    """Client sampling params safe to forward to Cline.
+
+    temperature/top_p/stop only — see the note on ``_CLINE_SAMPLING_KEYS``
+    about reasoning_effort.
+    """
     return {k: body[k] for k in _CLINE_SAMPLING_KEYS if body.get(k) is not None}
+
+
+# ── Zen client mimicry ──────────────────────────────────────────
+# Zen free tier gates on real-CLI headers (pi-freeflow trefeon/pi-freeflow):
+# User-Agent opencode/<version> (>=1.17.0), x-opencode-client, a
+# ses_<12hex><14base62> x-opencode-session stable per process (+ session-id
+# and affinity aliases), a fresh msg_ x-opencode-request per call, and
+# x-opencode-project. _zen_headers() builds the full set; every Zen call
+# path (discovery, verify, chat, responses, streaming, direct-fallback)
+# must use it so no path leaks a stale UA or a missing key.
+# Never send Authorization: Zen free tier is keyless, any Bearer 401s.
+
+# Process-stable OpenCode session (pi-freeflow OPENCODE_SESSION: one per
+# daemon). Created lazily on first use so oc_id() is defined.
+_OPENCODE_SESSION: str | None = None
+
+
+def _stable_zen_session() -> str:
+    global _OPENCODE_SESSION
+    if not _OPENCODE_SESSION:
+        _OPENCODE_SESSION = oc_id("ses", descending=True)
+    return _OPENCODE_SESSION
+
+
+_ZEN_SESSION_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+_ZEN_SESSION_HEX_RE = re.compile(r"^ses_[0-9a-f]{8,}$")
+
+# Native tools the Zen free tier expects to see (pi-freeflow sextet):
+# callers keep their tools; any missing fingerprint tool is appended.
+_ZEN_NATIVE_TOOL_DEFS = (
+    (
+        "bash",
+        "Execute a shell command in the project directory",
+        {
+            "type": "object",
+            "properties": {"command": {"type": "string", "description": "Shell command to run"}},
+            "required": ["command"],
+        },
+    ),
+    (
+        "glob",
+        "Find files matching a glob pattern",
+        {
+            "type": "object",
+            "properties": {"pattern": {"type": "string", "description": "Glob pattern to match"}},
+            "required": ["pattern"],
+        },
+    ),
+    (
+        "grep",
+        "Search file contents with a regular expression",
+        {
+            "type": "object",
+            "properties": {"pattern": {"type": "string", "description": "Regex pattern to search"}},
+            "required": ["pattern"],
+        },
+    ),
+    (
+        "read",
+        "Read the contents of a file",
+        {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "File path to read"}},
+            "required": ["path"],
+        },
+    ),
+    (
+        "edit",
+        "Do not call this placeholder tool",
+        {"type": "object", "properties": {}},
+    ),
+    (
+        "write",
+        "Write contents to a file",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to write"},
+                "content": {"type": "string", "description": "File content"},
+            },
+            "required": ["path", "content"],
+        },
+    ),
+)
+
+
+def _zen_session_id(session_id) -> str:
+    """Normalize to the real CLI shape, stable per process (pi-freeflow).
+
+    Correctly-shaped ``ses_<12hex><14base62>`` ids pass through untouched
+    (preserves per-conversation stability). Anything else returns the
+    process-stable ``_stable_zen_session()`` so every probe/call shares one
+    daemon session like the reference client.
+    """
+    try:
+        s = str(session_id or "")
+    except Exception:
+        s = ""
+    if s and _ZEN_SESSION_RE.match(s):
+        return s
+    # Legacy hex sessions (ses_+hex) predate the base62 shape; keep them
+    # working by mapping deterministically onto the stable daemon session
+    # instead of emitting a wrong-shaped id that trips the gate.
+    return _stable_zen_session()
+
+
+def _zen_headers(session_id) -> dict:
+    """Full real-client header set for every Zen call (pi-freeflow)."""
+    sid = _zen_session_id(session_id)
+    return {
+        "Content-Type": "application/json",
+        "User-Agent": f"opencode/{OC_VERSION}",
+        "x-opencode-client": "cli",
+        "x-opencode-project": _ZEN_PROJECT_ID,
+        "x-opencode-request": oc_id("msg"),
+        "x-opencode-session": sid,
+        "x-opencode-session-id": sid,
+        "x-session-affinity": sid,
+    }
+
+
+def _normalize_tool_name(name) -> str:
+    """Lowercase Bash->bash like pi-freeflow normalizePlaceholderCase."""
+    try:
+        return str(name or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _ensure_native_tools(tools):
+    """Guarantee the pi-freeflow fingerprint sextet (OpenAI chat shape).
+
+    Caller tools are never dropped; any missing fingerprint tool
+    (bash,glob,grep,read,edit,write) is appended.
+    """
+    out = [t for t in (tools or []) if isinstance(t, dict)]
+    have = set()
+    for t in out:
+        fn = t.get("function") or {}
+        if isinstance(fn, dict) and fn.get("name"):
+            have.add(_normalize_tool_name(fn.get("name")))
+            # Normalize case in place so upstream sees lowercase.
+            try:
+                fn["name"] = _normalize_tool_name(fn.get("name"))
+            except Exception:
+                pass
+    for name, desc, params in _ZEN_NATIVE_TOOL_DEFS:
+        if name not in have:
+            out.append({"type": "function", "function": {"name": name, "description": desc, "parameters": params}})
+            have.add(name)
+    return out
+
+
+def _ensure_native_responses_tools(resp_tools):
+    """Same guarantee for Responses-shaped tools ({type,name,...})."""
+    out = [t for t in (resp_tools or []) if isinstance(t, dict)]
+    have = set()
+    for t in out:
+        if t.get("name"):
+            have.add(_normalize_tool_name(t.get("name")))
+            try:
+                t["name"] = _normalize_tool_name(t.get("name"))
+            except Exception:
+                pass
+    for name, desc, params in _ZEN_NATIVE_TOOL_DEFS:
+        if name not in have:
+            out.append({"type": "function", "name": name, "description": desc, "parameters": params})
+            have.add(name)
+    return out
 
 
 def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tokens=None, max_completion_tokens=None, sampling: dict | None = None):
     model = _normalize_model(model)
     req_body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
+    tools = _ensure_native_tools(tools)
     if tools:
         req_body["tools"] = tools
     if tool_choice:
-        # Zen thinking mode rejects forced tool_choice (e.g. {"type":"function",
-        # "function":{"name":"..."}} or "none"). Downgrade to "auto" so the
-        # request passes thinking-mode validation; the model will still call
-        # the right tool based on context.
-        if tool_choice == "auto" or tool_choice == "none":
+        # pi-freeflow: tool_choice "none"/{type:"none"} is deleted, never
+        # forwarded. Forced function calls are downgraded to "auto".
+        try:
+            is_none = tool_choice == "none" or (
+                isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
+            )
+        except Exception:
+            is_none = False
+        if is_none:
+            pass
+        elif tool_choice == "auto":
             req_body["tool_choice"] = tool_choice
         else:
             req_body["tool_choice"] = "auto"
@@ -2275,21 +2695,13 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tok
     req_body.pop("prompt_cache_retention", None)
     req_body.pop("store", None)  # never forward store:true to Zen
 
-    request_id = oc_id("msg")
     # Keyless: Zen free tier rejects ANY Authorization Bearer (401), so omit
     # the header entirely. Keep x-opencode-client/project + UA.
     # Applied-last-wins: this fresh dict is built AFTER any caller header
     # merge, and no code path in server.py / proxy_pool.py re-adds
     # Authorization afterwards (pool clients set transport only; direct-
     # fallback paths only strip via _strip_direct_headers, never inject).
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": f"opencode/{OC_VERSION}",
-        "x-opencode-client": "cli",
-        "x-opencode-project": _ZEN_PROJECT_ID,
-        "x-opencode-request": request_id,
-        "x-opencode-session": session_id,
-    }
+    headers = _zen_headers(session_id)
     if any(str(k).lower() == "authorization" for k in headers):
         raise RuntimeError("keyless: Authorization leaked into zen_request headers")
     return req_body, headers
@@ -2340,6 +2752,73 @@ def _muse_effort(effort) -> str | None:
     return e if e in _MUSE_EFFORTS else None
 
 
+# Highest reasoning effort each free model actually offers. A request for a
+# level a model does not have used to fail outright; the level is now
+# clamped to the highest one that model supports (pi-freeflow 98a12c5 /
+# 1.33.0), which previously only covered Muse Spark.
+_MODEL_MAX_EFFORT: dict[str, str] = {}
+
+
+def _model_effort_ceiling(model: str | None) -> str | None:
+    """Highest effort ``model`` supports, or None when unconstrained."""
+    if not model:
+        return None
+    m = str(model).lower()
+    # Longest key first so "nemotron-3.5-lightning" wins over "nemotron".
+    for key in sorted(_MODEL_MAX_EFFORT, key=len, reverse=True):
+        if key in m:
+            return _MODEL_MAX_EFFORT[key]
+    return None
+
+
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _clamp_effort_for_model(model: str | None, effort) -> str | None:
+    """Clamp ``effort`` to the model's ceiling, preserving unknown levels.
+
+    Deliberately does NOT route through ``_muse_effort``: that helper folds
+    ``max``/``ultra`` into ``xhigh`` for Muse Spark, which would flatten
+    every model that legitimately offers ``max``. The fold now happens only
+    as a result of the ceiling clamp (or, for a model with no known ceiling,
+    via ``_muse_effort`` as the legacy default).
+    """
+    if not effort:
+        return None
+    e = str(effort).lower().strip()
+    if e not in _EFFORT_ORDER:
+        return None
+    ceiling = _model_effort_ceiling(model)
+    if not ceiling:
+        return _muse_effort(e) or e
+    if _EFFORT_ORDER.index(e) <= _EFFORT_ORDER.index(ceiling):
+        return e
+    return ceiling
+
+
+# Highest reasoning effort each free model actually offers (pi-freeflow
+# catalog, verified live). Models absent from this table are unconstrained.
+# muse-spark tops out at xhigh, so a "max" request is clamped rather than
+# rejected.
+_MODEL_MAX_EFFORT.update({
+    "muse-spark-1.3": "xhigh",
+    "muse-spark-1.2": "xhigh",
+    "muse-spark-1.1": "xhigh",
+    "muse-spark": "xhigh",
+    "big-pickle": "max",
+    "space-bunny-free": "max",
+    "longcat-2.5-preview-free": "max",
+    "fledge-alpha-free": "max",
+    "ling-3.1-flash-free": "max",
+    "nemotron-3-ultra-free": "xhigh",
+    "nemotron-3.5-lightning-free": "xhigh",
+    "mimo-v2.6-flash-free": "xhigh",
+    # Step 5 Preview offers only low/medium/high and disables "minimal"
+    # (pi-freeflow 50981fb / 1.34.0: the Zen entry corrected from its Kilo twin).
+    "step-5-preview-free": "high",
+})
+
+
 def _model_suffix_effort(model: str | None) -> str | None:
     """Extract the reasoning-effort suffix from a client model id (…:high)."""
     if not model:
@@ -2353,26 +2832,30 @@ def _model_suffix_effort(model: str | None) -> str | None:
 
 
 def _resolve_muse_effort(model_id: str | None, body: dict | None = None) -> str | None:
-    """Resolve the muse reasoning effort with the Responses xhigh clamp.
+    """Resolve the reasoning effort, clamped to what ``model_id`` supports.
 
     Precedence: ``:suffix`` on the model id > ``reasoning.effort`` >
     ``reasoning_effort``. Without this, a Chat-style ``reasoning_effort``
     (e.g. "max") falls through the ``if eff:`` gate as None and the request
     goes out with no ``reasoning`` block at all (same normalization 9router
     does at its executor boundary).
+
+    The resolved level is then clamped to the model's own ceiling, so asking
+    for a level a model does not offer degrades to the highest one it does
+    instead of failing upstream (pi-freeflow 98a12c5 / 1.33.0).
     """
     eff = _model_suffix_effort(model_id)
     if eff:
-        return eff
+        return _clamp_effort_for_model(model_id, eff)
     if isinstance(body, dict):
         r = body.get("reasoning")
         if isinstance(r, dict):
             eff = _muse_effort(r.get("effort"))
             if eff:
-                return eff
+                return _clamp_effort_for_model(model_id, eff)
         eff = _muse_effort(body.get("reasoning_effort"))
         if eff:
-            return eff
+            return _clamp_effort_for_model(model_id, eff)
     return None
 
 
@@ -2518,17 +3001,18 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
         "input": _chat_to_responses_input(messages),
         "stream": True,
     }
-    if tools:
-        body["tools"] = [
-            {
-                "type": "function",
-                "name": (t.get("function") or {}).get("name") or "",
-                "description": (t.get("function") or {}).get("description") or "",
-                "parameters": (t.get("function") or {}).get("parameters") or {},
-            }
-            for t in tools
-            if isinstance(t, dict)
-        ]
+    resp_tools = _ensure_native_responses_tools([
+        {
+            "type": "function",
+            "name": (t.get("function") or {}).get("name") or "",
+            "description": (t.get("function") or {}).get("description") or "",
+            "parameters": (t.get("function") or {}).get("parameters") or {},
+        }
+        for t in (tools or [])
+        if isinstance(t, dict)
+    ])
+    if resp_tools:
+        body["tools"] = resp_tools
         body["tool_choice"] = "auto"
     # max_tokens hygiene: prefer max_tokens (never rename it); fall back to
     # max_completion_tokens only when max_tokens is absent.
@@ -2541,7 +3025,7 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
         mt = _RESPONSES_MIN_OUTPUT_TOKENS
     if mt is not None:
         body["max_output_tokens"] = mt
-    eff = _muse_effort(effort)
+    eff = _clamp_effort_for_model(model, effort)
     # No default effort cap: unset effort passes through with no reasoning
     # block (upstream default, full quality). Only explicit high/xhigh/max/
     # ultra on tool-free muse requests is downgraded to low — those levels
@@ -2553,8 +3037,28 @@ def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
         body["reasoning"] = {"effort": eff, "summary": "auto"}
     if sampling:
         body.update(sampling)
+    # pi-freeflow normalizeResponsesBody: Responses forbids chat-only keys.
+    body.pop("messages", None)
+    body.pop("max_tokens", None)
+    body.pop("max_completion_tokens", None)
+    body.pop("temperature", None)
+    body.pop("top_p", None)
+    body.pop("response_format", None)
+    try:
+        if body.get("parallel_tool_calls") is False:
+            body.pop("parallel_tool_calls", None)
+    except Exception:
+        pass
+    try:
+        tc = body.get("tool_choice")
+        if tc == "none" or (isinstance(tc, dict) and tc.get("type") == "none"):
+            body.pop("tool_choice", None)
+    except Exception:
+        pass
     body.pop("prompt_cache_retention", None)
-    body.pop("store", None)  # never forward store:true to Zen
+    if body.get("store") is None:
+        body["store"] = False
+    body["stream"] = True
     return body
 
 
@@ -2577,6 +3081,49 @@ def _responses_diag(resp_body: dict) -> str:
         return "?"
 
 
+def _gate_req_diag(req_body: dict | None) -> str:
+    """One-line digest of any upstream request body for FreeTier gate forensics.
+
+    Responses bodies delegate to _responses_diag; chat bodies get the mirror:
+    tool count/shape, message count + role layout, token knobs. Lets the next
+    gate 403 be diffed against a working request from the same window.
+    """
+    try:
+        body = req_body or {}
+        if "input" in body:
+            return _responses_diag(body)
+        tools = body.get("tools") or []
+        tinfo = []
+        for t in tools[:12]:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function") or {}
+            name = (fn.get("name") if isinstance(fn, dict) else None) or t.get("name") or "?"
+            tinfo.append(str(name))
+        msgs = body.get("messages") or []
+        roles = []
+        for m in msgs:
+            if isinstance(m, dict):
+                r = str(m.get("role") or "?")
+                extra = ""
+                if m.get("tool_calls"):
+                    extra = "+tc"
+                if m.get("reasoning_content") or m.get("reasoning"):
+                    extra += "+rsn"
+                roles.append(r + extra)
+        chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs if isinstance(m, dict))
+        return (
+            f"tools={len(tools)}[{','.join(tinfo)}] "
+            f"msgs={len(msgs)}[{'>'.join(roles[:16])}] msg_chars~{chars} "
+            f"max_tokens={body.get('max_tokens')!r} max_completion_tokens={body.get('max_completion_tokens')!r} "
+            f"tool_choice={body.get('tool_choice')!r} stream={body.get('stream')!r} "
+            f"temperature={body.get('temperature')!r} top_p={body.get('top_p')!r} "
+            f"reasoning_effort={(body.get('reasoning') or {}).get('effort') if isinstance(body.get('reasoning'), dict) else body.get('reasoning_effort', body.get('reasoningEffort'))!r}"
+        )
+    except Exception:
+        return "?"
+
+
 def _responses_usage_to_chat(usage: dict | None) -> dict | None:
     if not isinstance(usage, dict):
         return None
@@ -2589,6 +3136,553 @@ def _responses_usage_to_chat(usage: dict | None) -> dict | None:
         "total_tokens": usage.get("total_tokens") or (prompt + completion),
         "prompt_cache_hit_tokens": cached,
     }
+
+
+# ── Streamed tool-call reassembly (pi-freeflow 880b103 / 1.33.3) ────
+# Some models label every parallel tool call with the same index (often 0).
+# Merging on index alone then joins distinct calls into one unreadable
+# blob — names concatenate, arguments splice together, and the host rejects
+# the whole turn (a planning tool ends up stuck mid-turn). A delta that
+# carries a *new* call id therefore opens its own slot, while id-less
+# deltas keep appending to the slot already open for that index, so a call
+# whose text arrives in several pieces still reassembles whole.
+
+
+def _tc_slot_empty(slot) -> bool:
+    """True when a tool-call slot has neither id, name, nor arguments yet."""
+    if not isinstance(slot, dict):
+        return False
+    if str(slot.get("id") or "").strip():
+        return False
+    fn = slot.get("function")
+    if isinstance(fn, dict):
+        return not str(fn.get("name") or "").strip() and not str(fn.get("arguments") or "").strip()
+    return not str(slot.get("name") or "").strip() and not str(slot.get("arguments") or "").strip()
+
+
+def _tool_call_slot_key(tc: dict, slots: dict, by_id: dict):
+    """Return the ``slots`` key this streamed tool-call delta belongs to.
+
+    ``slots`` maps key -> slot dict (any shape; only emptiness is inspected)
+    and ``by_id`` maps call id -> key. Keys stay integers so downstream
+    ``sorted(slots)`` still yields first-seen order across both plain
+    indices and overflow slots.
+    """
+    idx = tc.get("index", 0)
+    if isinstance(idx, bool) or not isinstance(idx, int):
+        idx = 0
+    cid = str(tc.get("id") or "").strip()
+    if not cid:
+        return idx
+    if cid in by_id:
+        return by_id[cid]
+    cur = slots.get(idx)
+    if cur is None or _tc_slot_empty(cur):
+        by_id[cid] = idx
+        return idx
+    nxt = 0
+    for k in slots:
+        if isinstance(k, int) and k >= nxt:
+            nxt = k + 1
+    by_id[cid] = nxt
+    return nxt
+
+
+# Tools the proxy declares purely so the Zen free tier answers (see
+# _ZEN_NATIVE_TOOL_DEFS). A model may still call one; a host that declared
+# no tools of its own can never execute it, so those calls are dropped
+# rather than handed to the client (pi-freeflow 1.30.0).
+_INJECTED_TOOL_NAMES = frozenset(t[0] for t in _ZEN_NATIVE_TOOL_DEFS)
+
+
+def _strip_injected_tool_calls(calls, caller_declared_tools: bool):
+    """Drop proxy-injected placeholder calls when the caller sent no tools.
+
+    ``calls`` is a list of assembled tool-call dicts in either chat shape
+    (``{"function": {"name": ...}}``) or flat shape (``{"name": ...}``).
+    Returns the input unchanged when the caller did declare tools, since
+    then the injected names ride along with real ones and a call to one is
+    at least addressable.
+    """
+    if caller_declared_tools or not calls:
+        return calls
+    out = []
+    for c in calls:
+        if not isinstance(c, dict):
+            continue
+        fn = c.get("function")
+        name = (fn.get("name") if isinstance(fn, dict) else None) or c.get("name") or ""
+        if str(name).strip().lower() in _INJECTED_TOOL_NAMES:
+            continue
+        out.append(c)
+    return out
+
+
+def _strip_injected_tool_deltas(piece: dict, caller_declared_tools: bool) -> None:
+    """Strip injected placeholder calls from one streamed SSE chunk in place.
+
+    Only touch chunks that actually carry a ``tool_calls`` delta, so the
+    common case costs a dict lookup per chunk.
+    """
+    if caller_declared_tools:
+        return
+    try:
+        choices = piece.get("choices") or []
+        if not choices:
+            return
+        first = choices[0]
+        if not isinstance(first, dict):
+            return
+        delta = first.get("delta")
+        if not isinstance(delta, dict):
+            return
+        tcs = delta.get("tool_calls")
+        if not tcs:
+            return
+        kept = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            name = (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name") or ""
+            if str(name).strip().lower() in _INJECTED_TOOL_NAMES:
+                continue
+            kept.append(tc)
+        if len(kept) != len(tcs):
+            delta["tool_calls"] = kept
+    except Exception:
+        return
+
+
+# ── Tool-argument schema repair (pi-freeflow 37c2cb6 / 1.33.2) ─────
+# Free models intermittently emit tool arguments that do not match the
+# schema the caller declared. Measured live through this proxy (probe_tool_args.py):
+#   muse-spark-1.3-contributor-free -> {"items":[...]} instead of {"list":[...]}
+#   step-5-preview-free            -> "tasks" instead of "items" inside a phase
+# Unrepaired, the host renders each phase as one raw JSON string and the task
+# list stalls mid-turn, and the model does not retry.
+#
+# Repairs are deliberately conservative: only when the intended target is
+# UNAMBIGUOUS (a single candidate). Never repairs unparseable or truncated
+# JSON — reconstructing cut-off arguments would invent content.
+
+_SCHEMA_SHAPE_CACHE: dict[int, str | None] = {}
+
+
+def _schema_shape(schema) -> str | None:
+    """Coarse shape tag of a declared JSON schema, or None when free-form."""
+    if not isinstance(schema, dict):
+        return None
+    t = schema.get("type")
+    if isinstance(t, str):
+        if t == "object":
+            return "object"
+        if t == "array":
+            items = schema.get("items")
+            it = items.get("type") if isinstance(items, dict) else None
+            return f"array<{it}>" if isinstance(it, str) else "array<any>"
+        return t
+    if isinstance(schema.get("properties"), dict):
+        return "object"
+    return None
+
+
+def _value_shape(value) -> str | None:
+    """Coarse shape tag of an actual emitted value."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        if not value:
+            return "array-any"
+        first = value[0]
+        if isinstance(first, dict):
+            return "array<object>"
+        if isinstance(first, str):
+            return "array<string>"
+        if isinstance(first, bool):
+            return "array<boolean>"
+        return "array-any"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    return None
+
+
+def _schema_props(schema):
+    """An object schema's declared property names, or an empty mapping."""
+    if not isinstance(schema, dict):
+        return {}
+    props = schema.get("properties")
+    return props if isinstance(props, dict) else {}
+
+
+def _repair_object(obj: dict, schema) -> bool:
+    """Repair one object against ``schema`` in place. Returns True if changed."""
+    props = _schema_props(schema)
+    if not props:
+        return False
+    changed = False
+    keys = list(obj)
+    unknown = [k for k in keys if k not in props]
+    missing = [k for k in props if k not in obj]
+
+    # Rule 1 — rename an undeclared key onto a missing declared one. Only when
+    # exactly one of each, or when a single case/plural-insensitive match
+    # exists, so the target is unambiguous.
+    if unknown:
+        candidates = []
+        for u in unknown:
+            ul = u.lower()
+            for m in missing:
+                ml = m.lower()
+                if ul == ml or ul.rstrip("s") == ml.rstrip("s") or ul + "s" == ml or ul == ml + "s":
+                    candidates.append((u, m))
+                    break
+        uniq_targets = {m for _, m in candidates}
+        if len(candidates) == 1 and len(uniq_targets) == 1:
+            src, dst = candidates[0]
+            obj[dst] = obj.pop(src)
+            changed = True
+            missing.remove(dst)
+        elif len(unknown) == 1 and len(missing) == 1 and not candidates:
+            src, dst = unknown[0], missing[0]
+            obj[dst] = obj.pop(src)
+            changed = True
+            missing.remove(dst)
+
+    # Rule 2 — a declared key holds the wrong shape while another declared key
+    # (absent) has exactly that shape. Fixes {"items": [ {...}, ... ]} where
+    # "list" was intended and "items" is declared array<string>.
+    if missing:
+        for k in list(obj):
+            sub = props.get(k)
+            want = _schema_shape(sub)
+            if want is None:
+                continue
+            got = _value_shape(obj.get(k))
+            if got is None or got == want:
+                continue
+            cands = [m for m in missing if _schema_shape(props.get(m)) == got]
+            if len(cands) == 1:
+                obj[cands[0]] = obj.pop(k)
+                changed = True
+                missing.remove(cands[0])
+                break
+
+    # Rule 3 — recurse into nested objects and array items.
+    for k, v in list(obj.items()):
+        sub = props.get(k)
+        if not isinstance(sub, dict):
+            continue
+        if isinstance(v, dict):
+            changed = _repair_object(v, sub) or changed
+        elif isinstance(v, list):
+            item_schema = sub.get("items")
+            if isinstance(item_schema, dict):
+                for e in v:
+                    if isinstance(e, dict):
+                        changed = _repair_object(e, item_schema) or changed
+    return changed
+
+
+def _matches_schema(value: dict, schema) -> bool:
+    """Lightweight conformance check: required keys present, declared keys known.
+
+    Mirrors pi-freeflow's ``matchesSchema`` well enough to decide whether a
+    salvaged payload is genuinely this tool's arguments. Not a full JSON Schema
+    validator — only the shape information ``_schema_shape`` already reads.
+    """
+    if not isinstance(value, dict) or not isinstance(schema, dict):
+        return False
+    props = _schema_props(schema)
+    if not props:
+        return False
+    for req in schema.get("required") or []:
+        if isinstance(req, str) and req not in value:
+            return False
+    for key, val in value.items():
+        if key not in props:
+            return False
+        want = _schema_shape(props.get(key))
+        if want is None:
+            continue
+        got = _value_shape(val)
+        if got is not None and got != want:
+            return False
+    return True
+
+
+def _parse_tool_args(args: str):
+    """Parse tool-call arguments, salvaging a stale prefix off the front.
+
+    Some models open a new call by echoing the tail of the one they have just
+    seen, so a single call arrives as ``<tail of previous>{"…this call…"}``
+    (pi-freeflow f637c58 / 1.34.0, observed live on space-bunny-free)::
+
+        ',"timeout":400}{"i":"…","command":"…"}'
+        ']}]}{"i":"Planning research phases","op":"init",…}'
+
+    Because the stream carried ONE tool call, keying fragments by call id
+    cannot separate them, and the host rejects the payload as invalid JSON.
+
+    Only strings that do not parse as-is are rescanned, and only a position
+    that yields a complete object is accepted — so a well-formed call never
+    reaches this path and a truncated one is still refused rather than
+    completed. Returns ``(value, salvaged)`` or ``(None, False)``.
+    """
+    try:
+        value = json.loads(args)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        value = None
+    else:
+        return (value, False) if isinstance(value, dict) else (None, False)
+    start = args.find("{")
+    while start != -1:
+        try:
+            salvaged = json.loads(args[start:])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            salvaged = None
+        if isinstance(salvaged, dict):
+            return salvaged, True
+        start = args.find("{", start + 1)
+    return None, False
+
+
+def _repair_tool_arguments(args, schema):
+    """Return repaired JSON text for ``args``, or None when nothing was changed.
+
+    ``args`` is the raw model-emitted arguments string. Returns None — meaning
+    "forward verbatim" — when the payload is unparseable (truncated mid-stream),
+    not an object, already conforms, or the repair target is ambiguous.
+    """
+    if not isinstance(schema, dict) or not _schema_props(schema):
+        return None
+    if not isinstance(args, str) or not args.strip():
+        return None
+    parsed, salvaged = _parse_tool_args(args)
+    if parsed is None:
+        return None  # truncated or non-JSON: never invent content
+    if salvaged:
+        # A salvaged payload needs no further reshaping: what follows the junk
+        # is already the caller's own object. Accept it only when it actually
+        # conforms to this tool's schema, so stray text that merely happens to
+        # contain a brace is not handed on as a tool payload.
+        if not _matches_schema(parsed, schema):
+            return None
+        try:
+            return json.dumps(parsed, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None
+    if not _repair_object(parsed, schema):
+        return None
+    try:
+        return json.dumps(parsed, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tool_schemas_from_body(body: dict) -> dict:
+    """tool name -> declared parameters schema, from an upstream request body.
+
+    Handles both chat shape (``{"function": {"name", "parameters"}}``) and
+    Responses shape (``{"name", "parameters"}``).
+    """
+    out: dict[str, dict] = {}
+    for t in (body or {}).get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        name = (fn.get("name") if isinstance(fn, dict) else None) or t.get("name") or ""
+        params = (fn.get("parameters") if isinstance(fn, dict) else None) or t.get("parameters")
+        if name and isinstance(params, dict) and _schema_props(params):
+            out[str(name)] = params
+    return out
+
+
+def _repair_assembled_tool_calls(calls, schemas: dict):
+    """Repair assembled tool-call dicts against ``schemas`` (chat or flat shape).
+
+    Returns ``(calls, repaired_count)``. Calls for tools without a declared
+    schema, and already-conforming calls, are returned untouched.
+    """
+    if not calls or not schemas:
+        return calls, 0
+    repaired = 0
+    for c in calls:
+        if not isinstance(c, dict):
+            continue
+        fn = c.get("function")
+        if isinstance(fn, dict):
+            name, args = fn.get("name"), fn.get("arguments")
+        else:
+            name, args = c.get("name"), c.get("arguments")
+        if not name or not isinstance(args, str):
+            continue
+        schema = schemas.get(str(name))
+        if schema is None:
+            continue
+        fixed = _repair_tool_arguments(args, schema)
+        if fixed is not None:
+            if isinstance(fn, dict):
+                fn["arguments"] = fixed
+            else:
+                c["arguments"] = fixed
+            repaired += 1
+    return calls, repaired
+
+
+def _tool_args_sse(slot_key, call_id, name, args: str, model=None) -> str:
+    """One SSE chunk carrying a complete ``arguments`` payload for a tool call."""
+    payload = {
+        "id": call_id or oc_id("chatcmpl"),
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": slot_key,
+                "id": call_id or None,
+                "type": "function",
+                "function": {"name": name or "", "arguments": args},
+            }]},
+            "finish_reason": None,
+        }],
+    }
+    if model:
+        payload["model"] = model
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _repair_stream_tool_args(lines, schemas: dict, model: str = None):
+    """Defer tool-call argument fragments so they can be repaired before delivery.
+
+    Free models intermittently emit arguments that do not match the schema the
+    caller declared (measured through this proxy: muse-spark-1.3 uses ``items``
+    where ``list`` was declared; step-5 uses ``tasks`` inside a phase). Repairing
+    mid-stream is impossible — the JSON is incomplete until the call ends — so
+    argument fragments are held per slot and flushed, repaired, once that call
+    completes (a ``finish_reason``, a fragment for a different slot, or end of
+    stream). Tool names and ids still go out immediately so a host can start
+    building the call.
+
+    Pass ``schemas`` empty to forward everything verbatim.
+    """
+    if not schemas:
+        async for unit in lines:
+            yield unit
+        return
+
+    pending: dict = {}    # slot key -> {"id": str, "name": str, "args": list[str]}
+    active = None         # slot key currently accumulating
+    repaired = 0
+    flushed = False
+
+    def _flush(key):
+        """Buffered (repaired) arguments for ``key`` as one chunk, or None."""
+        nonlocal repaired
+        ent = pending.pop(key, None)
+        if not ent or not ent["args"]:
+            return None
+        joined = "".join(ent["args"])
+        schema = schemas.get(ent["name"])
+        if schema is not None:
+            fixed = _repair_tool_arguments(joined, schema)
+            if fixed is not None:
+                repaired += 1
+                joined = fixed
+        return _tool_args_sse(key, ent["id"], ent["name"], joined, model)
+
+    async for unit in lines:
+        text = str(unit)
+        suffix, body = "", text
+        if text.endswith("\n\n"):
+            body, suffix = text[:-2], "\n\n"
+        if not body.startswith("data:"):
+            yield unit
+            continue
+        payload = body[5:].strip()
+        if not payload or payload == "[DONE]":
+            for key in list(pending):
+                chunk = _flush(key)
+                if chunk:
+                    yield chunk
+            pending.clear()
+            flushed = True
+            yield unit
+            continue
+        try:
+            piece = json.loads(payload)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            yield unit
+            continue
+        if not isinstance(piece, dict) or not piece.get("choices"):
+            yield unit
+            continue
+        first = piece["choices"][0]
+        if not isinstance(first, dict):
+            yield unit
+            continue
+        delta = first.get("delta") or {}
+        tcs = delta.get("tool_calls") if isinstance(delta, dict) else None
+        if not tcs:
+            yield unit
+            continue
+
+        # _tool_call_slot_key expects key -> slot dict carrying id/name/args.
+        view = {k: {"id": v["id"], "name": v["name"], "arguments": "".join(v["args"])}
+                for k, v in pending.items()}
+        by_id: dict[str, int] = {}
+        rewrote = False
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            key = _tool_call_slot_key(tc, view, by_id)
+            if key not in pending:
+                pending[key] = {"id": "", "name": "", "args": []}
+            ent = pending[key]
+            if tc.get("id"):
+                ent["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if not isinstance(fn, dict):
+                continue
+            if fn.get("name"):
+                ent["name"] = fn["name"]
+            if fn.get("arguments"):
+                ent["args"].append(fn["arguments"])
+                # Withhold: the host receives the whole (possibly repaired)
+                # payload once this call completes.
+                fn["arguments"] = ""
+                rewrote = True
+            if active is not None and key != active and active in pending:
+                chunk = _flush(active)
+                if chunk:
+                    yield chunk
+            active = key
+
+        if rewrote:
+            piece["choices"][0]["delta"] = delta
+            yield f"data: {json.dumps(piece, ensure_ascii=False)}\n\n"
+        else:
+            yield unit
+        if first.get("finish_reason") == "tool_calls":
+            for key in list(pending):
+                chunk = _flush(key)
+                if chunk:
+                    yield chunk
+            pending.clear()
+            active = None
+            flushed = True
+
+    if not flushed and pending:
+        for key in list(pending):
+            chunk = _flush(key)
+            if chunk:
+                yield chunk
+    if repaired:
+        _log(f"[zen] Repaired {repaired} malformed tool-call argument(s) during stream")
 
 
 async def _zen_responses_stream_with_retry(
@@ -2669,13 +3763,22 @@ async def _zen_responses_stream_with_retry(
 
     attempt = 0
     free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    pinned_proxy: str | None = None  # reasoning-recovery retry: reuse this exit for one iteration
+    reasoning_recovery_done = False  # one same-exit retry per request, then fall through
     while True:
         if attempt > attempts + MAX_STREAM_CONTINUATIONS:
             break
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
-        if PROXY_POOL_ENABLED and not direct_only:
+        if pinned_proxy is not None:
+            # Reasoning-recovery retry: the exit that took the 400 is innocent
+            # (upstream signed the blob to a different backend), so rebuild on
+            # the SAME exit instead of rotating. The pin lasts one iteration.
+            proxy_addr = pinned_proxy
+            pinned_proxy = None
+            client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
+        elif PROXY_POOL_ENABLED and not direct_only:
             if not proxy_pool.ready:
                 await proxy_pool.load()
             p = await _select_with_repoll()
@@ -2698,6 +3801,21 @@ async def _zen_responses_stream_with_retry(
                 headers = _strip_direct_headers(headers)
             client = _stream_direct_client if direct_only else _stream_default_client
             proxy_addr = None
+
+        # Issuer affinity: upstream signs each reasoning encrypted_content blob
+        # to the backend that produced it. If this conversation was established
+        # on a different exit, the replayed history would be rejected with a
+        # 400 — strip the caller-bound reasoning before sending. No affinity
+        # yet (first turn) leaves the body unchanged: this exit becomes the
+        # issuer on success.
+        conv_key = _responses_conversation_key(resp_body)
+        if conv_key and proxy_addr:
+            aff = _conv_affinity.get(conv_key)
+            if aff is not None and aff[1] > time.time() and aff[0] != proxy_addr:
+                old_relay = aff[0]
+                resp_body = _strip_reasoning_encryption(resp_body)
+                resp_body = _strip_rejected_reasoning(conv_key, resp_body)
+                _log(f"[zen] issuer changed ({old_relay} -> {proxy_addr}); sending without caller-bound reasoning")
 
         try:
             upstream_request = client.build_request(
@@ -2734,8 +3852,8 @@ async def _zen_responses_stream_with_retry(
         if resp.status_code == 429:
             try:
                 raw = await resp.aread()
-                data = json.loads(raw)
-                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                data = _as_dict(json.loads(raw))
+                err_msg = (_upstream_error(data)).get("message") or "Rate limit exceeded"
             except Exception:
                 err_msg = "Rate limit exceeded"
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses 429 (attempt {attempt}): {err_msg}")
@@ -2771,8 +3889,34 @@ async def _zen_responses_stream_with_retry(
                 data = json.loads(body_text)
             except (json.JSONDecodeError, TypeError, ValueError):
                 data = {}
-            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}"
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses error {resp.status_code}: {raw[:400]!r}")
+            # Caller-bound reasoning recovery. Upstream signs each reasoning
+            # encrypted_content blob to the backend that produced it; when the
+            # conversation reaches a different backend (proxy exit rotation),
+            # the replayed history is rejected with a 400. The exit is innocent
+            # — strip the caller-bound reasoning and retry once on the SAME
+            # exit (no rotation, no cooldown, no attempt burn). A second 400 of
+            # the same class falls through to the normal error handling below.
+            if (
+                resp.status_code == 400
+                and not reasoning_recovery_done
+                and (_is_reasoning_caller_mismatch(body_text) or _is_expired_reasoning_reference(body_text))
+            ):
+                reasoning_recovery_done = True
+                caller_mismatch = _is_reasoning_caller_mismatch(body_text)
+                original_body = resp_body
+                if caller_mismatch:
+                    resp_body = _strip_reasoning_encryption(resp_body)
+                else:
+                    resp_body = _strip_all_reasoning_items(resp_body)
+                if conv_key:
+                    _remember_rejected_reasoning(conv_key, original_body)
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] reasoning recovery ({'caller mismatch' if caller_mismatch else 'expired reference'}); retrying once without caller-bound reasoning")
+                if proxy_addr:
+                    pinned_proxy = proxy_addr
+                await resp.aclose()
+                continue
             if _is_too_large_status(resp.status_code):
                 # 413 = size, not health: rotate with ZERO health accounting,
                 # then direct-if-enabled (keep last 413 body for salvage).
@@ -2797,12 +3941,12 @@ async def _zen_responses_stream_with_retry(
                 yield _openai_stream_error(err_msg, "upstream_error", "413")
             if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
                 free_tier_gates += 1
-                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(resp_body)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     _report_free_tier_block(proxy_addr)
                     proxy_pool.release(proxy_addr)
                 if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
-                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(resp_body)}")
                     await resp.aclose()
                     yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
                     return
@@ -2823,6 +3967,7 @@ async def _zen_responses_stream_with_retry(
                 yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
                 return
             if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                _note_backend_unavailable(model)
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] backend unavailable upstream ([backend_unavailable]); failing fast (model backend down, not the exit)")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     proxy_pool.release(proxy_addr)
@@ -2948,7 +4093,7 @@ async def _zen_responses_stream_with_retry(
                     ptype = piece.get("type") or ""
 
                     if ptype in ("error", "response.failed", "response.incomplete") and not piece.get("response"):
-                        err = piece.get("error") or {}
+                        err = _upstream_error(piece)
                         err_msg = (err.get("message") if isinstance(err, dict) else None) or piece.get("message") or "Upstream error"
                         _log(f"[zen] Responses stream error (attempt {attempt}): {err_msg}")
                         last_error = ValueError(err_msg)
@@ -3052,7 +4197,7 @@ async def _zen_responses_stream_with_retry(
                         response_obj = piece.get("response") or {}
                         status = response_obj.get("status") or ""
                         if status == "failed":
-                            ferr = response_obj.get("error") or {}
+                            ferr = _upstream_error(response_obj)
                             fmsg = (ferr.get("message") if isinstance(ferr, dict) else None) or "Upstream error"
                             _log(f"[zen] Responses {status} (attempt {attempt}): {fmsg}")
                             last_error = ValueError(fmsg)
@@ -3138,6 +4283,11 @@ async def _zen_responses_stream_with_retry(
                         stream_completed = True
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_success(proxy_addr)
+                            if conv_key:
+                                # This exit issued (or re-issued) the conversation's
+                                # reasoning — pin the conversation to it so a later
+                                # turn routed elsewhere strips the caller-bound blobs.
+                                _affinity_remember(conv_key, proxy_addr)
                         _log(f"[zen] OK [{model}|{proxy_addr or 'direct'}] responses stream complete content={len(_content_buf)} reason={len(_reason_buf)} tools={tool_count} finish={finish_reason}")
                         break
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
@@ -3240,6 +4390,13 @@ async def _zen_responses_stream_with_retry(
 
 # ── Proxy-aware Zen API calls ─────────────────────────────────────
 
+# Streaming upstream by default: non-streaming
+# callers default to streaming upstream with the stream buffered into one
+# chat.completion object. Set OPENCODE_STREAM_BRIDGE=0 to restore the old
+# scoped behavior (bridge only x-preview/hy3).
+_STREAM_BRIDGE_ALL = os.environ.get("OPENCODE_STREAM_BRIDGE", "1").lower() not in ("0", "false", "no", "off")
+
+
 def _needs_stream_bridge(model: str | None) -> bool:
     """True for models whose upstream hangs on fully-buffered generations.
 
@@ -3249,7 +4406,12 @@ def _needs_stream_bridge(model: str | None) -> bool:
     transport survives the silent warm-up. Clients asking stream=false for
     such models get an internal bridge: stream upstream, aggregate, return
     one chat.completion object.
+
+    Default (OPENCODE_STREAM_BRIDGE=1): every Zen chat model bridges, since
+    the free tier gates on real-client streaming behavior.
     """
+    if _STREAM_BRIDGE_ALL:
+        return True
     if not model:
         return False
     m = str(model)
@@ -3266,6 +4428,7 @@ async def _aggregate_upstream_completion(
     model: str = None,
     max_retries: int = None,
     gen=None,
+    caller_tools: bool = True,
 ):
     """Stream the upstream response and assemble a buffered chat.completion.
 
@@ -3283,13 +4446,15 @@ async def _aggregate_upstream_completion(
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls: dict[int, dict] = {}
+    tc_by_id: dict[str, int] = {}
     finish_reason = None
     usage: dict | None = None
     saw_error = None
 
     if gen is None:
         gen = _zen_stream_with_retry(
-            request, stream_body, headers, user, messages, session_id, model, max_retries
+            request, stream_body, headers, user, messages, session_id, model, max_retries,
+            caller_tools=caller_tools,
         )
     got_any_chunk = False
     async for raw in gen:
@@ -3304,9 +4469,12 @@ async def _aggregate_upstream_completion(
                 piece = json.loads(payload)
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
+            if not isinstance(piece, dict):
+                continue
             got_any_chunk = True
-            if isinstance(piece.get("error"), dict):
-                saw_error = piece["error"].get("message") or "Upstream stream error"
+            err_ev = _upstream_error(piece)
+            if err_ev:
+                saw_error = err_ev.get("message") or piece.get("message") or "Upstream stream error"
                 continue
             choices = piece.get("choices")
             first_choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -3320,13 +4488,17 @@ async def _aggregate_upstream_completion(
             if delta.get("reasoning_content"):
                 reasoning_parts.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
+                if not isinstance(tc, dict):
+                    continue
                 slot = tool_calls.setdefault(
-                    idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                    _tool_call_slot_key(tc, tool_calls, tc_by_id),
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
                 )
                 if tc.get("id"):
                     slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
                 if fn.get("name"):
                     slot["function"]["name"] = slot["function"]["name"] + fn["name"]
                 if fn.get("arguments"):
@@ -3393,6 +4565,17 @@ async def _aggregate_upstream_completion(
     if reasoning:
         message["reasoning_content"] = reasoning
     ordered_calls = [tool_calls[i] for i in sorted(tool_calls)]
+    ordered_calls = _strip_injected_tool_calls(ordered_calls, caller_tools)
+    # Repair malformed model-emitted arguments against the declared schema
+    # (pi-freeflow 37c2cb6). Only fires on an unambiguous mismatch, so a
+    # conforming call is forwarded verbatim.
+    if ordered_calls:
+        _calls, _fixed = _repair_assembled_tool_calls(
+            ordered_calls, _tool_schemas_from_body(req_body)
+        )
+        if _fixed:
+            _log(f"[zen] Repaired {_fixed} malformed tool-call argument(s) against declared schema")
+            ordered_calls = _calls
     if ordered_calls:
         message["tool_calls"] = [
             {
@@ -3449,6 +4632,7 @@ async def _zen_request_with_retry(
     session_id: str = None,
     model: str = None,
     max_retries: int = None,
+    caller_tools: bool = True,
 ):
     """Non-streaming Zen API call with proxy pool retry on 429."""
     _ensure_req_id()
@@ -3456,7 +4640,8 @@ async def _zen_request_with_retry(
         # Buffered transport times out on this model's silent warm-up; stream
         # internally and hand the caller a normal completion object instead.
         return await _aggregate_upstream_completion(
-            request, req_body, headers, user, messages, session_id, model, max_retries
+            request, req_body, headers, user, messages, session_id, model, max_retries,
+            caller_tools=caller_tools,
         )
     last_error = None
     attempts = MAX_RETRIES if max_retries is None else max_retries
@@ -3537,7 +4722,7 @@ async def _zen_request_with_retry(
                 )
             body_text = body_bytes.decode("utf-8", errors="replace")
             try:
-                data = json.loads(body_bytes)
+                data = _as_dict(json.loads(body_bytes))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 data = {}
 
@@ -3545,7 +4730,7 @@ async def _zen_request_with_retry(
             is_rate_limit = is_429 or "FreeUsageLimitError" in body_text
 
             if is_rate_limit:
-                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                err_msg = (_upstream_error(data)).get("message") or "Rate limit exceeded"
                 last_status = 429
                 _log(f"[zen] 429 (attempt {attempt}): {err_msg}")
                 _log_429_hint()
@@ -3563,7 +4748,7 @@ async def _zen_request_with_retry(
                 return _local_rate_limit_response(err_msg + " (free model rate limit)")
 
             if resp.status_code >= 400:
-                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}"
                 last_status = resp.status_code
                 if _is_too_large_status(resp.status_code):
                     # 413 = size, not health: rotate with ZERO pool-health
@@ -3599,7 +4784,7 @@ async def _zen_request_with_retry(
                     )
                 if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
                     free_tier_gates += 1
-                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
+                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
                     if PROXY_POOL_ENABLED and proxy_addr:
                         _report_free_tier_block(proxy_addr)
                     if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
@@ -3616,6 +4801,7 @@ async def _zen_request_with_retry(
                         content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
                     )
                 if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                    _note_backend_unavailable(model)
                     # Model backend down upstream: identical on every proxy exit,
                     # so fail fast with a hint instead of cooldown+rotate that
                     # penalizes healthy exits. Release handled by the loop finally.
@@ -3717,7 +4903,7 @@ async def _zen_request_with_retry(
                     return data
                 return JSONResponse(
                     status_code=code if isinstance(code, int) and code >= 400 else 502,
-                    content={"error": {"message": (data.get("error") or {}).get("message") if isinstance(data, dict) else text or "Direct fetch failed", "type": "upstream_error"}},
+                    content={"error": {"message": (_upstream_error(data)).get("message") if isinstance(data, dict) else text or "Direct fetch failed", "type": "upstream_error"}},
                 )
             _log(f"[zen] direct-fetch failed: {text[:200]}")
     if last_error:
@@ -3740,8 +4926,14 @@ async def _zen_stream_with_retry(
     session_id: str = None,
     model: str = None,
     max_retries: int = None,
+    caller_tools: bool = True,
 ):
-    """Streaming Zen API call with proxy pool retry on 429/403 and ReadError recovery."""
+    """Streaming Zen API call with proxy pool retry on 429/403 and ReadError recovery.
+
+    ``caller_tools`` is whether the *caller* declared tools, captured before
+    ``zen_request`` injects the fingerprint sextet. ``req_body["tools"]`` is
+    always populated after injection, so it cannot answer that question.
+    """
     _ensure_req_id()
     last_error = None
     last_status: int | None = None
@@ -3856,8 +5048,8 @@ async def _zen_stream_with_retry(
             try:
                 raw = await resp.aread()
                 try:
-                    data = json.loads(raw)
-                    err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                    data = _as_dict(json.loads(raw))
+                    err_msg = (_upstream_error(data)).get("message") or "Rate limit exceeded"
                 except Exception:
                     err_msg = "Rate limit exceeded"
             except Exception as e:
@@ -3943,7 +5135,7 @@ async def _zen_stream_with_retry(
                 data = json.loads(body_text)
             except (json.JSONDecodeError, TypeError, ValueError):
                 data = {}
-            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}" + ("" if body_text.strip() else " (empty body)")
+            err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}" + ("" if body_text.strip() else " (empty body)")
             is_context_exceeded = _is_context_limit_error(data, body_text)
             is_region_blocked = _is_region_error(data, body_text)
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream error {resp.status_code}: {body_preview!r} len={len(raw)}")
@@ -3969,12 +5161,12 @@ async def _zen_stream_with_retry(
 
             if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
                 free_tier_gates += 1
-                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     _report_free_tier_block(proxy_addr)
                 await resp.aclose()
                 if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
-                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(req_body)}")
                     yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
                     return
                 if attempt < attempts and not await _client_gone(request):
@@ -4030,6 +5222,7 @@ async def _zen_stream_with_retry(
             await resp.aclose()
             last_status = resp.status_code
             if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                _note_backend_unavailable(model)
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] backend unavailable upstream ([backend_unavailable]); failing fast (model backend down, not the exit)")
                 yield _openai_stream_error(err_msg + " (backend temporarily unavailable; try again shortly)", "upstream_error", str(resp.status_code))
                 return
@@ -4122,6 +5315,12 @@ async def _zen_stream_with_retry(
                             break
                         yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
                         return
+                    # A caller that declared no tools must never receive a call
+                    # to one of the proxy's injected placeholders (pi-freeflow
+                    # 1.30.0). Applied after the JSON parse so the forwarded
+                    # chunk and the parsed copy stay in sync. ``caller_tools``
+                    # is pre-injection, so this actually fires.
+                    _strip_injected_tool_deltas(piece, caller_tools)
                     if not isinstance(piece, dict):
                         err = ValueError("malformed upstream SSE JSON: expected an object")
                         _log(
@@ -4413,8 +5612,8 @@ async def _zen_stream_anthropic_with_retry(
                 if resp.status_code == 429:
                     try:
                         raw = await resp.aread()
-                        parsed = json.loads(raw)
-                        err_msg = (parsed.get("error") or {}).get("message") or "Rate limit"
+                        parsed = _as_dict(json.loads(raw))
+                        err_msg = (_upstream_error(parsed)).get("message") or "Rate limit"
                     except Exception:
                         err_msg = "Rate limit"
                     _log(f"[zen] Anthropic stream 429 (attempt {attempt}): {err_msg}")
@@ -4438,7 +5637,7 @@ async def _zen_stream_anthropic_with_retry(
                         data = json.loads(body_text)
                     except (json.JSONDecodeError, TypeError, ValueError):
                         data = {}
-                    err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                    err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}"
                     is_context_exceeded = _is_context_limit_error(data, body_text)
                     is_region_blocked = _is_region_error(data, body_text)
                     _log(f"[zen] Anthropic stream error {resp.status_code}: {raw[:300]}")
@@ -4456,11 +5655,11 @@ async def _zen_stream_anthropic_with_retry(
                         return
                     if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
                         free_tier_gates += 1
-                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty)")
+                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
                         if PROXY_POOL_ENABLED and proxy_addr:
                             _report_free_tier_block(proxy_addr)
                         if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
-                            _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                            _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(req_body)}")
                             yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                             return
                         if attempt < attempts and not await _client_gone(request):
@@ -4488,6 +5687,7 @@ async def _zen_stream_anthropic_with_retry(
                     if is_context_exceeded:
                         _log("[zen] Context limit error; not retrying on another proxy")
                     if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                        _note_backend_unavailable(model)
                         _log(f"[zen] [{model}|{proxy_addr or 'direct'}] backend unavailable upstream ([backend_unavailable]); failing fast (model backend down, not the exit)")
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg + " (backend temporarily unavailable; try again shortly)"}})
                         return
@@ -4556,6 +5756,8 @@ async def _zen_stream_anthropic_with_retry(
                             parsed = json.loads(payload)
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(parsed, dict):
+                            continue
 
                         u = parsed.get("usage")
                         if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
@@ -4566,7 +5768,13 @@ async def _zen_stream_anthropic_with_retry(
                                 u.get("prompt_cache_miss_tokens") or 0,
                             )
 
-                        delta = (parsed.get("choices") or [{}])[0].get("delta") or {}
+                        choice_list = parsed.get("choices")
+                        first_piece = choice_list[0] if isinstance(choice_list, list) and choice_list else {}
+                        if not isinstance(first_piece, dict):
+                            first_piece = {}
+                        delta = first_piece.get("delta") or {}
+                        if not isinstance(delta, dict):
+                            delta = {}
                         if not delta:
                             continue
 
@@ -4575,7 +5783,7 @@ async def _zen_stream_anthropic_with_retry(
                             _reason_buf += delta["reasoning_content"]
                         if delta.get("content"):
                             _content_buf += delta["content"]
-                        if (parsed.get("choices") or [{}])[0].get("finish_reason"):
+                        if first_piece.get("finish_reason"):
                             if session_id and _reason_buf and _content_buf:
                                 _remember_reasoning(session_id, _content_buf, _reason_buf)
                             _reason_buf = ""
@@ -4603,6 +5811,8 @@ async def _zen_stream_anthropic_with_retry(
                             output_tokens += -(-len(delta["content"]) // 4)
 
                         for tc in delta.get("tool_calls", []):
+                            if not isinstance(tc, dict):
+                                continue
                             idx = tc.get("index", 0)
                             if idx > tool_idx:
                                 tool_streamed = True
@@ -4611,11 +5821,15 @@ async def _zen_stream_anthropic_with_retry(
                                     text_closed = True
                                 tool_idx = idx
                                 block_idx = idx + 1 if content_idx > 0 else idx
+                                tfunc = tc.get("function")
+                                tfunc = tfunc if isinstance(tfunc, dict) else {}
                                 yield send_sse("content_block_start", {
                                     "type": "content_block_start", "index": block_idx,
-                                    "content_block": {"type": "tool_use", "id": tc.get("id") or oc_id("toolu"), "name": (tc.get("function") or {}).get("name") or ""},
+                                    "content_block": {"type": "tool_use", "id": tc.get("id") or oc_id("toolu"), "name": tfunc.get("name") or ""},
                                 })
                             func = tc.get("function") or {}
+                            if not isinstance(func, dict):
+                                continue
                             if func.get("arguments"):
                                 block_idx = idx + 1 if content_idx > 0 else idx
                                 yield send_sse("content_block_delta", {
@@ -4624,7 +5838,7 @@ async def _zen_stream_anthropic_with_retry(
                                 })
                                 output_tokens += -(-len(func["arguments"]) // 4)
 
-                        finish_reason = (parsed.get("choices") or [{}])[0].get("finish_reason")
+                        finish_reason = first_piece.get("finish_reason")
                         if finish_reason:
                             if finish_reason == "tool_calls":
                                 tool_streamed = True
@@ -4771,929 +5985,7 @@ async def _zen_stream_anthropic_with_retry(
         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": f"connection error: stream failed after {attempts + 1} attempts: {_exc_desc(last_error)}"}})
 
 
-# ── NVIDIA NIM direct transport (key rotation on 2x consecutive 429) ──
-
-# Fail-fast: if this many *consecutive* 429s happen without a single key
-# succeeding, the whole pool is saturated with rate limits. Returning a clear
-# 429 to the client beats silently looping every key with backoff for minutes
-# (which looks like "thinking" to the client). A "consecutive" run is broken by
-# any success OR any non-429 (e.g. a socket error that still tries the pool).
-NVIDIA_POOL_429_FAILFAST = 12
-
-def nvidia_request_body(model, messages, stream, tools, tool_choice, max_tokens=None, max_completion_tokens=None, sampling=None):
-    """Build a standard OpenAI-compatible body for the NVIDIA NIM endpoint.
-
-    Unlike the Zen thinking-mode upstream, NIM accepts normal OpenAI messages;
-    we only normalize roles and don't inject any reasoning_content.
-    """
-    body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
-    if tools:
-        body["tools"] = tools
-    if tool_choice:
-        if tool_choice in ("auto", "none"):
-            body["tool_choice"] = tool_choice
-        else:
-            body["tool_choice"] = "auto"
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
-    if max_completion_tokens is not None:
-        body["max_completion_tokens"] = max_completion_tokens
-    if sampling:
-        body.update(sampling)
-    return body
-
-
-def _nvidia_headers(key: str) -> dict:
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {key}",
-    }
-
-
-def _nvidia_client(streaming: bool):
-    from nvidia_pool import (
-        NVIDIA_CONNECT_TIMEOUT,
-        NVIDIA_READ_TIMEOUT,
-        NVIDIA_STREAM_READ_TIMEOUT,
-    )
-    # trust_env=False: NVIDIA calls must go directly to integrate.api.nvidia.com
-    # and must NOT be routed through the SOCKS proxy pool / system HTTP proxy,
-    # otherwise heavy (long-thinking) models get mishandled (e.g. proxied 404s).
-    return httpx.AsyncClient(
-        base_url="https://integrate.api.nvidia.com",
-        timeout=httpx.Timeout(
-            connect=NVIDIA_CONNECT_TIMEOUT,
-            read=NVIDIA_STREAM_READ_TIMEOUT if streaming else NVIDIA_READ_TIMEOUT,
-            write=NVIDIA_STREAM_READ_TIMEOUT if streaming else NVIDIA_READ_TIMEOUT,
-            pool=NVIDIA_CONNECT_TIMEOUT,
-        ),
-        proxy=None,
-        trust_env=False,
-    )
-
-
-def _nvidia_rate_limit_response(err_msg: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error": {
-                "message": err_msg + " (nvidia key rate limit)",
-                "type": "rate_limit_error",
-                "code": "rate_limit_exceeded",
-            }
-        },
-    )
-
-
-async def nvidia_request_with_retry(
-    req_body: dict,
-    user: str,
-    model: str,
-    max_retries: int = None,
-):
-    """Buffered NVIDIA NIM call with key rotation on consecutive 429s.
-
-    Keys rotate when one hits a rate limit twice in a row (nvidia_keys
-    enforces the cooldown). Returns the parsed OpenAI completion dict, a
-    JSONResponse error, or None if the client gave up.
-    """
-    attempts = max_retries if max_retries is not None else MAX_RETRIES
-    last_error = None
-    last_key = None
-    last_status = None
-    last_body = ""
-    key_limit = len(nvidia_keys.keys) or 1
-    # Consecutive pool-wide 429s (not broken by a success or non-429). When this
-    # reaches NVIDIA_POOL_429_FAILFAST the whole pool is saturated → fail fast
-    # instead of looping every key with backoff for minutes ("thinking").
-    consecutive_429 = 0
-    # Sweep the whole pool: each iteration picks the next usable key (the pool
-    # advances internally), so a model that 404s for some keys (key lacks
-    # access) but works for another eventually succeeds. Rate limits rotate and
-    # cool down the offending key.
-    for attempt in range(key_limit + attempts):
-        key = nvidia_keys.select()
-        if key is None:
-            return _nvidia_rate_limit_response("all NVIDIA keys are in rate-limit cooldown")
-        client = _nvidia_client(streaming=False)
-        headers = _nvidia_headers(key)
-        try:
-            try:
-                resp = await client.post(
-                    "/v1/chat/completions", json=req_body, headers=headers
-                )
-            except Exception as e:
-                last_error = e
-                _log(f"[nvidia] Request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
-                if attempt < key_limit + attempts - 1:
-                    await _backoff(attempt)
-                    continue
-                return JSONResponse(
-                    status_code=502,
-                    content={"error": {"message": f"NVIDIA request failed: {_exc_desc(e)}", "type": "upstream_error"}},
-                )
-
-            body_bytes = await resp.aread()
-            body_text = body_bytes.decode("utf-8", errors="replace")
-            last_key = key
-            last_status = resp.status_code
-            last_body = body_text
-            try:
-                data = json.loads(body_bytes)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                data = {}
-
-            is_429 = resp.status_code == 429
-            is_rate_limit = is_429 or "FreeUsageLimitError" in body_text or (
-                "erate" in body_text and "429" in body_text
-            )
-            if is_rate_limit:
-                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
-                rotated = nvidia_keys.report_rate_limit(key)
-                _log(f"[nvidia] 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
-                consecutive_429 += 1
-                # Whole pool saturated with rate limits → fail fast with a clear
-                # 429 rather than silently looping every key for minutes.
-                if consecutive_429 >= NVIDIA_POOL_429_FAILFAST:
-                    _log(f"[nvidia] {consecutive_429} consecutive 429s → pool saturated; failing fast")
-                    return _nvidia_rate_limit_response(
-                        f"NVIDIA pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment"
-                    )
-                # Two consecutive 429s rotate the key to cooldown; keep trying
-                # other keys. Fewer than two → short backoff + retry same key.
-                if attempt < key_limit + attempts - 1:
-                    await _backoff(attempt)
-                    continue
-                return _nvidia_rate_limit_response(err_msg)
-
-            if resp.status_code >= 400:
-                consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
-                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-                is_context = _is_context_limit_error(data, body_text)
-                _log(f"[nvidia] Error {resp.status_code} (key {key[-8:]}): {err_msg} body={body_text[:200]!r}")
-                if resp.status_code in (401, 403):
-                    # Bad/revoked key — rotate away (not rate-limit but unusable).
-                    nvidia_keys.report_rate_limit(key)
-                if is_context:
-                    # Context window exhaustion is per-model/request, not key.
-                    return JSONResponse(
-                        status_code=resp.status_code,
-                        content={"error": {"message": err_msg, "type": "context_window_error"}},
-                    )
-                if _is_degraded_error(data, body_text):
-                    # NVIDIA NIM deployment is DEGRADED: every key returns the same
-                    # 400. Fail fast instead of sweeping the whole pool on backoff.
-                    _log(f"[nvidia] Model deployment DEGRADED (key {key[-8:]}): {err_msg}")
-                    return JSONResponse(
-                        status_code=503,
-                        content={"error": {
-                            "message": f"NVIDIA model temporarily unavailable (degraded): {err_msg}",
-                            "type": "upstream_error",
-                        }},
-                    )
-                # 404 (model not authorized for this key) → advance to the next
-                # key with no delay; a different key may have access.
-                if resp.status_code < 500 and attempt < key_limit + attempts - 1:
-                    continue
-                # 5xx → escalating key cooldown (504 fast-breaks, no cycling);
-                # then transient retry with backoff.
-                if not _report_nvidia_status(key, resp.status_code):
-                    return JSONResponse(
-                        status_code=resp.status_code,
-                        content={"error": {"message": err_msg, "type": "upstream_error"}},
-                    )
-                if attempt < key_limit + attempts - 1:
-                    await _backoff(attempt)
-                    continue
-                return JSONResponse(
-                    status_code=resp.status_code,
-                    content={"error": {"message": err_msg, "type": "upstream_error"}},
-                )
-
-            nvidia_keys.report_success(key)
-            consecutive_429 = 0
-            usage = data.get("usage") or {}
-            if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
-                _add_tokens(model,
-                    usage.get("prompt_tokens") or 0,
-                    usage.get("completion_tokens") or 0,
-                    usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                    usage.get("prompt_cache_miss_tokens") or 0,
-                )
-            return data
-        finally:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-
-    last_err = f"NVIDIA error after retries (last key {last_key[-8:] if last_key else 'none'}: HTTP {last_status})"
-    if last_error:
-        last_err += f": {_exc_desc(last_error)}"
-    return JSONResponse(
-        status_code=last_status or 502,
-        content={"error": {"message": last_err, "type": "upstream_error"}},
-    )
-
-
-async def nvidia_stream_with_retry(
-    req_body: dict,
-    user: str,
-    model: str,
-    max_retries: int = None,
-):
-    """Streaming NVIDIA NIM call with key rotation on consecutive 429s.
-
-    Yields OpenAI SSE lines. A key that 429s twice consecutively rotates away
-    (cooldown) and the request is retried with the next key.
-    """
-    attempts = max_retries if max_retries is not None else MAX_RETRIES
-    last_error = None
-    key_limit = len(nvidia_keys.keys) or 1
-    used_keys_in_request = 0
-    # Consecutive pool-wide 429s → fail fast when the whole pool is saturated.
-    consecutive_429 = 0
-    # Track stream throughput so we don't replay once bytes reached the client.
-    streamed_any = False
-
-    attempt = 0
-    while attempt <= attempts + key_limit * 2:
-        key = nvidia_keys.select()
-        if key is None:
-            yield _openai_stream_error(
-                "all NVIDIA keys are in rate-limit cooldown",
-                "rate_limit_error", "rate_limit_exceeded",
-            )
-            return
-        used_keys_in_request += 1
-        client = _nvidia_client(streaming=True)
-        try:
-            upstream_request = client.build_request(
-                "POST", "/v1/chat/completions", json=req_body,
-                headers=_nvidia_headers(key),
-            )
-            resp = await client.send(upstream_request, stream=True)
-        except Exception as e:
-            last_error = e
-            _log(f"[nvidia] Stream request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
-            await client.aclose()
-            if attempt < attempts + key_limit * 2:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            yield _openai_stream_error(f"Stream request failed: {_exc_desc(e)}", "upstream_error", "transport_error")
-            return
-
-        if resp.status_code == 429:
-            try:
-                raw = await resp.aread()
-                try:
-                    data = json.loads(raw)
-                    err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
-                except Exception:
-                    err_msg = "Rate limit exceeded"
-            except Exception as e:
-                err_msg = f"Rate limit ({_exc_desc(e)})"
-            rotated = nvidia_keys.report_rate_limit(key)
-            _log(f"[nvidia] Stream 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
-            await resp.aclose()
-            await client.aclose()
-            consecutive_429 += 1
-            # Whole pool saturated → fail fast with a clear 429 instead of
-            # silently looping every key for minutes (looks like "thinking").
-            if consecutive_429 >= NVIDIA_POOL_429_FAILFAST:
-                _log(f"[nvidia] {consecutive_429} consecutive 429s → pool saturated; failing fast")
-                yield _openai_stream_error(
-                    f"NVIDIA pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment",
-                    "rate_limit_error", "rate_limit_exceeded",
-                )
-                return
-            if rotated and used_keys_in_request < key_limit:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            if attempt < attempts + key_limit * 2:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
-            return
-
-        if resp.status_code >= 400:
-            try:
-                raw = await resp.aread()
-            except Exception:
-                raw = b""
-            # Decode the CURRENT attempt's body first, then parse it: the
-            # stale-body bug parsed a previous attempt's body_text here.
-            body_text = raw.decode("utf-8", errors="replace")
-            try:
-                data = json.loads(body_text) if body_text else {}
-            except Exception:
-                _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): unparsable body {raw[:400]!r}")
-                data = {}
-            if not isinstance(data, dict):
-                _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): non-object body {raw[:400]!r}")
-                data = {}
-            err_msg = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) else None
-            err_msg = err_msg or f"HTTP {resp.status_code}"
-            consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
-            _log(f"[nvidia] Stream error {resp.status_code} (key {key[-8:]}): {err_msg}")
-            if _is_degraded_error(data, body_text):
-                # NVIDIA NIM deployment DEGRADED → every key returns the same
-                # 400; fail fast rather than sweeping the whole pool on backoff.
-                await resp.aclose()
-                await client.aclose()
-                _log(f"[nvidia] Model deployment DEGRADED (key {key[-8:]}): {err_msg}")
-                yield _openai_stream_error(
-                    f"NVIDIA model temporarily unavailable (degraded): {err_msg}",
-                    "upstream_error", str(resp.status_code),
-                )
-                return
-            if resp.status_code in (401, 403):
-                nvidia_keys.report_rate_limit(key)
-            await resp.aclose()
-            await client.aclose()
-            # No bytes have streamed yet -> safe to try another key. A 404 means
-            # this key lacks the model; a 5xx may be transient. Sweep the pool.
-            # 5xx records escalating key cooldown (504 fast-breaks, no cycling).
-            if resp.status_code < 500 and attempt < attempts + key_limit:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            if resp.status_code >= 500:
-                if not _report_nvidia_status(key, resp.status_code):
-                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
-                    return
-                if attempt < attempts + key_limit * 2:
-                    attempt += 1
-                    await _backoff(attempt)
-                    continue
-            yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
-            return
-
-        # Success — stream it through
-        nvidia_keys.report_success(key)
-        consecutive_429 = 0
-        stream_completed = False
-        try:
-            try:
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        stream_completed = True
-                        yield line + "\n\n"
-                        streamed_any = True
-                        break
-                    try:
-                        piece = json.loads(payload)
-                    except Exception:
-                        piece = {}
-                    if not isinstance(piece, dict):
-                        continue
-                    # In-stream error (e.g. rate limit surfaced mid-body)
-                    ev = _first_chunk_error(line)
-                    if ev:
-                        err_msg, is_rate_limit = ev
-                        if is_rate_limit:
-                            rotated = nvidia_keys.report_rate_limit(key)
-                            _log(f"[nvidia] Stream body rate-limit on key {key[-8:]}: {err_msg} rotated={rotated}")
-                            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
-                        else:
-                            yield _openai_stream_error(err_msg)
-                        return
-                    if '"usage"' in line:
-                        u = piece.get("usage") or {}
-                        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
-                            _add_tokens(model,
-                                u.get("prompt_tokens") or 0,
-                                u.get("completion_tokens") or 0,
-                                u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                                u.get("prompt_cache_miss_tokens") or 0,
-                            )
-                    yield line + "\n\n"
-                    streamed_any = True
-            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
-                _log(f"[nvidia] Stream interrupted (key {key[-8:]}): {_exc_desc(e)}")
-                last_error = e
-                if not streamed_any and attempt < attempts + key_limit * 2:
-                    attempt += 1
-                    await _backoff(attempt)
-                    continue
-                yield _openai_stream_error(_transport_error_message(e), "upstream_error", "transport_error")
-                return
-        finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-
-        if not stream_completed:
-            _log(f"[nvidia] Stream ended before [DONE] on key {key[-8:]}")
-            if not streamed_any and attempt < attempts + key_limit * 2:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            yield _openai_stream_error("NVIDIA stream ended before completion", "upstream_error", "incomplete_stream")
-            return
-        return
-
-    yield _openai_stream_error(
-        f"connection error: NVIDIA stream failed after retries: {_exc_desc(last_error)}",
-        "upstream_error", "transport_error",
-    )
-
-
-# ── AMD Radeon TokenFactory direct transport (mirrors NVIDIA) ──
-
-# Fail-fast: if this many *consecutive* 429s happen without a single key
-# succeeding, the whole pool is saturated with rate limits. Returning a clear
-# 429 to the client beats silently looping every key with backoff for minutes
-# (which looks like "thinking" to the client). A "consecutive" run is broken by
-# any success OR any non-429 (e.g. a socket error that still tries the pool).
-AMD_POOL_429_FAILFAST = 12
-
-# Dynamic discovery cache for GET /models on the TokenFactory endpoint.
-# _AMD_DYNAMIC_IDS holds verbatim upstream IDs (no amd/ prefix); a 0.0 stamp
-# means "never fetched successfully". Never wiped on empty/failure — the
-# hardcoded amd_models() fallback always applies.
-_AMD_DYNAMIC_IDS: list[str] = []
-_AMD_DYNAMIC_AT: float = 0.0
-_AMD_DYNAMIC_TTL = 3600.0
-
-
-def amd_request_body(model, messages, stream, tools, tool_choice, max_tokens=None, max_completion_tokens=None, sampling=None):
-    """Build a standard OpenAI-compatible body for the AMD TokenFactory endpoint.
-
-    TokenFactory is OpenAI-compatible for /chat/completions; like NIM we only
-    normalize roles and don't inject any reasoning_content.
-    """
-    body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
-    if tools:
-        body["tools"] = tools
-    if tool_choice:
-        if tool_choice in ("auto", "none"):
-            body["tool_choice"] = tool_choice
-        else:
-            body["tool_choice"] = "auto"
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
-    if max_completion_tokens is not None:
-        body["max_completion_tokens"] = max_completion_tokens
-    if sampling:
-        body.update(sampling)
-    return body
-
-
-def _amd_headers(key: str) -> dict:
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {key}",
-    }
-
-
-def _amd_client(streaming: bool):
-    from amd_pool import (
-        AMD_BASE_URL,
-        AMD_CONNECT_TIMEOUT,
-        AMD_READ_TIMEOUT,
-        AMD_STREAM_READ_TIMEOUT,
-    )
-    # trust_env=False: AMD calls go directly to developer.amd.com.cn and must
-    # NOT be routed through the SOCKS proxy pool / system HTTP proxy.
-    return httpx.AsyncClient(
-        base_url=AMD_BASE_URL,
-        timeout=httpx.Timeout(
-            connect=AMD_CONNECT_TIMEOUT,
-            read=AMD_STREAM_READ_TIMEOUT if streaming else AMD_READ_TIMEOUT,
-            write=AMD_STREAM_READ_TIMEOUT if streaming else AMD_READ_TIMEOUT,
-            pool=AMD_CONNECT_TIMEOUT,
-        ),
-        proxy=None,
-        trust_env=False,
-    )
-
-
-def _amd_rate_limit_response(err_msg: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error": {
-                "message": err_msg + " (amd key rate limit)",
-                "type": "rate_limit_error",
-                "code": "rate_limit_exceeded",
-            }
-        },
-    )
-
-
-async def _amd_fetch_dynamic_ids() -> list[str]:
-    """GET the TokenFactory /models list with a pooled key (dynamic discovery).
-
-    Returns verbatim upstream IDs on success; on any failure (or empty pool)
-    returns [] and the caller falls back to amd_models(). Never wipes the
-    cached dynamic list on failure.
-    """
-    global _AMD_DYNAMIC_IDS, _AMD_DYNAMIC_AT
-    now = time.time()
-    if _AMD_DYNAMIC_IDS and now - _AMD_DYNAMIC_AT < _AMD_DYNAMIC_TTL:
-        return _AMD_DYNAMIC_IDS
-    if not amd_keys.ready:
-        return _AMD_DYNAMIC_IDS or amd_models()
-    key = amd_keys.select()
-    if key is None:
-        return _AMD_DYNAMIC_IDS or amd_models()
-    client = _amd_client(streaming=False)
-    try:
-        try:
-            resp = await client.get("/models", headers=_amd_headers(key))
-        except Exception as e:
-            _log(f"[amd] Dynamic /models fetch failed: {_exc_desc(e)}")
-            return _AMD_DYNAMIC_IDS or amd_models()
-        try:
-            raw = await resp.aread()
-        except Exception as e:
-            _log(f"[amd] Dynamic /models read failed: {_exc_desc(e)}")
-            return _AMD_DYNAMIC_IDS or amd_models()
-        if resp.status_code >= 400:
-            _log(f"[amd] Dynamic /models HTTP {resp.status_code}")
-            if resp.status_code in (401, 403):
-                amd_keys.report_rate_limit(key)
-            else:
-                _report_amd_status(key, resp.status_code)
-            return _AMD_DYNAMIC_IDS or amd_models()
-        try:
-            payload = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
-            return _AMD_DYNAMIC_IDS or amd_models()
-        ids: list[str] = []
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if isinstance(data, list):
-            for entry in data:
-                mid = entry.get("id") if isinstance(entry, dict) else None
-                if mid:
-                    ids.append(str(mid))
-        if ids:
-            amd_keys.report_success(key)
-            _AMD_DYNAMIC_IDS = sorted(set(ids))
-            _AMD_DYNAMIC_AT = now
-            return _AMD_DYNAMIC_IDS
-        return _AMD_DYNAMIC_IDS or amd_models()
-    finally:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-
-
-async def amd_request_with_retry(
-    req_body: dict,
-    user: str,
-    model: str,
-    max_retries: int = None,
-):
-    """Buffered AMD TokenFactory call with key rotation on consecutive 429s.
-
-    Mirrors nvidia_request_with_retry. Returns the parsed OpenAI completion
-    dict, a JSONResponse error, or None if the client gave up.
-    """
-    attempts = max_retries if max_retries is not None else MAX_RETRIES
-    last_error = None
-    last_key = None
-    last_status = None
-    last_body = ""
-    key_limit = len(amd_keys.keys) or 1
-    # Consecutive pool-wide 429s (not broken by a success or non-429). When this
-    # reaches AMD_POOL_429_FAILFAST the whole pool is saturated → fail fast
-    # instead of looping every key with backoff for minutes ("thinking").
-    consecutive_429 = 0
-    # Sweep the whole pool: each iteration picks the next usable key (the pool
-    # advances internally), so a model that 404s for some keys (key lacks
-    # access) but works for another eventually succeeds. Rate limits rotate and
-    # cool down the offending key.
-    for attempt in range(key_limit + attempts):
-        key = amd_keys.select()
-        if key is None:
-            return _amd_rate_limit_response("all AMD keys are in rate-limit cooldown")
-        client = _amd_client(streaming=False)
-        headers = _amd_headers(key)
-        try:
-            try:
-                resp = await client.post(
-                    "/chat/completions", json=req_body, headers=headers
-                )
-            except Exception as e:
-                last_error = e
-                _log(f"[amd] Request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
-                if attempt < key_limit + attempts - 1:
-                    await _backoff(attempt)
-                    continue
-                return JSONResponse(
-                    status_code=502,
-                    content={"error": {"message": f"AMD request failed: {_exc_desc(e)}", "type": "upstream_error"}},
-                )
-
-            body_bytes = await resp.aread()
-            body_text = body_bytes.decode("utf-8", errors="replace")
-            last_key = key
-            last_status = resp.status_code
-            last_body = body_text
-            try:
-                data = json.loads(body_bytes)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                data = {}
-
-            is_429 = resp.status_code == 429
-            is_rate_limit = is_429 or "FreeUsageLimitError" in body_text or (
-                "erate" in body_text and "429" in body_text
-            )
-            if is_rate_limit:
-                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
-                rotated = amd_keys.report_rate_limit(key)
-                _log(f"[amd] 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
-                consecutive_429 += 1
-                # Whole pool saturated with rate limits → fail fast with a clear
-                # 429 rather than silently looping every key for minutes.
-                if consecutive_429 >= AMD_POOL_429_FAILFAST:
-                    _log(f"[amd] {consecutive_429} consecutive 429s → pool saturated; failing fast")
-                    return _amd_rate_limit_response(
-                        f"AMD pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment"
-                    )
-                if attempt < key_limit + attempts - 1:
-                    await _backoff(attempt)
-                    continue
-                return _amd_rate_limit_response(err_msg)
-
-            if resp.status_code >= 400:
-                consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
-                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-                is_context = _is_context_limit_error(data, body_text)
-                _log(f"[amd] Error {resp.status_code} (key {key[-8:]}): {err_msg} body={body_text[:200]!r}")
-                if resp.status_code in (401, 403):
-                    # Bad/revoked key — rotate away (not rate-limit but unusable).
-                    amd_keys.report_rate_limit(key)
-                if is_context:
-                    # Context window exhaustion is per-model/request, not key.
-                    return JSONResponse(
-                        status_code=resp.status_code,
-                        content={"error": {"message": err_msg, "type": "context_window_error"}},
-                    )
-                # 404 (model not authorized for this key) → advance to the next
-                # key with no delay; a different key may have access.
-                if resp.status_code < 500 and attempt < key_limit + attempts - 1:
-                    continue
-                # 5xx → escalating key cooldown (504 fast-breaks, no cycling);
-                # then transient retry with backoff.
-                if not _report_amd_status(key, resp.status_code):
-                    return JSONResponse(
-                        status_code=resp.status_code,
-                        content={"error": {"message": err_msg, "type": "upstream_error"}},
-                    )
-                if attempt < key_limit + attempts - 1:
-                    await _backoff(attempt)
-                    continue
-                return JSONResponse(
-                    status_code=resp.status_code,
-                    content={"error": {"message": err_msg, "type": "upstream_error"}},
-                )
-
-            amd_keys.report_success(key)
-            consecutive_429 = 0
-            usage = data.get("usage") or {}
-            if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
-                _add_tokens(model,
-                    usage.get("prompt_tokens") or 0,
-                    usage.get("completion_tokens") or 0,
-                    usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                    usage.get("prompt_cache_miss_tokens") or 0,
-                )
-            return data
-        finally:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-
-    last_err = f"AMD error after retries (last key {last_key[-8:] if last_key else 'none'}: HTTP {last_status})"
-    if last_error:
-        last_err += f": {_exc_desc(last_error)}"
-    return JSONResponse(
-        status_code=last_status or 502,
-        content={"error": {"message": last_err, "type": "upstream_error"}},
-    )
-
-
-async def amd_stream_with_retry(
-    req_body: dict,
-    user: str,
-    model: str,
-    max_retries: int = None,
-):
-    """Streaming AMD TokenFactory call with key rotation on consecutive 429s.
-
-    Mirrors nvidia_stream_with_retry. Yields OpenAI SSE lines. A key that 429s
-    rotates away (cooldown) and the request is retried with the next key.
-    """
-    attempts = max_retries if max_retries is not None else MAX_RETRIES
-    last_error = None
-    key_limit = len(amd_keys.keys) or 1
-    used_keys_in_request = 0
-    # Consecutive pool-wide 429s → fail fast when the whole pool is saturated.
-    consecutive_429 = 0
-    # Track stream throughput so we don't replay once bytes reached the client.
-    streamed_any = False
-
-    attempt = 0
-    while attempt <= attempts + key_limit * 2:
-        key = amd_keys.select()
-        if key is None:
-            yield _openai_stream_error(
-                "all AMD keys are in rate-limit cooldown",
-                "rate_limit_error", "rate_limit_exceeded",
-            )
-            return
-        used_keys_in_request += 1
-        client = _amd_client(streaming=True)
-        try:
-            upstream_request = client.build_request(
-                "POST", "/chat/completions", json=req_body,
-                headers=_amd_headers(key),
-            )
-            resp = await client.send(upstream_request, stream=True)
-        except Exception as e:
-            last_error = e
-            _log(f"[amd] Stream request failed (attempt {attempt}, key {key[-8:]}): {_exc_desc(e)}")
-            await client.aclose()
-            if attempt < attempts + key_limit * 2:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            yield _openai_stream_error(f"Stream request failed: {_exc_desc(e)}", "upstream_error", "transport_error")
-            return
-
-        if resp.status_code == 429:
-            try:
-                raw = await resp.aread()
-                try:
-                    data = json.loads(raw)
-                    err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
-                except Exception:
-                    err_msg = "Rate limit exceeded"
-            except Exception as e:
-                err_msg = f"Rate limit ({_exc_desc(e)})"
-            rotated = amd_keys.report_rate_limit(key)
-            _log(f"[amd] Stream 429 on key {key[-8:]} (attempt {attempt}): {err_msg} rotated={rotated}")
-            await resp.aclose()
-            await client.aclose()
-            consecutive_429 += 1
-            # Whole pool saturated → fail fast with a clear 429 instead of
-            # silently looping every key for minutes (looks like "thinking").
-            if consecutive_429 >= AMD_POOL_429_FAILFAST:
-                _log(f"[amd] {consecutive_429} consecutive 429s → pool saturated; failing fast")
-                yield _openai_stream_error(
-                    f"AMD pool rate-limited ({consecutive_429} consecutive 429s); try again in a moment",
-                    "rate_limit_error", "rate_limit_exceeded",
-                )
-                return
-            if rotated and used_keys_in_request < key_limit:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            if attempt < attempts + key_limit * 2:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
-            return
-
-        if resp.status_code >= 400:
-            try:
-                raw = await resp.aread()
-            except Exception:
-                raw = b""
-            try:
-                data = json.loads(raw) if raw else {}
-            except Exception:
-                data = {}
-            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-            body_text = raw.decode("utf-8", errors="replace")
-            consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
-            _log(f"[amd] Stream error {resp.status_code} (key {key[-8:]}): {err_msg}")
-            if resp.status_code in (401, 403):
-                amd_keys.report_rate_limit(key)
-            await resp.aclose()
-            await client.aclose()
-            # No bytes have streamed yet -> safe to try another key. A 404 means
-            # this key lacks the model; a 5xx may be transient. Sweep the pool.
-            # 5xx records escalating key cooldown (504 fast-breaks, no cycling).
-            if resp.status_code < 500 and attempt < attempts + key_limit:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            if resp.status_code >= 500:
-                if not _report_amd_status(key, resp.status_code):
-                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
-                    return
-                if attempt < attempts + key_limit * 2:
-                    attempt += 1
-                    await _backoff(attempt)
-                    continue
-            yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
-            return
-
-        # Success — stream it through
-        amd_keys.report_success(key)
-        consecutive_429 = 0
-        stream_completed = False
-        try:
-            try:
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        stream_completed = True
-                        yield line + "\n\n"
-                        streamed_any = True
-                        break
-                    try:
-                        piece = json.loads(payload)
-                    except Exception:
-                        piece = {}
-                    if not isinstance(piece, dict):
-                        continue
-                    # In-stream error (e.g. rate limit surfaced mid-body)
-                    ev = _first_chunk_error(line)
-                    if ev:
-                        err_msg, is_rate_limit = ev
-                        if is_rate_limit:
-                            rotated = amd_keys.report_rate_limit(key)
-                            _log(f"[amd] Stream body rate-limit on key {key[-8:]}: {err_msg} rotated={rotated}")
-                            yield _openai_stream_error(err_msg, "rate_limit_error", "rate_limit_exceeded")
-                        else:
-                            yield _openai_stream_error(err_msg)
-                        return
-                    if '"usage"' in line:
-                        u = piece.get("usage") or {}
-                        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
-                            _add_tokens(model,
-                                u.get("prompt_tokens") or 0,
-                                u.get("completion_tokens") or 0,
-                                u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                                u.get("prompt_cache_miss_tokens") or 0,
-                            )
-                    yield line + "\n\n"
-                    streamed_any = True
-            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
-                _log(f"[amd] Stream interrupted (key {key[-8:]}): {_exc_desc(e)}")
-                last_error = e
-                if not streamed_any and attempt < attempts + key_limit * 2:
-                    attempt += 1
-                    await _backoff(attempt)
-                    continue
-                yield _openai_stream_error(_transport_error_message(e), "upstream_error", "transport_error")
-                return
-        finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-
-        if not stream_completed:
-            _log(f"[amd] Stream ended before [DONE] on key {key[-8:]}")
-            if not streamed_any and attempt < attempts + key_limit * 2:
-                attempt += 1
-                await _backoff(attempt)
-                continue
-            yield _openai_stream_error("AMD stream ended before completion", "upstream_error", "incomplete_stream")
-            return
-        return
-
-    yield _openai_stream_error(
-        f"connection error: AMD stream failed after retries: {_exc_desc(last_error)}",
-        "upstream_error", "transport_error",
-    )
-
-
-# ── Cline direct transport (mirrors AMD) ──
+# ── Cline direct transport ──
 
 # Fail-fast: if this many *consecutive* 429s happen without a single key
 # succeeding, the whole pool is saturated with rate limits. Returning a clear
@@ -5712,19 +6004,155 @@ _CLINE_DYNAMIC_IDS: list[str] = []
 _CLINE_DYNAMIC_AT: float = 0.0
 _CLINE_DYNAMIC_TTL = 3600.0
 
-# Identity headers every Cline request must carry (desktop-client handshake).
-_CLINE_CLIENT_TYPE = "cline-desktop"
-_CLINE_USER_AGENT = "Cline/3.5.54"
+# Live free-tier rotation cache fed by GET CLINE_RECOMMENDED_URL
+# (``{recommended:[...], free:[{id...}], clinePass:[...]}`` — only free[]
+# IDs are consumed, verbatim). Same 1h TTL pattern as _CLINE_DYNAMIC_IDS:
+# a 0.0 stamp means "never fetched"; never wiped on empty/failure — the
+# static _CLINE_FREE_CANONICAL fallback always applies via the merge.
+_CLINE_FREE_IDS: list[str] = []
+_CLINE_FREE_AT: float = 0.0
+# In-flight guard for the rotation fetch (chat path + startup + /v1/models can
+# all race the TTL). A plain flag, not an asyncio primitive: the fetch is
+# reached from several event loops across tests.
+_CLINE_FREE_FETCHING = False
+
+# Identity headers every Cline request must carry (desktop-client handshake,
+# pi-freeflow CLINE_CLIENT_HEADERS — required: cline-free/* 403s with a bare
+# bearer, 200s with this set).
+_CLINE_CLIENT_HEADERS = {
+    "HTTP-Referer": "https://cline.bot",
+    "X-Title": "Cline",
+    "X-IS-MULTIROOT": "false",
+    "X-CLIENT-TYPE": "cline-desktop",
+    "X-CLIENT-VERSION": "3.5.54",
+    "User-Agent": "Cline/3.5.54",
+}
 
 # Hint appended when Cline reports an empty balance (402): the key exists but
 # needs a top-up or a subscription at app.cline.bot.
 _CLINE_TOP_UP_HINT = " (empty balance — top up at app.cline.bot / not subscribed)"
 
+# Fail-fast when a paid (non-free-rotation) model hits a login slot: login
+# slots serve the live free[] rotation only and must never bill.
+_CLINE_PAID_GATE_MSG = "(not in live Cline free rotation; login slots serve free[] only — no billing)"
+
+
+def _cline_account_for_token(token):
+    """Return the cline_all_accounts() entry behind ``token`` (or None)."""
+    try:
+        for acct in cline_all_accounts():
+            try:
+                if acct.get("token") == token:
+                    return acct
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _cline_token_is_key_slot(token) -> bool:
+    """True when ``token`` belongs to a static key slot (bypasses paid gate)."""
+    try:
+        acct = _cline_account_for_token(token)
+    except Exception:
+        return False
+    return bool(acct.get("keySlot")) if isinstance(acct, dict) else False
+
+
+def _cline_preferred_skip(is_free: bool) -> set:
+    """Slot/token names to deprioritize for routing preference.
+
+    Free models prefer login slots (skip key slots); paid models prefer key
+    slots (skip login slots). Returns both slot names and tokens so it works
+    whether the pool matches on slot or token. Empty when the filter would
+    remove every account (fallback to the normal roll).
+    """
+    try:
+        accounts = cline_all_accounts()
+    except Exception:
+        return set()
+    if not accounts:
+        return set()
+    skip: set = set()
+    try:
+        if is_free:
+            for acct in accounts:
+                if isinstance(acct, dict) and acct.get("keySlot"):
+                    if acct.get("slot"):
+                        skip.add(acct.get("slot"))
+                    if acct.get("token"):
+                        skip.add(acct.get("token"))
+        else:
+            for acct in accounts:
+                if isinstance(acct, dict) and not acct.get("keySlot"):
+                    if acct.get("slot"):
+                        skip.add(acct.get("slot"))
+                    if acct.get("token"):
+                        skip.add(acct.get("token"))
+    except Exception:
+        return set()
+    if not skip:
+        return skip
+    try:
+        all_ids = set()
+        for acct in accounts:
+            if isinstance(acct, dict):
+                if acct.get("slot"):
+                    all_ids.add(acct.get("slot"))
+                if acct.get("token"):
+                    all_ids.add(acct.get("token"))
+        # Filtered empty (every id skipped, or every slot skipped) → no filter.
+        all_slots = {a.get("slot") for a in accounts if isinstance(a, dict) and a.get("slot")}
+        skip_slots = {s for s in skip if s in all_slots}
+        if all_slots and skip_slots >= all_slots:
+            return set()
+        if all_ids and skip >= all_ids:
+            return set()
+    except Exception:
+        pass
+    return skip
+
+
+def _cline_retire_slot(skip_set, key, slot_name=None):
+    """Retire a slot for the rest of THIS request, under BOTH skip forms.
+
+    A `continue` that does not retire the slot does not advance anything:
+    select() hands the same bearer back and the roll loops on one key.
+    """
+    if slot_name:
+        skip_set.add(slot_name)
+    if key:
+        skip_set.add(key)
+
+
+def _cline_record_cap(skip_set, capped_slots, key, slot_name, reset_ms, earliest_reset_ms):
+    """Fold a known-capped slot into the roll state of one request.
+
+    - Retires the slot (slot name + bearer token) so ``ClineKeyPool.select``
+      drops it whichever form the caller started from. Without this the capped
+      slot was re-selected on every iteration and the roll never reached
+      ``key is None``.
+    - Adds the slot NAME to ``capped_slots`` so ``len()`` counts logins, not
+      tokens (a live 429 records tokens; the pre-attempt gate sees slot names).
+    - Keeps the nearest ``reset_ms`` so an all-capped roll can still say
+      *when* the cap lifts instead of "all Cline logins exhausted".
+
+    Returns the (possibly updated) ``earliest_reset_ms``.
+    """
+    _cline_retire_slot(skip_set, key, slot_name)
+    if slot_name:
+        capped_slots.add(slot_name)
+    if isinstance(reset_ms, (int, float)) and reset_ms > 0:
+        if earliest_reset_ms is None or reset_ms < earliest_reset_ms:
+            earliest_reset_ms = reset_ms
+    return earliest_reset_ms
+
 
 def cline_request_body(model, messages, stream, tools, tool_choice, max_tokens=None, max_completion_tokens=None, sampling=None):
     """Build a standard OpenAI-compatible body for the Cline endpoint.
 
-    Cline is OpenAI-compatible for /chat/completions; like AMD we only
+    Cline is OpenAI-compatible for /chat/completions; we only
     normalize roles and don't inject any reasoning_content.
     """
     body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
@@ -5745,12 +6173,12 @@ def cline_request_body(model, messages, stream, tools, tool_choice, max_tokens=N
 
 
 def _cline_headers(key: str) -> dict:
-    return {
+    headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {key}",
-        "X-CLIENT-TYPE": _CLINE_CLIENT_TYPE,
-        "User-Agent": _CLINE_USER_AGENT,
     }
+    headers.update(_CLINE_CLIENT_HEADERS)
+    return headers
 
 
 def _cline_client(streaming: bool):
@@ -5801,6 +6229,163 @@ def _cline_balance_response(err_msg: str) -> JSONResponse:
     )
 
 
+def _cline_upstream_stream_body(req_body: dict) -> dict:
+    """Copy of the client body with stream forced true for the upstream POST.
+
+    cline-free/* only serves SSE (a plain ``stream:false`` POST 500s
+    upstream), so the buffered path always streams upstream and aggregates
+    the SSE events back into a chat.completion dict below.
+    """
+    body = dict(req_body or {})
+    body["stream"] = True
+    return body
+
+
+def _cline_looks_like_sse(body_text: str) -> bool:
+    """True when any line of the upstream body is an SSE data line."""
+    for line in (body_text or "").splitlines():
+        if line.strip().startswith("data:"):
+            return True
+    return False
+
+
+def _cline_sse_to_completion(raw: bytes, model: str, schemas: dict | None = None):
+    """Aggregate an upstream OpenAI SSE stream into a chat.completion dict.
+
+    Concatenates ``choices[0].delta.content`` (plus ``reasoning_content`` /
+    ``reasoning``, tool-call deltas, finish_reason and usage) into the same
+    JSON shape the non-streaming transport would have returned. Returns the
+    completion dict, an ``{"error": ...}`` marker when the stream carried an
+    upstream error payload, or None when no usable chunk was produced.
+    """
+    text = raw.decode("utf-8", errors="replace") if raw else ""
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    tc_by_id: dict[str, int] = {}
+    finish_reason = None
+    usage = None
+    cid = None
+    created = None
+    saw_error = None
+    saw_rate_limit = False
+    got_any_chunk = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(":"):
+            continue
+        if not s.startswith("data:"):
+            continue
+        payload = s[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            piece = json.loads(payload)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(piece, dict):
+            continue
+        ev = _first_chunk_error(s)
+        if ev:
+            saw_error, saw_rate_limit = ev
+            continue
+        err_ev = _upstream_error(piece)
+        if err_ev:
+            saw_error = err_ev.get("message") or piece.get("message") or "Upstream stream error"
+            continue
+        choices = piece.get("choices")
+        first = choices[0] if isinstance(choices, list) and choices else {}
+        if not isinstance(first, dict) or not first:
+            u = piece.get("usage")
+            if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                usage = u
+            continue
+        got_any_chunk = True
+        if cid is None and isinstance(piece.get("id"), str):
+            cid = piece["id"]
+        if created is None and isinstance(piece.get("created"), int):
+            created = piece["created"]
+        delta = first.get("delta") or {}
+        if not isinstance(delta, dict):
+            delta = {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            content_parts.append(content)
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            reasoning_parts.append(reasoning)
+        for tc in delta.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            slot = tool_calls.setdefault(
+                _tool_call_slot_key(tc, tool_calls, tc_by_id),
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if isinstance(fn, dict):
+                if fn.get("name"):
+                    slot["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
+        if first.get("finish_reason"):
+            finish_reason = first["finish_reason"]
+        u = piece.get("usage")
+        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+            usage = u
+    if saw_error and not content_parts and not tool_calls:
+        return {"error": {
+            "message": saw_error,
+            "type": "rate_limit_error" if saw_rate_limit else "upstream_error",
+        }}
+    if not got_any_chunk and not content_parts and not tool_calls:
+        return None
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    message: dict = {"role": "assistant"}
+    if content or not tool_calls:
+        message["content"] = content
+    else:
+        message["content"] = None
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    ordered = [tool_calls[i] for i in sorted(tool_calls)]
+    # Cline forwards the caller's tools verbatim and never receives the
+    # injected Zen sextet, so there is nothing to strip on this lane.
+    ordered = _strip_injected_tool_calls(ordered, True)
+    if schemas:
+        ordered, _fixed = _repair_assembled_tool_calls(ordered, schemas)
+        if _fixed:
+            _log(f"[cline] Repaired {_fixed} malformed tool-call argument(s) against declared schema")
+    if ordered:
+        message["tool_calls"] = [
+            {
+                "id": c["id"] or oc_id("call"),
+                "type": "function",
+                "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]},
+            }
+            for c in ordered
+        ]
+        finish_reason = finish_reason or "tool_calls"
+    if not usage:
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": (len(content) + len(reasoning)) // 4,
+            "completion_tokens_details": {"reasoning_tokens": len(reasoning) // 4},
+        }
+    return {
+        "id": cid or oc_id("chatcmpl"),
+        "object": "chat.completion",
+        "created": created if created is not None else int(time.time()),
+        "model": model or "",
+        "choices": [
+            {"index": 0, "message": message, "finish_reason": finish_reason or "stop"}
+        ],
+        "usage": usage,
+    }
+
+
 async def _cline_fetch_dynamic_ids() -> list[str]:
     """GET the Cline /models list with a pooled key (dynamic discovery).
 
@@ -5835,7 +6420,10 @@ async def _cline_fetch_dynamic_ids() -> list[str]:
         if resp.status_code >= 400:
             _log(f"[cline] Dynamic /models HTTP {resp.status_code}")
             if resp.status_code in (401, 403):
-                cline_keys.report_capped(key, "", raw.decode("utf-8", errors="replace") if raw else "")
+                # Stale bearer on the discovery call: refresh once; dead
+                # grants are skipped by the chat roll (discovery never mutates
+                # caps for the empty-model key).
+                cline_keys.refresh_once(key)
             else:
                 _report_cline_status(key, resp.status_code)
             return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
@@ -5851,9 +6439,10 @@ async def _cline_fetch_dynamic_ids() -> list[str]:
                 if mid:
                     ids.append(str(mid))
         if ids:
-            cline_keys.report_success(key)
+            cline_keys.report_slot_success(key, "")
             _CLINE_DYNAMIC_IDS = sorted(set(ids))
             _CLINE_DYNAMIC_AT = now
+            _log(f"[cline] Discovered {len(ids)} dynamic models (merged with {len(cline_models())} static)")
             return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
         return sorted(set(cline_models()) | set(_CLINE_DYNAMIC_IDS))
     finally:
@@ -5863,46 +6452,185 @@ async def _cline_fetch_dynamic_ids() -> list[str]:
             pass
 
 
+async def _cline_fetch_recommended_free() -> list[str]:
+    """GET the official free-tier rotation with a pooled key.
+
+    Fetches ``CLINE_RECOMMENDED_URL`` (``{recommended, free, clinePass}``),
+    takes the ``free[]`` IDs verbatim, caches them (same 1h TTL pattern as
+    the /models dynamic cache) and merges them into cline_proxy's dynamic
+    free list via ``set_dynamic_free_ids``. Returns the merged
+    ``cline_free_models()`` list (static fallback + live rotation).
+
+    Never wipes on failure: empty pool / network error / non-200 / empty
+    or malformed ``free[]`` all keep the previous rotation (and the
+    hardcoded fallback always applies). The base URL of the constant is
+    the same api.cline.bot origin, so the existing _cline_client transport
+    is reused with the pooled key + identity headers.
+
+    Stampede guard: the TTL check is not atomic, so N concurrent callers could
+    all see a stale rotation and all fetch. A plain in-flight flag (not an
+    asyncio primitive — this is reached from more than one loop in tests)
+    lets exactly one caller through.
+    """
+    global _CLINE_FREE_IDS, _CLINE_FREE_AT, _CLINE_FREE_FETCHING
+    now = time.time()
+    if _CLINE_FREE_IDS and now - _CLINE_FREE_AT < _CLINE_DYNAMIC_TTL:
+        return cline_free_models()
+    if not cline_keys.ready:
+        return cline_free_models()
+    if _CLINE_FREE_FETCHING:
+        return cline_free_models()   # a refresh is already in flight
+    key = cline_keys.select()
+    if key is None:
+        return cline_free_models()
+    _CLINE_FREE_FETCHING = True
+    path = CLINE_RECOMMENDED_URL
+    if isinstance(path, str) and path.startswith(CLINE_BASE_URL):
+        path = path[len(CLINE_BASE_URL):]
+    client = _cline_client(streaming=False)
+    try:
+        try:
+            resp = await client.get(path, headers=_cline_headers(key))
+        except Exception as e:
+            _log(f"[cline] Recommended free fetch failed: {_exc_desc(e)}")
+            return cline_free_models()
+        try:
+            raw = await resp.aread()
+        except Exception as e:
+            _log(f"[cline] Recommended free read failed: {_exc_desc(e)}")
+            return cline_free_models()
+        if resp.status_code >= 400:
+            _log(f"[cline] Recommended free HTTP {resp.status_code}")
+            if resp.status_code in (401, 403):
+                cline_keys.refresh_once(key)
+            else:
+                _report_cline_status(key, resp.status_code)
+            return cline_free_models()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            return cline_free_models()
+        ids = parse_recommended_free(payload)
+        if not ids:
+            # Empty/malformed free[]: keep previous rotation, never wipe.
+            return cline_free_models()
+        cline_keys.report_slot_success(key, "")
+        _CLINE_FREE_IDS = sorted(set(ids))
+        _CLINE_FREE_AT = now
+        merged = set_dynamic_free_ids(ids)
+        return merged
+    finally:
+        _CLINE_FREE_FETCHING = False
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+async def _cline_maybe_refresh_free():
+    """Refresh the live free rotation when stale, from the chat path.
+
+    Without this the rotation is only refreshed at startup and on
+    /v1/models, so a model Cline rotates INTO ``free[]`` keeps being 402-gated
+    (is_free_id reads the stale cache) until something happens to list models.
+    Costs one comparison while fresh; when stale it is one upstream GET, at
+    most once per TTL and never more than one in flight. Failures are
+    swallowed: the static fallback keeps working either way.
+    """
+    try:
+        await _cline_fetch_recommended_free()
+    except Exception as e:
+        _log(f"[cline] free rotation refresh skipped: {_exc_desc(e)}")
+
+
 async def cline_request_with_retry(
     req_body: dict,
     user: str,
     model: str,
     max_retries: int = None,
 ):
-    """Buffered Cline call with key rotation on consecutive 429s.
+    """Buffered Cline call rolling across login slots (active-first, capped-last).
 
-    Mirrors amd_request_with_retry. Returns the parsed OpenAI completion
-    dict, a JSONResponse error, or None if the client gave up.
+    Selection = pool roll: stale slots refresh once pre-attempt (transient
+    keeps stale, dead grant skips), 401/403 refreshes once then retries and
+    skips on a dead grant, 429 caps record + move to the next slot, success
+    clears the cap + bumps usage + marks active. Error map: 401/403 auth,
+    429 rate-limit, 402 exhausted (top-up hint), 5xx server. Cline stays
+    DIRECT (trust_env=False, never through the SOCKS pool). Upstream is
+    ALWAYS streamed (stream:true — cline-free/* 500s plain stream:false
+    POSTs) and the SSE events are aggregated into one OpenAI completion
+    dict via _cline_sse_to_completion. Returns the parsed OpenAI
+    completion dict, a JSONResponse error, or None if the
+    client gave up.
     """
     attempts = max_retries if max_retries is not None else MAX_RETRIES
     last_error = None
     last_key = None
     last_status = None
     last_body = ""
-    key_limit = len(cline_keys.keys) or 1
-    # Consecutive pool-wide 429s (not broken by a success or non-429). When this
-    # reaches CLINE_POOL_429_FAILFAST the whole pool is saturated → fail fast
-    # instead of looping every key with backoff for minutes ("thinking").
+    # Keep the live free rotation current from the chat path (TTL-guarded, at
+    # most one fetch in flight) so a model rotated INTO free[] stops being
+    # 402-gated without waiting for someone to call /v1/models.
+    await _cline_maybe_refresh_free()
+    slot_total = cline_keys.slot_count() or 1
+    skipped: set = set()
+    # Routing preference: free models skip key slots (prefer login); paid
+    # models skip login slots (prefer key). Fallback to the normal roll when
+    # the filter would remove every slot.
+    verbatim = cline_model_id(model)
+    want_free = is_free_id(verbatim)
+    preferred = _cline_preferred_skip(want_free)
     consecutive_429 = 0
-    # Sweep the whole pool: each iteration picks the next usable key (the pool
-    # advances internally), so a model that 404s for some keys (key lacks
-    # access) but works for another eventually succeeds. Rate limits rotate and
-    # cool down the offending key.
-    for attempt in range(key_limit + attempts):
-        key = cline_keys.select(model)
+    capped_slots: set = set()
+    earliest_reset_ms = None
+    limit_model_id = None
+    cap_skips = 0
+    tried = 0
+    max_tries = slot_total + attempts
+    while tried < max_tries:
+        tried += 1
+        attempt = tried - 1
+        key = cline_keys.select(model, skip=skipped | preferred)
+        if key is None and preferred:
+            key = cline_keys.select(model, skip=skipped)
         if key is None:
-            return _cline_rate_limit_response("all Cline keys are in rate-limit cooldown")
-        client = _cline_client(streaming=False)
+            break
+        # Free-only gate: paid models fail fast on login slots with zero
+        # upstream calls; key slots bypass the gate (they bill normally).
+        if not want_free and not _cline_token_is_key_slot(key):
+            _log(f"[cline] Paid model {verbatim} {_CLINE_PAID_GATE_MSG} — failing fast, no upstream call")
+            return JSONResponse(
+                status_code=402,
+                content={"error": {"message": f"{verbatim} {_CLINE_PAID_GATE_MSG}", "type": "billing_error", "code": "insufficient_balance"}},
+            )
+        # Cap gate: skip slots already on this model's daily free cap — no
+        # upstream call, no backoff, just move to the next open slot. Records
+        # the slot + its reset so an all-capped pool still reports the hint.
+        slot_name = cline_keys.slot_name_for(key)
+        reset_ms = cline_keys.cap_reset_ms_for(slot_name, verbatim) if slot_name else None
+        if slot_name and reset_ms is not None:
+            cap_skips += 1
+            # Bounded: one line per slot. The gate is loop-bounded already,
+            # but a selection regression must not turn this into log spam.
+            if cap_skips <= slot_total:
+                _log(f"[cline] Slot {slot_name} capped on {verbatim} — skipping (no upstream call)")
+            earliest_reset_ms = _cline_record_cap(
+                skipped, capped_slots, key, slot_name, reset_ms, earliest_reset_ms)
+            continue
+        # cline-free/* only serves SSE: force stream:true upstream even for
+        # non-streaming clients; the buffered path aggregates below.
+        stream_body = _cline_upstream_stream_body(req_body)
+        client = _cline_client(streaming=True)
         headers = _cline_headers(key)
         try:
             try:
                 resp = await client.post(
-                    "/chat/completions", json=req_body, headers=headers
+                    "/chat/completions", json=stream_body, headers=headers
                 )
             except Exception as e:
                 last_error = e
                 _log(f"[cline] Request failed (attempt {attempt}, key ...{key[-8:] if len(key) >= 8 else key}): {_exc_desc(e)}")
-                if attempt < key_limit + attempts - 1:
+                if attempt < max_tries - 1:
                     await _backoff(attempt)
                     continue
                 return JSONResponse(
@@ -5915,51 +6643,184 @@ async def cline_request_with_retry(
             last_key = key
             last_status = resp.status_code
             last_body = body_text
-            try:
-                data = json.loads(body_bytes)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                data = {}
+            bridged = False
+            if resp.status_code < 400 and _cline_looks_like_sse(body_text):
+                bridged = True
+                agg = _cline_sse_to_completion(body_bytes, model, _tool_schemas_from_body(req_body))
+                if isinstance(agg, dict) and "error" in agg and "choices" not in agg:
+                    err_msg = (_upstream_error(agg)).get("message") or "Upstream stream error"
+                    _log(f"[cline] SSE-bridged in-stream error (key ...{key[-8:] if len(key) >= 8 else key}): {err_msg}")
+                    data = agg
+                    # In-stream rate limits keep cap bookkeeping + 429 fail-fast.
+                    kind = "rate-limit" if (_upstream_error(agg)).get("type") == "rate_limit_error" else "server"
+                elif agg is None:
+                    data = {}
+                    _log(f"[cline] SSE-bridged empty stream (key ...{key[-8:] if len(key) >= 8 else key})")
+                    kind = "server"
+                else:
+                    data = agg
+                    kind = "ok"
+                    last_body = json.dumps(agg)[:2000]
+            else:
+                try:
+                    data = _as_dict(json.loads(body_bytes))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    data = {}
+                kind = _map_cline_error(resp.status_code)
 
-            is_429 = resp.status_code == 429
-            is_rate_limit = is_429 or "FreeUsageLimitError" in body_text or (
-                "erate" in body_text and "429" in body_text
-            ) or "free limit reached" in body_text.lower()
-            if is_rate_limit:
-                err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
-                cline_keys.report_capped(key, model, body_text)
-                hint = cline_keys.nearest_reset_hint(model)
-                _log(f"[cline] 429 on key ...{key[-8:] if len(key) >= 8 else key} (attempt {attempt}): {err_msg} capped")
+            if kind == "rate-limit":
+                err_msg = (_upstream_error(data)).get("message") or "Rate limit exceeded"
+                from cline_pool import parse_cline_free_limit as _parse_limit
+                limit = _parse_limit(body_text)
+                # Persist under the CANONICAL id: the pre-attempt cap gate looks
+                # the cap up by verbatim, so a prefixed key here writes an entry
+                # the gate never matches and the next request 429s again.
+                cline_keys.report_capped(key, verbatim, body_text)
+                reset_ms = None
+                if limit is not None:
+                    if limit.get("modelId"):
+                        limit_model_id = limit["modelId"]
+                    if isinstance(limit.get("resetAt"), (int, float)):
+                        reset_ms = limit["resetAt"]
+                # This slot just said "your daily free limit is exhausted":
+                # retire it for the rest of THIS request whether or not the body
+                # carried a machine-readable resetAt. Rolling on persistence
+                # alone re-picked the same key 6x (40s) on a cap that was
+                # already on disk.
+                earliest_reset_ms = _cline_record_cap(
+                    skipped, capped_slots, key, slot_name, reset_ms, earliest_reset_ms)
+                hint = cline_keys.nearest_reset_hint(verbatim)
+                _log(f"[cline] 429 on key ...{key[-8:] if len(key) >= 8 else key} (attempt {attempt}): {err_msg} capped — slot retired for this request")
                 consecutive_429 += 1
                 # Whole pool saturated with rate limits → fail fast with a clear
                 # 429 rather than silently looping every key for minutes.
-                if consecutive_429 >= CLINE_POOL_429_FAILFAST:
-                    _log(f"[cline] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+                # Effective ceiling = min(threshold, slots+1): each slot is
+                # retired after its first 429, so a constant 12 can never be
+                # reached — an unreachable guard is not a guard.
+                failfast_429 = min(CLINE_POOL_429_FAILFAST, slot_total + 1)
+                if consecutive_429 >= failfast_429:
+                    _log(f"[cline] {consecutive_429} consecutive 429s (fail-fast at {failfast_429}, {slot_total} slot(s)) -> pool saturated; failing fast")
                     msg = f"Cline pool rate-limited ({consecutive_429} consecutive 429s)"
                     if hint:
                         msg += f"; {hint}"
                     else:
                         msg += "; try again in a moment"
                     return _cline_rate_limit_response(msg)
-                if attempt < key_limit + attempts - 1:
-                    await _backoff(attempt)
+                if attempt < max_tries - 1:
+                    # No backoff: the next pick is a DIFFERENT slot (or none),
+                    # never a retry of the key that just reported a daily cap.
                     continue
                 return _cline_rate_limit_response(err_msg)
 
-            if resp.status_code == 402:
-                err_msg = (data.get("error") or {}).get("message") or "Empty balance"
+            if kind == "exhausted":
+                err_msg = (_upstream_error(data)).get("message") or "Empty balance"
                 _log(f"[cline] 402 on key ...{key[-8:] if len(key) >= 8 else key}: {err_msg}")
                 _report_cline_status(key, resp.status_code)
                 return _cline_balance_response(err_msg)
 
+            if kind == "auth":
+                err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}"
+                _log(f"[cline] Auth {resp.status_code} (key ...{key[-8:] if len(key) >= 8 else key}): {err_msg} — refresh-once+retry")
+                consecutive_429 = 0
+                fresh = cline_keys.refresh_once(key)
+                if fresh:
+                    # Exactly one retry with the fresh bearer (upstream SSE
+                    # forced + aggregated, same as the main attempt).
+                    retry_headers = _cline_headers(fresh)
+                    retry_client = _cline_client(streaming=True)
+                    try:
+                        try:
+                            rresp = await retry_client.post(
+                                "/chat/completions", json=_cline_upstream_stream_body(req_body), headers=retry_headers
+                            )
+                        except Exception as e:
+                            last_error = e
+                            _log(f"[cline] Retry failed (key ...{fresh[-8:] if len(fresh) >= 8 else fresh}): {_exc_desc(e)}")
+                            continue
+                        rbytes = await rresp.aread()
+                        rtext = rbytes.decode("utf-8", errors="replace")
+                        if rresp.status_code < 400 and _cline_looks_like_sse(rtext):
+                            ragg = _cline_sse_to_completion(rbytes, model, _tool_schemas_from_body(req_body))
+                            if isinstance(ragg, dict) and "error" in ragg and "choices" not in ragg:
+                                rtext = (_upstream_error(ragg)).get("message") or rtext
+                                rdata = ragg
+                                rkind = "rate-limit" if (_upstream_error(ragg)).get("type") == "rate_limit_error" else "server"
+                            elif ragg is None:
+                                rdata = {}
+                                rkind = "server"
+                            else:
+                                rdata = ragg
+                                rkind = "ok"
+                                rtext = json.dumps(ragg)[:2000]
+                        else:
+                            try:
+                                rdata = _as_dict(json.loads(rbytes))
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                rdata = {}
+                            rkind = _map_cline_error(rresp.status_code)
+                        if rkind == "ok":
+                            last_key = fresh
+                            last_status = rresp.status_code
+                            cline_keys.report_slot_success(fresh, verbatim)
+                            consecutive_429 = 0
+                            usage = rdata.get("usage") or {}
+                            if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
+                                _add_tokens(model,
+                                    usage.get("prompt_tokens") or 0,
+                                    usage.get("completion_tokens") or 0,
+                                    usage.get("prompt_cache_hit_tokens") or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                                    usage.get("prompt_cache_miss_tokens") or 0,
+                                )
+                            return rdata
+                        last_key = fresh
+                        last_status = rresp.status_code
+                        last_body = rtext
+                        if rkind == "rate-limit":
+                            cline_keys.report_capped(fresh, verbatim, rtext)
+                            # Retire the refreshed slot too, else the roll hands
+                            # back the same login and 429s it again.
+                            slot_fresh = cline_keys.slot_name_for(fresh)
+                            earliest_reset_ms = _cline_record_cap(
+                                skipped, capped_slots, fresh, slot_fresh, None, earliest_reset_ms)
+                        continue
+                    finally:
+                        try:
+                            await retry_client.aclose()
+                        except Exception:
+                            pass
+                elif fresh is False:
+                    # Dead grant — skip this slot for the rest of the roll.
+                    skipped.add(key)
+                    continue
+                # Transient (None): fall through to next slot this turn.
+                continue
+
+            # SSE-bridged HTTP-200 in-stream errors have status<400 (so the
+            # >=400 block below never fires): retry/fail-fast through the
+            # same slot roll as raw 5xx instead of reporting success.
+            if bridged and kind not in ("ok", "rate-limit", "exhausted", "auth"):
+                consecutive_429 = 0
+                agg_err = (_upstream_error(data)).get("message") or "Upstream stream error"
+                _log(f"[cline] SSE-bridged upstream error (key ...{key[-8:] if len(key) >= 8 else key}): {agg_err}")
+                if not _report_cline_status(key, resp.status_code):
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": agg_err, "type": "upstream_error"}},
+                    )
+                if attempt < max_tries - 1:
+                    await _backoff(attempt)
+                    continue
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": agg_err, "type": "upstream_error"}},
+                )
+
             if resp.status_code >= 400:
                 consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
-                err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+                err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}"
                 is_context = _is_context_limit_error(data, body_text)
                 bare_500 = _is_bare_internal_error(resp.status_code, data, body_text)
                 _log(f"[cline] Error {resp.status_code} (key ...{key[-8:] if len(key) >= 8 else key}): {err_msg} body={body_text[:200]!r}")
-                if resp.status_code in (401, 403):
-                    # Bad/revoked key — rotate away (not rate-limit but unusable).
-                    cline_keys.report_capped(key, model, body_text)
                 if is_context:
                     # Context window exhaustion is per-model/request, not key.
                     return JSONResponse(
@@ -5972,6 +6833,7 @@ async def cline_request_with_retry(
                         content={"error": {"message": err_msg + " (model appears down upstream; try another Cline model)", "type": "upstream_error"}},
                     )
                 if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                    _note_backend_unavailable(model)
                     return JSONResponse(
                         status_code=resp.status_code,
                         content={"error": {"message": err_msg + " (backend temporarily unavailable; try again shortly)", "type": "upstream_error"}},
@@ -5981,18 +6843,20 @@ async def cline_request_with_retry(
                         status_code=resp.status_code,
                         content={"error": {"message": err_msg, "type": "upstream_error"}},
                     )
-                # 404 (model not authorized for this key) → advance to the next
-                # key with no delay; a different key may have access.
-                if resp.status_code < 500 and attempt < key_limit + attempts - 1:
+                # 404 (model not authorized for this slot) → advance to the
+                # next slot with no delay; a different login may have access.
+                # Retiring the slot is what makes "advance" real — select()
+                # otherwise hands the same bearer straight back.
+                if resp.status_code < 500 and attempt < max_tries - 1:
+                    _cline_retire_slot(skipped, key, slot_name)
                     continue
-                # 5xx → escalating key cooldown (504 fast-breaks, no cycling);
-                # then transient retry with backoff.
+                # 5xx server error → transient retry with backoff.
                 if not _report_cline_status(key, resp.status_code):
                     return JSONResponse(
                         status_code=resp.status_code,
                         content={"error": {"message": err_msg, "type": "upstream_error"}},
                     )
-                if attempt < key_limit + attempts - 1:
+                if attempt < max_tries - 1:
                     await _backoff(attempt)
                     continue
                 return JSONResponse(
@@ -6000,7 +6864,7 @@ async def cline_request_with_retry(
                     content={"error": {"message": err_msg, "type": "upstream_error"}},
                 )
 
-            cline_keys.report_success(key)
+            cline_keys.report_slot_success(key, verbatim)
             consecutive_429 = 0
             usage = data.get("usage") or {}
             if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
@@ -6017,6 +6881,15 @@ async def cline_request_with_retry(
             except Exception:
                 pass
 
+    # Roll outcome: every slot reported a daily cap (resetAt known or not) →
+    # limitOnly hint; else last upstream failure.
+    if capped_slots:
+        hint = cline_keys.nearest_reset_hint(verbatim)
+        msg = f"All {len(capped_slots)} Cline login(s) on this model's daily free cap"
+        if limit_model_id:
+            msg += f" (model {limit_model_id})"
+        msg += f"; {hint}" if hint else "; try again later"
+        return _cline_rate_limit_response(msg)
     last_err = f"Cline error after retries (last key ...{last_key[-8:] if last_key and len(last_key) >= 8 else (last_key or 'none')}: HTTP {last_status})"
     if last_error:
         last_err += f": {_exc_desc(last_error)}"
@@ -6032,29 +6905,100 @@ async def cline_stream_with_retry(
     model: str,
     max_retries: int = None,
 ):
-    """Streaming Cline call with key rotation on consecutive 429s.
+    """Streaming Cline call rolling across login slots (active-first, capped-last).
 
-    Mirrors amd_stream_with_retry. Yields OpenAI SSE lines. A key that 429s
-    rotates away (cooldown) and the request is retried with the next key.
+    Yields OpenAI SSE lines. Stale slots refresh once pre-attempt, 401/403
+    refreshes once then retries (skipped on a dead grant), 429 caps record +
+    move on, success clears + bumps + marks active. Cline stays DIRECT
+    (trust_env=False, never through the SOCKS pool).
     """
     attempts = max_retries if max_retries is not None else MAX_RETRIES
     last_error = None
-    key_limit = len(cline_keys.keys) or 1
+    # Same TTL-guarded rotation refresh as the buffered path.
+    await _cline_maybe_refresh_free()
+    slot_total = cline_keys.slot_count() or 1
+    skipped: set = set()
+    # Routing preference: free models skip key slots (prefer login); paid
+    # models skip login slots (prefer key). Fallback to the normal roll when
+    # the filter would remove every slot.
+    verbatim = cline_model_id(model)
+    want_free = is_free_id(verbatim)
+    preferred = _cline_preferred_skip(want_free)
     used_keys_in_request = 0
     # Consecutive pool-wide 429s → fail fast when the whole pool is saturated.
     consecutive_429 = 0
+    capped_slots: set = set()
+    earliest_reset_ms = None
+    limit_model_id = None
     # Track stream throughput so we don't replay once bytes reached the client.
     streamed_any = False
+    cap_skips = 0
+    # Last real upstream failure of this roll. Without it the exhausted tail
+    # reports "_exc_desc(None)" → the literal string "failed after retries:
+    # None", discarding the actual 404/405/429 the slots returned.
+    last_upstream_msg = None
+    last_upstream_status = None
 
     attempt = 0
-    while attempt <= attempts + key_limit * 2:
-        key = cline_keys.select(model)
+    max_tries = slot_total + attempts * 2
+    # Hard iteration ceiling. `attempt` only advances on the retry paths, so a
+    # no-op path that `continue`s (the cap gate below) could never terminate the
+    # loop — a single capped slot spun 24k times with NO await on the skip path,
+    # pegging a core and blocking the whole event loop (/v1/models stopped
+    # answering). Every iteration now costs one count off this budget, and the
+    # budget leaves room for one cap-skip per slot on top of the old bound.
+    max_iterations = attempts + slot_total * 2 + slot_total + 1
+    iterations = 0
+    while iterations < max_iterations:
+        iterations += 1
+        key = cline_keys.select(model, skip=skipped | preferred)
+        if key is None and preferred:
+            key = cline_keys.select(model, skip=skipped)
         if key is None:
-            yield _openai_stream_error(
-                "all Cline keys are in rate-limit cooldown",
-                "rate_limit_error", "rate_limit_exceeded",
-            )
+            # Every slot reported a daily cap for this model → the informative
+            # rate-limit message, even when no resetAt could be parsed (the
+            # hint is then just "try again later").
+            if capped_slots:
+                hint = cline_keys.nearest_reset_hint(verbatim)
+                msg = f"All {len(capped_slots)} Cline login(s) on this model's daily free cap"
+                if limit_model_id:
+                    msg += f" (model {limit_model_id})"
+                msg += f"; {hint}" if hint else "; try again later"
+                yield _openai_stream_error(msg, "rate_limit_error", "rate_limit_exceeded")
+            else:
+                # Pool exhausted for another reason (every slot retired on a
+                # 404/405, or a dead grant). Surface the real upstream failure
+                # instead of mislabelling it a rate limit and losing it.
+                if last_upstream_msg:
+                    yield _openai_stream_error(
+                        f"Cline stream failed after retries (last slot HTTP {last_upstream_status}): {last_upstream_msg}",
+                        "upstream_error", str(last_upstream_status) if last_upstream_status else None)
+                    return
+                yield _openai_stream_error(
+                    "all Cline logins exhausted",
+                    "rate_limit_error", "rate_limit_exceeded",
+                )
             return
+        # Free-only gate: paid models fail fast on login slots with zero
+        # upstream calls; key slots bypass the gate (they bill normally).
+        if not want_free and not _cline_token_is_key_slot(key):
+            _log(f"[cline] Paid model {verbatim} {_CLINE_PAID_GATE_MSG} — failing fast, no upstream call")
+            yield _openai_stream_error(f"{verbatim} {_CLINE_PAID_GATE_MSG}", "billing_error", "insufficient_balance")
+            return
+        # Cap gate: skip slots already on this model's daily free cap — no
+        # upstream call, no backoff, just move to the next open slot. Records
+        # the slot + its reset so an all-capped pool still reports the hint.
+        slot_name = cline_keys.slot_name_for(key)
+        reset_ms = cline_keys.cap_reset_ms_for(slot_name, verbatim) if slot_name else None
+        if slot_name and reset_ms is not None:
+            cap_skips += 1
+            # Bounded: one line per slot. The loop is iteration-bounded above,
+            # but a selection regression must not turn this into log spam.
+            if cap_skips <= slot_total:
+                _log(f"[cline] Slot {slot_name} capped on {verbatim} — skipping (no upstream call)")
+            earliest_reset_ms = _cline_record_cap(
+                skipped, capped_slots, key, slot_name, reset_ms, earliest_reset_ms)
+            continue
         used_keys_in_request += 1
         client = _cline_client(streaming=True)
         try:
@@ -6067,7 +7011,7 @@ async def cline_stream_with_retry(
             last_error = e
             _log(f"[cline] Stream request failed (attempt {attempt}, key ...{key[-8:] if len(key) >= 8 else key}): {_exc_desc(e)}")
             await client.aclose()
-            if attempt < attempts + key_limit * 2:
+            if attempt < attempts + slot_total * 2:
                 attempt += 1
                 await _backoff(attempt)
                 continue
@@ -6078,8 +7022,8 @@ async def cline_stream_with_retry(
             try:
                 raw = await resp.aread()
                 try:
-                    data402 = json.loads(raw) if raw else {}
-                    err_msg402 = (data402.get("error") or {}).get("message") or "Empty balance"
+                    data402 = _as_dict(json.loads(raw)) if raw else {}
+                    err_msg402 = (_upstream_error(data402)).get("message") or "Empty balance"
                 except Exception:
                     err_msg402 = "Empty balance"
             except Exception:
@@ -6094,24 +7038,46 @@ async def cline_stream_with_retry(
             try:
                 raw = await resp.aread()
                 try:
-                    data = json.loads(raw)
-                    err_msg = (data.get("error") or {}).get("message") or "Rate limit exceeded"
+                    data = _as_dict(json.loads(raw))
+                    err_msg = (_upstream_error(data)).get("message") or "Rate limit exceeded"
                 except Exception:
                     err_msg = "Rate limit exceeded"
                 body_text = raw.decode("utf-8", errors="replace") if raw else ""
             except Exception as e:
                 err_msg = f"Rate limit ({_exc_desc(e)})"
                 body_text = ""
-            cline_keys.report_capped(key, model, body_text)
-            hint = cline_keys.nearest_reset_hint(model)
-            _log(f"[cline] Stream 429 on key ...{key[-8:] if len(key) >= 8 else key} (attempt {attempt}): {err_msg} capped")
+            from cline_pool import parse_cline_free_limit as _parse_limit
+            limit = _parse_limit(body_text)
+            # Persist under the CANONICAL id (the pre-attempt cap gate looks the
+            # cap up by verbatim, so a prefixed key writes an entry it can never
+            # match and the next request 429s upstream again).
+            cline_keys.report_capped(key, verbatim, body_text)
+            reset_ms = None
+            if limit is not None:
+                if limit.get("modelId"):
+                    limit_model_id = limit["modelId"]
+                if isinstance(limit.get("resetAt"), (int, float)):
+                    reset_ms = limit["resetAt"]
+            # This slot just reported an exhausted daily cap: retire it for the
+            # rest of THIS request whether or not the body carried a resetAt.
+            # Without this the roll re-picked the same key 10x (~2 min, no
+            # progress) — the persisted cap alone does not stop an in-request
+            # re-selection.
+            earliest_reset_ms = _cline_record_cap(
+                skipped, capped_slots, key, slot_name, reset_ms, earliest_reset_ms)
+            hint = cline_keys.nearest_reset_hint(verbatim)
+            _log(f"[cline] Stream 429 on key ...{key[-8:] if len(key) >= 8 else key} (attempt {attempt}): {err_msg} capped — slot retired for this request")
             await resp.aclose()
             await client.aclose()
             consecutive_429 += 1
             # Whole pool saturated → fail fast with a clear 429 instead of
             # silently looping every key for minutes (looks like "thinking").
-            if consecutive_429 >= CLINE_POOL_429_FAILFAST:
-                _log(f"[cline] {consecutive_429} consecutive 429s → pool saturated; failing fast")
+            # Effective ceiling = min(threshold, slots+1): a slot is retired
+            # after its first 429, so a constant 12 is unreachable and the
+            # guard never fires.
+            failfast_429 = min(CLINE_POOL_429_FAILFAST, slot_total + 1)
+            if consecutive_429 >= failfast_429:
+                _log(f"[cline] {consecutive_429} consecutive 429s (fail-fast at {failfast_429}, {slot_total} slot(s)) -> pool saturated; failing fast")
                 msg = f"Cline pool rate-limited ({consecutive_429} consecutive 429s)"
                 if hint:
                     msg += f"; {hint}"
@@ -6120,8 +7086,87 @@ async def cline_stream_with_retry(
                 yield _openai_stream_error(msg, "rate_limit_error", "rate_limit_exceeded")
                 return
             attempt += 1
-            await _backoff(attempt)
+            # No backoff: the next pick is a DIFFERENT slot (or none), never a
+            # retry of the key that just reported a daily cap. This is what
+            # turns a 2-minute roll into a sub-second one.
             continue
+
+        if resp.status_code in (401, 403):
+            try:
+                raw = await resp.aread()
+            except Exception:
+                raw = b""
+            try:
+                data = _as_dict(json.loads(raw)) if raw else {}
+            except Exception:
+                data = {}
+            err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}"
+            last_upstream_msg, last_upstream_status = err_msg, resp.status_code
+            _log(f"[cline] Stream auth {resp.status_code} (key ...{key[-8:] if len(key) >= 8 else key}): {err_msg} — refresh-once+retry")
+            consecutive_429 = 0
+            await resp.aclose()
+            await client.aclose()
+            fresh = cline_keys.refresh_once(key)
+            if fresh:
+                # Exactly one retry with the fresh bearer (no bytes streamed yet).
+                rclient = _cline_client(streaming=True)
+                try:
+                    rup = rclient.build_request(
+                        "POST", "/chat/completions", json=req_body,
+                        headers=_cline_headers(fresh),
+                    )
+                    rresp = await rclient.send(rup, stream=True)
+                except Exception as e:
+                    last_error = e
+                    _log(f"[cline] Stream retry failed: {_exc_desc(e)}")
+                    await rclient.aclose()
+                    if attempt < max_tries:
+                        attempt += 1
+                        await _backoff(attempt)
+                        continue
+                    yield _openai_stream_error(f"Stream request failed: {_exc_desc(e)}", "upstream_error", "transport_error")
+                    return
+                if rresp.status_code >= 400:
+                    try:
+                        rraw = await rresp.aread()
+                    except Exception:
+                        rraw = b""
+                    try:
+                        rdata = _as_dict(json.loads(rraw)) if rraw else {}
+                    except Exception:
+                        rdata = {}
+                    rmsg = (_upstream_error(rdata)).get("message") or f"HTTP {rresp.status_code}"
+                    last_upstream_msg, last_upstream_status = rmsg, rresp.status_code
+                    await rresp.aclose()
+                    await rclient.aclose()
+                    if rresp.status_code == 429:
+                        rbody = rraw.decode("utf-8", errors="replace")
+                        cline_keys.report_capped(fresh, verbatim, rbody)
+                        # Retire the refreshed slot for this request too.
+                        rlimit = None
+                        try:
+                            from cline_pool import parse_cline_free_limit as _pl
+                            _plim = _pl(rbody)
+                            rlimit = _plim.get("resetAt") if _plim else None
+                        except Exception:
+                            rlimit = None
+                        earliest_reset_ms = _cline_record_cap(
+                            skipped, capped_slots, fresh, cline_keys.slot_name_for(fresh),
+                            rlimit, earliest_reset_ms)
+                    attempt += 1
+                    continue
+                # Fresh bearer accepted — hand the stream through under it.
+                resp = rresp
+                client = rclient
+                key = fresh
+            elif fresh is False:
+                skipped.add(key)
+                attempt += 1
+                continue
+            else:
+                attempt += 1
+                await _backoff(attempt)
+                continue
 
         if resp.status_code >= 400:
             try:
@@ -6129,21 +7174,30 @@ async def cline_stream_with_retry(
             except Exception:
                 raw = b""
             try:
-                data = json.loads(raw) if raw else {}
+                data = _as_dict(json.loads(raw)) if raw else {}
             except Exception:
                 data = {}
-            err_msg = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            err_msg = (_upstream_error(data)).get("message") or f"HTTP {resp.status_code}"
             body_text = raw.decode("utf-8", errors="replace")
+            last_upstream_msg, last_upstream_status = err_msg, resp.status_code
             consecutive_429 = 0  # a non-429 breaks the consecutive-429 run
             _log(f"[cline] Stream error {resp.status_code} (key ...{key[-8:] if len(key) >= 8 else key}): {err_msg}")
-            if resp.status_code in (401, 403):
-                cline_keys.report_capped(key, model, body_text)
             await resp.aclose()
             await client.aclose()
-            # No bytes have streamed yet -> safe to try another key. A 404 means
-            # this key lacks the model; a 5xx may be transient. Sweep the pool.
-            # 5xx records escalating key cooldown (504 fast-breaks, no cycling).
-            if resp.status_code < 500 and attempt < attempts + key_limit:
+            # Deterministic per-request context error (mirrors the buffered
+            # path): another slot and every backoff in between repeat the same
+            # 400. Must be checked BEFORE the sweep, or a long-context request
+            # burns the whole retry budget (~30s) and still reports a generic
+            # upstream_error instead of context_window_error.
+            if _is_context_limit_error(data, body_text):
+                yield _openai_stream_error(err_msg, "context_window_error", str(resp.status_code))
+                return
+            # No bytes have streamed yet -> safe to try another slot. A 404
+            # means this login lacks the model; a 5xx may be transient. Sweep
+            # the pool. Retiring the slot is what makes the sweep real: without
+            # it select() returns the same bearer and the roll loops on one key.
+            if resp.status_code < 500 and attempt < attempts + slot_total:
+                _cline_retire_slot(skipped, key, slot_name)
                 attempt += 1
                 await _backoff(attempt)
                 continue
@@ -6152,23 +7206,28 @@ async def cline_stream_with_retry(
                     yield _openai_stream_error(err_msg + " (model appears down upstream; try another Cline model)", "upstream_error", str(resp.status_code))
                     return
                 if _is_backend_unavailable_error(resp.status_code, data, body_text):
+                    _note_backend_unavailable(model)
                     yield _openai_stream_error(err_msg + " (backend temporarily unavailable; try again shortly)", "upstream_error", str(resp.status_code))
                     return
                 if _is_free_tier_gate_error(data, body_text) or _is_promotion_ended_error(data, body_text, resp.status_code, model):
                     yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
                     return
-                if not _report_cline_status(key, resp.status_code):
-                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
-                    return
-                if attempt < attempts + key_limit * 2:
+                _report_cline_status(key, resp.status_code)
+                if attempt < max_tries:
                     attempt += 1
                     await _backoff(attempt)
                     continue
             yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
             return
 
-        # Success — stream it through
-        cline_keys.report_success(key)
+        # Success — stream it through.
+        # Cap clearing / usage / active-slot bookkeeping happens AFTER the
+        # stream completes (as in the buffered path, which records success
+        # only after aggregation). A 200 whose body is an immediate in-stream
+        # error, an empty stream or a truncated stream must NOT clear a real
+        # daily cap, bump usage.served, or mark the slot active — and a
+        # mid-stream rate limit would otherwise have its own cap cleared by
+        # the very next 200.
         consecutive_429 = 0
         stream_completed = False
         try:
@@ -6197,8 +7256,8 @@ async def cline_stream_with_retry(
                     if ev:
                         err_msg, is_rate_limit = ev
                         if is_rate_limit:
-                            cline_keys.report_capped(key, model, payload)
-                            hint = cline_keys.nearest_reset_hint(model)
+                            cline_keys.report_capped(key, verbatim, payload)
+                            hint = cline_keys.nearest_reset_hint(verbatim)
                             _log(f"[cline] Stream body rate-limit on key ...{key[-8:] if len(key) >= 8 else key}: {err_msg} capped")
                             if hint:
                                 err_msg = f"{err_msg} ({hint})"
@@ -6220,7 +7279,7 @@ async def cline_stream_with_retry(
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TransportError) as e:
                 _log(f"[cline] Stream interrupted (key ...{key[-8:] if len(key) >= 8 else key}): {_exc_desc(e)}")
                 last_error = e
-                if not streamed_any and attempt < attempts + key_limit * 2:
+                if not streamed_any and attempt < max_tries:
                     attempt += 1
                     await _backoff(attempt)
                     continue
@@ -6238,16 +7297,38 @@ async def cline_stream_with_retry(
 
         if not stream_completed:
             _log(f"[cline] Stream ended before [DONE] on key ...{key[-8:] if len(key) >= 8 else key}")
-            if not streamed_any and attempt < attempts + key_limit * 2:
+            if not streamed_any and attempt < max_tries:
                 attempt += 1
                 await _backoff(attempt)
                 continue
             yield _openai_stream_error("Cline stream ended before completion", "upstream_error", "incomplete_stream")
             return
+        cline_keys.report_slot_success(key, verbatim)
         return
 
+    # Loop exhausted (iteration ceiling). Same roll outcome as the buffered
+    # path: all-capped → reset hint, else the last transport failure.
+    if capped_slots:
+        hint = cline_keys.nearest_reset_hint(verbatim)
+        msg = f"All {len(capped_slots)} Cline login(s) on this model's daily free cap"
+        if limit_model_id:
+            msg += f" (model {limit_model_id})"
+        msg += f"; {hint}" if hint else "; try again later"
+        yield _openai_stream_error(msg, "rate_limit_error", "rate_limit_exceeded")
+        return
+    # A rate-limited roll always lands in the branch above (capped_slots is
+    # in-memory and monotonic), so what is left here is a non-rate-limit roll.
+    # Report the last real upstream failure; never the literal "None" that
+    # _exc_desc(None) produced.
+    if last_upstream_msg:
+        yield _openai_stream_error(
+            f"Cline stream failed after retries (last slot HTTP {last_upstream_status}): {last_upstream_msg}",
+            "upstream_error", str(last_upstream_status) if last_upstream_status else None,
+        )
+        return
     yield _openai_stream_error(
-        f"connection error: Cline stream failed after retries: {_exc_desc(last_error)}",
+        "connection error: Cline stream failed after retries: "
+        + (_exc_desc(last_error) if last_error is not None else "no upstream response"),
         "upstream_error", "transport_error",
     )
 
@@ -6444,14 +7525,12 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
 # Minimal Ollama-compatible shim for clients that only speak Ollama
 # (e.g. some VS Code extensions): GET /api/tags lists the same models as
 # /v1/models, POST /api/chat and POST /api/generate fan out to the same
-# Zen / NVIDIA-NIM upstream paths as /v1/chat/completions. Streaming uses
+# Zen upstream paths as /v1/chat/completions. Streaming uses
 # Ollama NDJSON (one JSON object per line), not SSE. Structured output
 # via `format` is NOT translated — the model returns plain text.
 
 OLLAMA_VERSION = "0.11.4"
 OLLAMA_MODIFIED_AT = "2026-01-01T00:00:00Z"
-# Keep in sync with the nvidia/* entries exposed by list_models.
-_OLLAMA_NVIDIA_ALIASES = ("kimi-k3", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-coder")
 
 
 def _ollama_now() -> str:
@@ -6466,22 +7545,6 @@ async def _ollama_names() -> list[str]:
     for alias, canonical in sorted(MODEL_ALIASES.items()):
         if canonical in seen and alias not in seen and not _is_blocked_model(canonical):
             names.append(alias)
-    if nvidia_keys.ready:
-        for alias in _OLLAMA_NVIDIA_ALIASES:
-            nid = f"nvidia/{alias}"
-            if nid not in seen:
-                names.append(nid)
-                seen.add(nid)
-    if amd_keys.ready:
-        try:
-            amd_ids = await _amd_fetch_dynamic_ids()
-        except Exception:
-            amd_ids = amd_models()
-        for mid in amd_ids:
-            nid = f"amd/{mid}"
-            if nid not in seen:
-                names.append(nid)
-                seen.add(nid)
     if cline_keys.ready:
         try:
             cline_ids = await _cline_fetch_dynamic_ids()
@@ -6492,15 +7555,11 @@ async def _ollama_names() -> list[str]:
             if nid not in seen:
                 names.append(nid)
                 seen.add(nid)
-    return names
+    return sorted(names, key=str.lower)
 
 
 def _ollama_details(name: str) -> dict:
-    if is_nvidia_model(name):
-        canon = nvidia_model_id(name)
-    elif is_amd_model(name):
-        canon = amd_model_id(name)
-    elif is_cline_model(name):
+    if is_cline_model(name):
         canon = cline_model_id(name)
     else:
         canon = _normalize_model(name) or ""
@@ -6568,23 +7627,11 @@ async def ollama_show(request: Request):
     name = body.get("model") or body.get("name") or ""
     if not name:
         return JSONResponse(status_code=400, content={"error": "model name required"})
-    if is_nvidia_model(name):
-        if not nvidia_keys.ready:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "No NVIDIA API keys loaded (nvidia-api-keys.txt empty/missing)"},
-            )
-    elif is_amd_model(name):
-        if not amd_keys.ready:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "No AMD API keys loaded (amd-api-keys.txt empty/missing)"},
-            )
-    elif is_cline_model(name):
+    if is_cline_model(name):
         if not cline_keys.ready:
             return JSONResponse(
                 status_code=503,
-                content={"error": "No Cline API keys loaded (cline-api-keys.txt empty/missing)"},
+                content={"error": "No Cline logins saved (python cline_login.py) and no cline-api-keys.txt keys loaded"},
             )
     elif not await _ensure_model_known(_normalize_model(name)):
         return JSONResponse(status_code=404, content={"error": f'model "{name}" not found'})
@@ -6766,56 +7813,16 @@ def _ollama_message(resp: JSONResponse) -> str:
 
 
 async def _ollama_upstream(request, user, model_raw, oai_messages, tools, stream, max_tokens, sampling, effort_body):
-    """Shared Zen/NIM fan-out for the Ollama shim (mirrors chat_completions).
+    """Shared Zen/Cline fan-out for the Ollama shim (mirrors chat_completions).
 
     Returns (kind, payload) where kind is:
       "sse"   -> payload is an async generator of OpenAI SSE strings
       "data"  -> payload is a buffered chat.completion dict
       "error" -> payload is (status_code, message) for an Ollama {"error": ...} body
     """
-    if is_nvidia_model(model_raw):
-        if not nvidia_keys.ready:
-            return ("error", (503, "No NVIDIA API keys loaded (nvidia-api-keys.txt empty/missing)"))
-        nim_model = nvidia_model_id(model_raw)
-        norm_messages = _normalize_messages(oai_messages) or []
-        req_body = nvidia_request_body(
-            nim_model, norm_messages, stream, tools, None,
-            max_tokens, None, sampling,
-        )
-        if stream:
-            return ("sse", nvidia_stream_with_retry(req_body, user, nim_model))
-        data = await nvidia_request_with_retry(req_body, user, nim_model)
-        if isinstance(data, JSONResponse):
-            return ("error", (_ollama_status(data), _ollama_message(data)))
-        if data is None:
-            return ("error", (502, "Client disconnected"))
-        if not data.get("choices"):
-            return ("error", (502, "Invalid upstream response"))
-        return ("data", data)
-
-    if is_amd_model(model_raw):
-        if not amd_keys.ready:
-            return ("error", (503, "No AMD API keys loaded (amd-api-keys.txt empty/missing)"))
-        amd_model = amd_model_id(model_raw)
-        norm_messages = _normalize_messages(oai_messages) or []
-        req_body = amd_request_body(
-            amd_model, norm_messages, stream, tools, None,
-            max_tokens, None, sampling,
-        )
-        if stream:
-            return ("sse", amd_stream_with_retry(req_body, user, amd_model))
-        data = await amd_request_with_retry(req_body, user, amd_model)
-        if isinstance(data, JSONResponse):
-            return ("error", (_ollama_status(data), _ollama_message(data)))
-        if data is None:
-            return ("error", (502, "Client disconnected"))
-        if not data.get("choices"):
-            return ("error", (502, "Invalid upstream response"))
-        return ("data", data)
-
     if is_cline_model(model_raw):
         if not cline_keys.ready:
-            return ("error", (503, "No Cline API keys loaded (cline-api-keys.txt empty/missing)"))
+            return ("error", (503, "No Cline logins saved (python cline_login.py) and no cline-api-keys.txt keys loaded"))
         cline_model = cline_model_id(model_raw)
         norm_messages = _normalize_messages(oai_messages) or []
         req_body = cline_request_body(
@@ -6852,6 +7859,7 @@ async def _ollama_upstream(request, user, model_raw, oai_messages, tools, stream
             return ("sse", gen)
         data = await _aggregate_upstream_completion(
             request, resp_body, headers, user, oai_messages or [], session_id, model, gen=gen,
+            caller_tools=bool(tools),
         )
         if isinstance(data, JSONResponse):
             return ("error", (_ollama_status(data), _ollama_message(data)))
@@ -6864,15 +7872,19 @@ async def _ollama_upstream(request, user, model_raw, oai_messages, tools, stream
             _log(f"[zen] buffered fallback: stream:true -> stream:false upstream (model={model})")
             buffered_body = dict(req_body)
             buffered_body["stream"] = False
-            data = await _zen_request_with_retry(request, buffered_body, headers, user, oai_messages or [], session_id, model)
+            data = await _zen_request_with_retry(request, buffered_body, headers, user, oai_messages or [], session_id, model, caller_tools=bool(tools))
             if isinstance(data, JSONResponse):
                 return ("error", (_ollama_status(data), _ollama_message(data)))
             if data is None:
                 return ("error", (502, "Client disconnected"))
             return ("data", data)
-        return ("sse", _zen_stream_with_retry(request, req_body, headers, user, oai_messages or [], session_id, model))
+        return ("sse", _repair_stream_tool_args(
+            _zen_stream_with_retry(request, req_body, headers, user, oai_messages or [], session_id, model, caller_tools=bool(tools)),
+            _tool_schemas_from_body(req_body),
+            model,
+        ))
 
-    data = await _zen_request_with_retry(request, req_body, headers, user, oai_messages or [], session_id, model)
+    data = await _zen_request_with_retry(request, req_body, headers, user, oai_messages or [], session_id, model, caller_tools=bool(tools))
     if isinstance(data, JSONResponse):
         return ("error", (_ollama_status(data), _ollama_message(data)))
     if data is None:
@@ -6894,12 +7906,14 @@ def _ollama_tool_args(slot_args: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-async def _ollama_ndjson_stream(sse_gen, model_name: str, mode: str, include_thinking: bool):
-    """Fold an OpenAI SSE stream (Zen/NIM/muse) into Ollama NDJSON chunks."""
+async def _ollama_ndjson_stream(sse_gen, model_name: str, mode: str, include_thinking: bool,
+                                caller_declared_tools: bool = False):
+    """Fold an OpenAI SSE stream (Zen/Cline) into Ollama NDJSON chunks."""
     created_at = _ollama_now()
     content_parts: list[str] = []
     think_parts: list[str] = []
     tool_acc: dict[int, dict] = {}
+    tc_by_id: dict[str, int] = {}
     finish_reason = None
     usage = None
     async for raw in sse_gen:
@@ -6914,8 +7928,11 @@ async def _ollama_ndjson_stream(sse_gen, model_name: str, mode: str, include_thi
                 piece = json.loads(payload)
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
-            if isinstance(piece.get("error"), dict):
-                yield json.dumps({"error": piece["error"].get("message") or "Upstream error"}, ensure_ascii=False) + "\n"
+            if not isinstance(piece, dict):
+                continue
+            perr = _upstream_error(piece)
+            if perr:
+                yield json.dumps({"error": perr.get("message") or "Upstream error"}, ensure_ascii=False) + "\n"
                 return
             choices = piece.get("choices")
             if not choices:
@@ -6946,8 +7963,9 @@ async def _ollama_ndjson_stream(sse_gen, model_name: str, mode: str, include_thi
             for tc in delta.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
-                idx = tc.get("index", 0)
-                slot = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                slot = tool_acc.setdefault(
+                    _tool_call_slot_key(tc, tool_acc, tc_by_id), {"id": "", "name": "", "arguments": ""}
+                )
                 if tc.get("id"):
                     slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
@@ -6973,10 +7991,14 @@ async def _ollama_ndjson_stream(sse_gen, model_name: str, mode: str, include_thi
         if include_thinking and think_parts:
             message["thinking"] = "".join(think_parts)
         if tool_acc:
-            message["tool_calls"] = [
-                {"function": {"name": tool_acc[idx]["name"], "arguments": _ollama_tool_args(tool_acc[idx]["arguments"])}}
-                for idx in sorted(tool_acc)
-            ]
+            kept = _strip_injected_tool_calls(
+                [tool_acc[idx] for idx in sorted(tool_acc)], caller_declared_tools
+            )
+            if kept:
+                message["tool_calls"] = [
+                    {"function": {"name": c["name"], "arguments": _ollama_tool_args(c["arguments"])}}
+                    for c in kept
+                ]
         final = {"model": model_name, "created_at": created_at, "message": message, "done": True, "done_reason": done_reason}
     if isinstance(usage, dict):
         final["prompt_eval_count"] = usage.get("prompt_tokens") or 0
@@ -7068,7 +8090,7 @@ async def ollama_chat(request: Request):
     if kind == "data":
         return JSONResponse(_ollama_chat_object(payload, str(model_raw), include_thinking))
     return StreamingResponse(
-        _ollama_ndjson_stream(payload, str(model_raw), "chat", include_thinking),
+        _ollama_ndjson_stream(payload, str(model_raw), "chat", include_thinking, bool(tools)),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
@@ -7112,7 +8134,7 @@ async def ollama_generate(request: Request):
     if kind == "data":
         return JSONResponse(_ollama_generate_object(payload, str(model_raw), include_thinking))
     return StreamingResponse(
-        _ollama_ndjson_stream(payload, str(model_raw), "generate", include_thinking),
+        _ollama_ndjson_stream(payload, str(model_raw), "generate", include_thinking, bool(tools)),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
@@ -7156,31 +8178,28 @@ async def list_models(request: Request):
     for alias, canonical in sorted(MODEL_ALIASES.items()):
         if canonical in _seen_ids and alias not in _seen_ids and not _is_blocked_model(canonical):
             data.append({"id": alias, "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
-    # NVIDIA NIM models exposed behind the nvidia/ (and nvimin/) prefix.
-    if nvidia_keys.ready:
-        for alias in ("kimi-k3", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-coder"):
-            data.append({"id": f"nvidia/{alias}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
-    # AMD Radeon TokenFactory models exposed behind the amd/ prefix.
-    # Dynamic discovery via GET /models when the pool is ready; hardcoded
-    # amd_models() fallback on failure — never wiped on empty.
-    if amd_keys.ready:
-        try:
-            amd_ids = await _amd_fetch_dynamic_ids()
-        except Exception:
-            amd_ids = amd_models()
-        for mid in amd_ids:
-            data.append({"id": f"amd/{mid}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
     # Cline models exposed behind the cline/ prefix.
     # Dynamic discovery via GET /models when the pool is ready, merged with
     # the hardcoded cline_models() fallback (which carries the cline-pass/*
-    # IDs the live endpoint omits) — never wiped on empty.
+    # IDs the live endpoint omits) — never wiped on empty. The live free
+    # rotation (GET recommended-models -> free[]) is refreshed here too so
+    # /v1/models advertises live free IDs; it merges with the static free
+    # fallback via cline_proxy (never a replacement, never wiped).
     if cline_keys.ready:
         try:
             cline_ids = await _cline_fetch_dynamic_ids()
         except Exception:
             cline_ids = cline_models()
+        try:
+            await _cline_fetch_recommended_free()
+        except Exception:
+            pass
+        free_live = set(cline_free_models())
         for mid in cline_ids:
             data.append({"id": f"cline/{mid}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
+        for mid in sorted(free_live - set(cline_ids)):
+            data.append({"id": f"cline/{mid}", "object": "model", "created": 1779000000, "owned_by": "opencode-free"})
+    data.sort(key=lambda e: e["id"].lower())
     return {"object": "list", "data": data, "models_checked_at": _models_checked_at}
 
 
@@ -7209,68 +8228,12 @@ async def chat_completions(request: Request):
             content={"error": {"message": "messages is required", "type": "invalid_request_error"}},
         )
 
-    # NVIDIA NIM direct route: models addressed with nvidia/ or nvimin/ prefix
-    if is_nvidia_model(model):
-        if not nvidia_keys.ready:
-            return JSONResponse(
-                status_code=503,
-                content={"error": {"message": "No NVIDIA API keys loaded (nvidia-api-keys.txt empty/missing)", "type": "upstream_error"}},
-            )
-        nim_model = nvidia_model_id(model)
-        norm_messages = _normalize_messages(messages) or []
-        req_body = nvidia_request_body(
-            nim_model, norm_messages, stream, tools, tool_choice,
-            body.get("max_tokens"), body.get("max_completion_tokens"), _nvidia_sampling_from(body),
-        )
-        if stream:
-            return StreamingResponse(
-                nvidia_stream_with_retry(req_body, user, nim_model),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
-            )
-        data = await nvidia_request_with_retry(req_body, user, nim_model)
-        if isinstance(data, JSONResponse):
-            return data
-        if data is None:
-            return JSONResponse(status_code=502, content={"error": {"message": "Client disconnected", "type": "upstream_error"}})
-        if not data.get("choices"):
-            return JSONResponse(status_code=502, content={"error": {"message": "Invalid upstream response", "type": "upstream_error"}})
-        return data
-
-    # AMD Radeon TokenFactory direct route: models addressed with amd/ or radeon/ prefix
-    if is_amd_model(model):
-        if not amd_keys.ready:
-            return JSONResponse(
-                status_code=503,
-                content={"error": {"message": "No AMD API keys loaded (amd-api-keys.txt empty/missing)", "type": "upstream_error"}},
-            )
-        amd_model = amd_model_id(model)
-        norm_messages = _normalize_messages(messages) or []
-        req_body = amd_request_body(
-            amd_model, norm_messages, stream, tools, tool_choice,
-            body.get("max_tokens"), body.get("max_completion_tokens"), _amd_sampling_from(body),
-        )
-        if stream:
-            return StreamingResponse(
-                amd_stream_with_retry(req_body, user, amd_model),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
-            )
-        data = await amd_request_with_retry(req_body, user, amd_model)
-        if isinstance(data, JSONResponse):
-            return data
-        if data is None:
-            return JSONResponse(status_code=502, content={"error": {"message": "Client disconnected", "type": "upstream_error"}})
-        if not data.get("choices"):
-            return JSONResponse(status_code=502, content={"error": {"message": "Invalid upstream response", "type": "upstream_error"}})
-        return data
-
     # Cline direct route: models addressed with the cline/ prefix
     if is_cline_model(model):
         if not cline_keys.ready:
             return JSONResponse(
                 status_code=503,
-                content={"error": {"message": "No Cline API keys loaded (cline-api-keys.txt empty/missing)", "type": "upstream_error"}},
+                content={"error": {"message": "No Cline logins saved (python cline_login.py) and no cline-api-keys.txt keys loaded", "type": "upstream_error"}},
             )
         cline_model = cline_model_id(model)
         norm_messages = _normalize_messages(messages) or []
@@ -7325,6 +8288,7 @@ async def chat_completions(request: Request):
         data = await _aggregate_upstream_completion(
             request, resp_body, headers, user, messages or [], session_id, model,
             gen=_zen_responses_stream_with_retry(request, resp_body, headers, user, messages or [], session_id, model),
+            caller_tools=bool(tools),
         )
         if isinstance(data, JSONResponse):
             return data
@@ -7337,7 +8301,7 @@ async def chat_completions(request: Request):
             _log(f"[zen] buffered fallback: stream:true -> stream:false upstream (model={model})")
             buffered_body = dict(req_body)
             buffered_body["stream"] = False
-            data = await _zen_request_with_retry(request, buffered_body, headers, user, messages or [], session_id, model)
+            data = await _zen_request_with_retry(request, buffered_body, headers, user, messages or [], session_id, model, caller_tools=bool(tools))
             if isinstance(data, JSONResponse):
                 return data
             if data is None:
@@ -7354,7 +8318,11 @@ async def chat_completions(request: Request):
                 },
             )
         return StreamingResponse(
-            _zen_stream_with_retry(request, req_body, headers, user, messages or [], session_id, model),
+            _repair_stream_tool_args(
+                _zen_stream_with_retry(request, req_body, headers, user, messages or [], session_id, model, caller_tools=bool(tools)),
+                _tool_schemas_from_body(req_body),
+                model,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -7362,7 +8330,7 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        data = await _zen_request_with_retry(request, req_body, headers, user, messages or [], session_id, model)
+        data = await _zen_request_with_retry(request, req_body, headers, user, messages or [], session_id, model, caller_tools=bool(tools))
         if isinstance(data, JSONResponse):
             return data
         if data is None:
@@ -7399,122 +8367,14 @@ async def messages(request: Request):
     model = body.get("model")
     stream = body.get("stream")
 
-    # NVIDIA NIM direct route (Anthropic format): convert to OpenAI, call NIM,
-    # convert the completion back to Anthropic. Streams are bridged through the
-    # buffered path (same guarantee as the Zen muse-spark fallback).
-    if is_nvidia_model(model):
-        if not nvidia_keys.ready:
-            return JSONResponse(
-                status_code=503,
-                content={"type": "error", "error": {"type": "upstream_error", "message": "No NVIDIA API keys loaded"}},
-            )
-        nim_model = nvidia_model_id(model)
-        oai_nv_messages, nv_tools = anthropic_to_openai(body)
-        oai_nv_messages = _normalize_messages(oai_nv_messages) or []
-        input_tokens = len(json.dumps(oai_nv_messages)) // 4
-        nv_req_body = nvidia_request_body(
-            nim_model, oai_nv_messages, False, nv_tools, None,
-            body.get("max_tokens"), body.get("max_completion_tokens"), _nvidia_sampling_from(body),
-        )
-        nv_data = await nvidia_request_with_retry(nv_req_body, user, nim_model)
-        if isinstance(nv_data, JSONResponse):
-            return nv_data
-        if nv_data is None:
-            return JSONResponse(
-                status_code=502,
-                content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
-            )
-        if not nv_data.get("choices"):
-            return JSONResponse(
-                status_code=502,
-                content={"type": "error", "error": {"type": "upstream_error", "message": "Invalid upstream response"}},
-            )
-        anth = openai_to_anthropic(nv_data, nim_model, input_tokens)
-        if stream:
-            async def _nv_anthropic_sse():
-                # Stream the already-complete buffered Anthropic conversion.
-                start_payload = json.dumps({"type": "message_start", "message": anth})
-                yield f"event: message_start\ndata: {start_payload}\n\n"
-                content = anth.get("content", [])
-                for idx, block in enumerate(content):
-                    cbs_payload = json.dumps({"type": "content_block_start", "index": idx, "content_block": block})
-                    yield f"event: content_block_start\ndata: {cbs_payload}\n\n"
-                    if block.get("type") == "text":
-                        delta_payload = json.dumps({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}})
-                        yield f"event: content_block_delta\ndata: {delta_payload}\n\n"
-                    cbstop_payload = json.dumps({"type": "content_block_stop", "index": idx})
-                    yield f"event: content_block_stop\ndata: {cbstop_payload}\n\n"
-                stop_payload = json.dumps({"type": "message_stop"})
-                yield f"event: message_stop\ndata: {stop_payload}\n\n"
-            return StreamingResponse(
-                _nv_anthropic_sse(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
-            )
-        return anth
-
-    # AMD TokenFactory direct route (Anthropic format): convert to OpenAI, call
-    # TokenFactory, convert the completion back to Anthropic. Streams are
-    # bridged through the buffered path (same guarantee as the NVIDIA route).
-    if is_amd_model(model):
-        if not amd_keys.ready:
-            return JSONResponse(
-                status_code=503,
-                content={"type": "error", "error": {"type": "upstream_error", "message": "No AMD API keys loaded"}},
-            )
-        amd_model = amd_model_id(model)
-        oai_amd_messages, amd_tools = anthropic_to_openai(body)
-        oai_amd_messages = _normalize_messages(oai_amd_messages) or []
-        input_tokens = len(json.dumps(oai_amd_messages)) // 4
-        amd_req_body = amd_request_body(
-            amd_model, oai_amd_messages, False, amd_tools, None,
-            body.get("max_tokens"), body.get("max_completion_tokens"), _amd_sampling_from(body),
-        )
-        amd_data = await amd_request_with_retry(amd_req_body, user, amd_model)
-        if isinstance(amd_data, JSONResponse):
-            return amd_data
-        if amd_data is None:
-            return JSONResponse(
-                status_code=502,
-                content={"type": "error", "error": {"type": "upstream_error", "message": "Client disconnected"}},
-            )
-        if not amd_data.get("choices"):
-            return JSONResponse(
-                status_code=502,
-                content={"type": "error", "error": {"type": "upstream_error", "message": "Invalid upstream response"}},
-            )
-        anth = openai_to_anthropic(amd_data, amd_model, input_tokens)
-        if stream:
-            async def _amd_anthropic_sse():
-                # Stream the already-complete buffered Anthropic conversion.
-                start_payload = json.dumps({"type": "message_start", "message": anth})
-                yield f"event: message_start\ndata: {start_payload}\n\n"
-                content = anth.get("content", [])
-                for idx, block in enumerate(content):
-                    cbs_payload = json.dumps({"type": "content_block_start", "index": idx, "content_block": block})
-                    yield f"event: content_block_start\ndata: {cbs_payload}\n\n"
-                    if block.get("type") == "text":
-                        delta_payload = json.dumps({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}})
-                        yield f"event: content_block_delta\ndata: {delta_payload}\n\n"
-                    cbstop_payload = json.dumps({"type": "content_block_stop", "index": idx})
-                    yield f"event: content_block_stop\ndata: {cbstop_payload}\n\n"
-                stop_payload = json.dumps({"type": "message_stop"})
-                yield f"event: message_stop\ndata: {stop_payload}\n\n"
-            return StreamingResponse(
-                _amd_anthropic_sse(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
-            )
-        return anth
-
     # Cline direct route (Anthropic format): convert to OpenAI, call Cline,
     # convert the completion back to Anthropic. Streams are bridged through
-    # the buffered path (same guarantee as the AMD route).
+    # the buffered path (same guarantee as the Zen muse-spark fallback).
     if is_cline_model(model):
         if not cline_keys.ready:
             return JSONResponse(
                 status_code=503,
-                content={"type": "error", "error": {"type": "upstream_error", "message": "No Cline API keys loaded"}},
+                content={"type": "error", "error": {"type": "upstream_error", "message": "No Cline logins saved (python cline_login.py) and no cline-api-keys.txt keys loaded"}},
             )
         cline_model = cline_model_id(model)
         oai_cline_messages, cline_tools = anthropic_to_openai(body)
@@ -7589,6 +8449,7 @@ async def messages(request: Request):
         data = await _aggregate_upstream_completion(
             request, resp_body, headers, user, oai_messages, session_id, model,
             gen=_zen_responses_stream_with_retry(request, resp_body, headers, user, oai_messages, session_id, model),
+            caller_tools=bool(tools),
         )
         if isinstance(data, JSONResponse):
             return data
@@ -7615,7 +8476,7 @@ async def messages(request: Request):
             _log(f"[zen] muse-spark buffered fallback (anthropic): stream:true+tools -> stream:false upstream (model={model})")
             buffered_body = dict(req_body)
             buffered_body["stream"] = False
-            data = await _zen_request_with_retry(request, buffered_body, headers, user, oai_messages, session_id, model)
+            data = await _zen_request_with_retry(request, buffered_body, headers, user, oai_messages, session_id, model, caller_tools=bool(tools))
             if isinstance(data, JSONResponse):
                 return data
             if data is None:
@@ -7643,7 +8504,7 @@ async def messages(request: Request):
             },
         )
     else:
-        data = await _zen_request_with_retry(request, req_body, headers, user, oai_messages, session_id, model)
+        data = await _zen_request_with_retry(request, req_body, headers, user, oai_messages, session_id, model, caller_tools=bool(tools))
         if isinstance(data, JSONResponse):
             return data
         if data is None:
@@ -7714,7 +8575,7 @@ def _chat_to_responses(data: dict, model: str):
     ))
 
 
-async def _stream_as_responses(upstream, model: str, session_id=None):
+async def _stream_as_responses(upstream, model: str, session_id=None, caller_declared_tools: bool = False):
     """Translate an upstream OpenAI chat-completions SSE stream into the
     Responses API event sequence a codex_responses client expects.
 
@@ -7727,6 +8588,7 @@ async def _stream_as_responses(upstream, model: str, session_id=None):
     msg_id = oc_id("msg")
     text_buf: list[str] = []
     tool_calls: dict[int, dict] = {}
+    tc_by_id: dict[str, int] = {}
     fc_order: list[int] = []
     fc_index: dict[int, int] = {}
     fc_open: dict[int, bool] = {}
@@ -7767,8 +8629,8 @@ async def _stream_as_responses(upstream, model: str, session_id=None):
             # Surface upstream error chunks explicitly: a {"error": {...}}
             # chunk carries no choices/usage and must NOT be swallowed into
             # a terminal status=incomplete. Emit a failed response instead.
-            err_obj = data.get("error")
-            if isinstance(err_obj, dict):
+            err_obj = _upstream_error(data)
+            if err_obj:
                 err_msg = err_obj.get("message") or "upstream error"
                 _log(f"[zen] Responses upstream error chunk: {_redact_for_log(str(err_msg))[:300]}")
                 yield _responses_sse("response.failed", {
@@ -7782,16 +8644,20 @@ async def _stream_as_responses(upstream, model: str, session_id=None):
                 return
             choices = data.get("choices") or []
             if not choices:
-                if data.get("usage"):
+                if isinstance(data.get("usage"), dict):
                     usage = data["usage"]
                 continue
             choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
             delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                delta = {}
             content = delta.get("content")
             tcs = delta.get("tool_calls")
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
-            if data.get("usage"):
+            if isinstance(data.get("usage"), dict):
                 usage = data["usage"]
             if content:
                 if not msg_open:
@@ -7818,7 +8684,13 @@ async def _stream_as_responses(upstream, model: str, session_id=None):
                 })
             if tcs:
                 for t in tcs:
-                    idx = t.get("index", 0)
+                    if not isinstance(t, dict):
+                        continue
+                    if not caller_declared_tools:
+                        fn_name = ((t.get("function") or {}).get("name") if isinstance(t.get("function"), dict) else None) or t.get("name") or ""
+                        if str(fn_name).strip().lower() in _INJECTED_TOOL_NAMES:
+                            continue
+                    idx = _tool_call_slot_key(t, tool_calls, tc_by_id)
                     tc = tool_calls.get(idx)
                     if tc is None:
                         tc = {"id": t.get("id") or oc_id("call"), "name": "", "args": ""}
@@ -7827,6 +8699,8 @@ async def _stream_as_responses(upstream, model: str, session_id=None):
                     if t.get("id"):
                         tc["id"] = t["id"]
                     fn = t.get("function") or {}
+                    if not isinstance(fn, dict):
+                        continue
                     if fn.get("name"):
                         tc["name"] = fn["name"]
                     frag = fn.get("arguments") or ""
@@ -7939,13 +8813,14 @@ async def handle_responses(request: Request):
             gen = _zen_responses_stream_with_retry(request, resp_body, headers, user, messages, session_id, zen_model)
             if stream:
                 return StreamingResponse(
-                    _stream_as_responses(gen, model, session_id),
+                    _stream_as_responses(gen, model, session_id, bool(tools)),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
                 )
             data = await _aggregate_upstream_completion(
                 request, resp_body, headers, user, messages, session_id, zen_model,
                 gen=_zen_responses_stream_with_retry(request, resp_body, headers, user, messages, session_id, zen_model),
+                caller_tools=bool(tools),
             )
             if isinstance(data, JSONResponse):
                 return data
@@ -7963,7 +8838,7 @@ async def handle_responses(request: Request):
                 _log(f"[zen] responses buffered fallback: stream:true -> stream:false upstream (model={zen_model})")
                 buffered_body = dict(req_body)
                 buffered_body["stream"] = False
-                data = await _zen_request_with_retry(request, buffered_body, headers, user, messages, session_id, zen_model)
+                data = await _zen_request_with_retry(request, buffered_body, headers, user, messages, session_id, zen_model, caller_tools=bool(tools))
                 if data is None:
                     return JSONResponse(
                         status_code=502,
@@ -7985,7 +8860,7 @@ async def handle_responses(request: Request):
                         ch["delta"] = delta
                         yield f"data: {json.dumps({'choices': [ch], 'usage': data.get('usage')})}\n\n"
                         yield "data: [DONE]\n\n"
-                    async for evt in _stream_as_responses(_single_chunk(), model, session_id):
+                    async for evt in _stream_as_responses(_single_chunk(), model, session_id, bool(tools)):
                         yield evt
                 return StreamingResponse(
                     _buffered_responses(),
@@ -7995,9 +8870,13 @@ async def handle_responses(request: Request):
                         "X-Accel-Buffering": "no",
                     },
                 )
-            upstream = _zen_stream_with_retry(request, req_body, headers, user, messages, session_id, zen_model)
+            upstream = _repair_stream_tool_args(
+                _zen_stream_with_retry(request, req_body, headers, user, messages, session_id, zen_model, caller_tools=bool(tools)),
+                _tool_schemas_from_body(req_body),
+                zen_model,
+            )
             return StreamingResponse(
-                _stream_as_responses(upstream, model, session_id),
+                _stream_as_responses(upstream, model, session_id, bool(tools)),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache, no-transform",
@@ -8005,7 +8884,7 @@ async def handle_responses(request: Request):
                 },
             )
 
-        data = await _zen_request_with_retry(request, req_body, headers, user, messages, session_id, zen_model)
+        data = await _zen_request_with_retry(request, req_body, headers, user, messages, session_id, zen_model, caller_tools=bool(tools))
         if isinstance(data, JSONResponse):
             return data
         if data is None:
@@ -8096,11 +8975,8 @@ async def health(request: Request):
         "pool_state": pool_state,
         "pool_size": len(proxy_pool.hot) if PROXY_POOL_ENABLED else None,
         "tokens": dict(_tokens),
-        "nvidia_keys": len(nvidia_keys.keys) if nvidia_keys.ready else 0,
-        "nvidia_models": [f"nvidia/{m}" for m in nvidia_models()] if nvidia_keys.ready else [],
-        "amd_keys": len(amd_keys.keys) if amd_keys.ready else 0,
-        "amd_models": [f"amd/{m}" for m in amd_models()] if amd_keys.ready else [],
-        "cline_keys": len(cline_keys.keys) if cline_keys.ready else 0,
+        "cline_slots": cline_keys.slot_count() if cline_keys.ready else 0,
+        "cline_keys": cline_keys.slot_count() if cline_keys.ready else 0,
         "cline_models": [f"cline/{m}" for m in cline_models()] if cline_keys.ready else [],
         "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models", "/api/tags", "/api/show", "/api/chat", "/api/generate"],
     }
@@ -8135,5 +9011,11 @@ if __name__ == "__main__":
     print("  Ollama:    GET  /api/tags, POST /api/chat|generate")
     print("  Models:    GET  /v1/models")
     print("  Health:    GET  /health")
+    try:
+        _cline_n = len(cline_models())
+        _cline_slots = cline_keys.slot_count() if cline_keys.ready else 0
+        print(f"  Cline:     {_cline_slots} slot(s), {_cline_n} static models (+ dynamic via /models, 1h TTL)")
+    except Exception:
+        pass
 
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
