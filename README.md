@@ -46,11 +46,11 @@ python server.py --port 8080 --proxy socks5://127.0.0.1:9150
 
 ## Models
 
-The model list is fetched dynamically from the Zen API (`opencode.ai/zen/v1/models`) and enriched with context limits / modalities from `models.dev`. It refreshes every 5 hours. Typical free models:
+The model list is fetched dynamically from the Zen API (`opencode.ai/inference/v1/models`) and enriched with context limits / modalities from `models.dev`. It refreshes every 5 hours. Typical free models:
 
 - `space-bunny-free` (text + image, 1M context, 512K output — best specs)
 - `mimo-v2.6-flash-free` / `mimo-v2.5-free` (text + image, reasoning)
-- `muse-spark-1.3-contributor-free` / `muse-spark-1.2-contributor-free` (text + image, routed to `/zen/v1/responses`)
+- `muse-spark-1.3-contributor-free` / `muse-spark-1.2-contributor-free` (text + image, routed to `/inference/v1/responses`)
 - `nemotron-3.5-lightning-free` / `nemotron-3-ultra-free` (text, reasoning)
 - `big-pickle` (reasoning model, text-only)
 - `fledge-alpha-free` (text, 1M context, 131K output)
@@ -143,7 +143,7 @@ Your tool (opencode CLI, Cursor, curl, etc.)
   opencode-free-proxy        ← translates formats, manages sessions & proxies
         │
         ▼  HTTPS
-  opencode.ai/zen/v1/       ← free tier API
+  opencode.ai/inference/v1/  ← free tier API
 ```
 
 > **Sessions**: the proxy hashes the message prefix to reuse the upstream session, so multi-turn conversations stay coherent.
@@ -242,14 +242,13 @@ curl http://localhost:6446/v1/models # cline/* entries list available Cline rout
 ```
 
 - **Proxy pool**: on by default, SOCKS5 proxies are scraped from public lists, verified, and rotated. A proxy gets one transport retry, then is blacklisted after its second transport failure; `429` responses temporarily skip the current proxy so the caller can retry through another IP.
-- **Auth headers**: the proxy adds the `x-opencode-*` headers the Zen API requires (discovered by reverse-engineering the opencode binary):
+- **Auth headers**: the proxy adds the headers the inference gateway requires (reverse-engineered from the opencode binary). `Authorization: Bearer public` is REQUIRED upstream since the `/zen/v1` → `/inference/v1` migration; `x-opencode-request` is deliberately NOT sent (the gateway 403s on it):
 
 ```
 Authorization: Bearer public
 User-Agent: opencode/1.15.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13
 x-opencode-client: cli
 x-opencode-project: global
-x-opencode-request: msg_<unique_id>
 x-opencode-session: ses_<unique_id>
 ```
 

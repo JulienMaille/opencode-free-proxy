@@ -5,7 +5,7 @@ Covers:
   1. max_tokens never renamed to max_completion_tokens.
   2. reasoning_content + tool_calls survive cache-key ops.
   3. prompt_cache_retention stripped (chat + Responses bodies).
-  4. keyless omission wins over injected Authorization.
+  4. public auth (Bearer public) wins over injected Authorization.
   5. empty discovery never wipes snapshot.
 
 Plus narrow coverage for the Zen-only deltas: dual-key models.dev lookup,
@@ -162,27 +162,27 @@ def test_prompt_cache_retention_stripped():
     assert rb.get("prompt_cache_key") == "k1"
 
 
-# ── 4. keyless omission wins ───────────────────────────────────────
+# ── 4. public auth wins ──────────────────────────────────────────
 
-def test_keyless_omission_wins_over_injected_authorization():
+def test_public_auth_wins_over_injected_authorization():
     _, headers = srv.zen_request("m", [{"role": "user", "content": "hi"}], False, None, None, "s")
-    assert not any(str(k).lower() == "authorization" for k in headers)
+    assert headers.get("Authorization") == "Bearer public"
+    assert not any(str(k) == "x-opencode-request" for k in headers)
 
-    # A pool/hook merge that injects Authorization still loses: the strip
-    # runs after the merge (applied-last-wins).
+    # A pool/hook merge that injects a caller key still loses: the strip
+    # runs after the merge (applied-last-wins), re-asserting Bearer public.
     merged = dict(headers)
     merged["Authorization"] = "Bearer injected"
     merged["X-Relay-Foo"] = "bar"
     stripped = srv._strip_direct_headers(merged)
-    assert not any(str(k).lower() == "authorization" for k in stripped)
+    assert stripped.get("Authorization") == "Bearer public"
     assert "X-Relay-Foo" not in stripped
     assert stripped.get("Content-Type") == "application/json"
 
-    # Case-insensitive + non-dict hardening.
+    # Case-insensitive + non-dict hardening (public credential re-asserted).
     stripped2 = srv._strip_direct_headers({"aUtHoRiZaTiOn": "Bearer x", "Ok": "1"})
-    assert not any(str(k).lower() == "authorization" for k in stripped2)
-    assert stripped2 == {"Ok": "1"}
-    assert srv._strip_direct_headers(None) == {}
+    assert stripped2 == {"Ok": "1", "Authorization": "Bearer public"}
+    assert srv._strip_direct_headers(None) == {"Authorization": "Bearer public"}
 
 
 # ── 5. empty discovery never wipes snapshot ────────────────────────
@@ -702,7 +702,7 @@ _TESTS = [
     test_max_tokens_never_renamed,
     test_reasoning_tool_calls_survive_cache_key_ops,
     test_prompt_cache_retention_stripped,
-    test_keyless_omission_wins_over_injected_authorization,
+    test_public_auth_wins_over_injected_authorization,
     test_empty_discovery_never_wipes_snapshot,
     test_dual_key_models_dev_lookup,
     test_humanize_name_fallback,

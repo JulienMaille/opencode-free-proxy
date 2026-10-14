@@ -1243,9 +1243,13 @@ def _is_free_tier_gate_error(data: dict | None = None, body: str = "") -> bool:
 def _report_free_tier_block(proxy_addr: str | None):
     """Rotate off a FreeTier-gated exit with zero health penalty.
 
-    The gate is request-shaped (same request 403s on every rotated exit while
-    other requests OK on those same exits) — see
-    ``proxy_pool.report_free_tier_block``. SYNC (owner: event-loop thread /
+    The gate is usually request-shaped (same request 403s on every rotated
+    exit while other requests OK on those same exits) — see
+    ``proxy_pool.report_free_tier_block`` — but a burned exit IP gates
+    EVERYTHING (exit-shaped case). The pool therefore ALSO counts gates per
+    exit and quarantines repeat offenders, while callers pass their
+    already-gated exits as select(exclude=...) so one request never re-picks
+    the exit it just gated on. SYNC (owner: event-loop thread /
     request path). Falls back to a bare sticky reset if the pool hook is
     unavailable.
     """
@@ -1424,7 +1428,7 @@ async def _fetch_free_models():
 
             async def _get_zen():
                 return await c.get(
-                    "https://opencode.ai/zen/v1/models",
+                    "https://opencode.ai/inference/v1/models",
                     headers=zen_headers,
                     timeout=10,
                 )
@@ -2051,17 +2055,19 @@ def _pool_health_for_gate() -> dict | None:
 _PROBE_REPOLL_SECS = 0.2
 
 
-async def _select_with_repoll():
+async def _select_with_repoll(exclude: set[str] | None = None):
     """proxy_pool.select() with probe hardening (no network beyond select).
 
     An empty selection races pool refill — sleep 200ms and re-poll once
     before the caller declares the pool empty and forces a refresh.
+    ``exclude`` forwards the caller's already-failed exits (e.g. gated this
+    request) so a retry never re-picks the exit it just failed on.
     """
-    p = await proxy_pool.select()
+    p = await proxy_pool.select(exclude=exclude)
     if p is not None:
         return p
     await asyncio.sleep(_PROBE_REPOLL_SECS)
-    return await proxy_pool.select()
+    return await proxy_pool.select(exclude=exclude)
 
 
 async def _maybe_force_refresh(reason: str) -> bool:
@@ -2136,15 +2142,16 @@ def _clear_req_ctx():
 def _strip_direct_headers(headers: dict | None) -> dict:
     """Strip relay/proxy hop headers for the direct-fetch fallback attempt.
 
-    Keyless applied-last-wins audit (Zen-only): Zen free tier rejects ANY
-    Authorization Bearer (401), so this strip MUST run after any pool/hook
-    header merge and MUST also drop Authorization (case-insensitive). No layer
-    in server.py / proxy_pool.py re-adds Authorization afterwards —
-    proxy_pool.get_client() only sets base_url/timeout/proxy, never headers,
-    and zen_request() builds Zen headers fresh with no Authorization key.
+    Public-auth applied-last-wins audit (Zen-only): the inference gateway
+    REQUIRES Authorization: Bearer public, so this strip MUST run after any
+    pool/hook header merge, MUST drop any caller key (case-insensitive), and
+    MUST re-assert the public credential. No layer in server.py /
+    proxy_pool.py removes it afterwards — proxy_pool.get_client() only sets
+    base_url/timeout/proxy, never headers, and zen_request() builds Zen
+    headers fresh with the public credential.
     """
     if not isinstance(headers, dict):
-        return {}
+        headers = {}
     out = {}
     for k, v in headers.items():
         if v is None:
@@ -2155,6 +2162,7 @@ def _strip_direct_headers(headers: dict | None) -> dict:
         if kl.startswith("x-relay-") or kl.startswith("x-proxy"):
             continue
         out[k] = v
+    out["Authorization"] = "Bearer public"
     return out
 
 
@@ -2369,7 +2377,7 @@ def _needs_buffered_fallback(model: str | None, tools, stream) -> bool:
     if not stream:
         return False
     m = (model or "").lower()
-    # muse-spark streams through /zen/v1/responses (see _is_muse_spark) and does
+    # muse-spark streams through /inference/v1/responses (see _is_muse_spark) and does
     # not use the chat/completions fallback at all.
     if "x-preview" in m or "x_preview" in m:
         return True
@@ -2496,11 +2504,18 @@ def _cline_sampling_from(body: dict) -> dict:
 # Zen free tier gates on real-CLI headers (pi-freeflow trefeon/pi-freeflow):
 # User-Agent opencode/<version> (>=1.17.0), x-opencode-client, a
 # ses_<12hex><14base62> x-opencode-session stable per process (+ session-id
-# and affinity aliases), a fresh msg_ x-opencode-request per call, and
-# x-opencode-project. _zen_headers() builds the full set; every Zen call
-# path (discovery, verify, chat, responses, streaming, direct-fallback)
-# must use it so no path leaks a stale UA or a missing key.
-# Never send Authorization: Zen free tier is keyless, any Bearer 401s.
+# and affinity aliases) and x-opencode-project. _zen_headers() builds the
+# full set; every Zen call path (discovery, verify, chat, responses,
+# streaming, direct-fallback) must use it so no path leaks a stale UA or a
+# missing key.
+# Inference gateway auth: /inference/v1 REQUIRES Authorization: Bearer
+# public (the /zen/v1 keyless era is over — old path 403s everything).
+# NEVER forward a caller key upstream; the public credential is forced
+# applied-last-wins in zen_request().
+# NEVER send x-opencode-request (msg_*): the inference gateway reads it as
+# "definitely not OpenCode" and 403s even when everything else is correct
+# (bisected live against real OpenCode 2.0.28, which omits it there).
+# The oc_id("msg") generator stays for ID-shape tests only.
 
 # Process-stable OpenCode session (pi-freeflow OPENCODE_SESSION: one per
 # daemon). Created lazily on first use so oc_id() is defined.
@@ -2558,8 +2573,16 @@ _ZEN_NATIVE_TOOL_DEFS = (
     ),
     (
         "edit",
-        "Do not call this placeholder tool",
-        {"type": "object", "properties": {}},
+        "Edit a file by replacing exact text",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to edit"},
+                "old_string": {"type": "string", "description": "Exact text to find"},
+                "new_string": {"type": "string", "description": "Replacement text"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
     ),
     (
         "write",
@@ -2601,10 +2624,10 @@ def _zen_headers(session_id) -> dict:
     sid = _zen_session_id(session_id)
     return {
         "Content-Type": "application/json",
+        "Authorization": "Bearer public",
         "User-Agent": f"opencode/{OC_VERSION}",
         "x-opencode-client": "cli",
         "x-opencode-project": _ZEN_PROJECT_ID,
-        "x-opencode-request": oc_id("msg"),
         "x-opencode-session": sid,
         "x-opencode-session-id": sid,
         "x-session-affinity": sid,
@@ -2695,26 +2718,28 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tok
     req_body.pop("prompt_cache_retention", None)
     req_body.pop("store", None)  # never forward store:true to Zen
 
-    # Keyless: Zen free tier rejects ANY Authorization Bearer (401), so omit
-    # the header entirely. Keep x-opencode-client/project + UA.
-    # Applied-last-wins: this fresh dict is built AFTER any caller header
-    # merge, and no code path in server.py / proxy_pool.py re-adds
-    # Authorization afterwards (pool clients set transport only; direct-
-    # fallback paths only strip via _strip_direct_headers, never inject).
+    # Public-auth applied-last-wins: /inference/v1 REQUIRES
+    # Authorization: Bearer public (the /zen/v1 keyless era is over — the
+    # old path 403s everything). This fresh dict is built AFTER any caller
+    # header merge; assert the public credential so a regression fails
+    # loudly instead of leaking a caller key or dropping auth. No code path
+    # in server.py / proxy_pool.py strips it afterwards (pool clients set
+    # transport only; direct-fallback paths preserve it via
+    # _strip_direct_headers).
     headers = _zen_headers(session_id)
-    if any(str(k).lower() == "authorization" for k in headers):
-        raise RuntimeError("keyless: Authorization leaked into zen_request headers")
+    if headers.get("Authorization") != "Bearer public":
+        raise RuntimeError("inference auth: Authorization: Bearer public missing from zen_request headers")
     return req_body, headers
 
 
-# ── Muse Spark via /zen/v1/responses ─────────────────────────────
+# ── Muse Spark via /inference/v1/responses ─────────────────────────────
 # Muse Spark models (muse-spark-1.2/1.3-contributor-free, future versions) are
-# NOT served by /zen/v1/chat/completions — that route returns a deterministic
+# NOT served by /inference/v1/chat/completions — that route returns a deterministic
 # bare 500 "Internal server error", which previously presented as a flood of
 # retries. They are only served by the Responses endpoint. Requests addressed
 # at these models are translated to the Responses shape (input items,
 # max_output_tokens, reasoning:{effort,summary}) and streamed from
-# /zen/v1/responses, then translated back into chat.completion.chunk SSE so
+# /inference/v1/responses, then translated back into chat.completion.chunk SSE so
 # every downstream client keeps speaking plain chat-completions.
 # (Same fix as 9router ab044e6/acb5c34.)
 
@@ -2995,7 +3020,7 @@ def _responses_continuation_body(resp_body: dict, content: str) -> dict:
 
 def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
                         max_completion_tokens=None, sampling: dict | None = None) -> dict:
-    """Build the /zen/v1/responses request body from chat-style parameters."""
+    """Build the /inference/v1/responses request body from chat-style parameters."""
     body: dict = {
         "model": model,
         "input": _chat_to_responses_input(messages),
@@ -3695,7 +3720,7 @@ async def _zen_responses_stream_with_retry(
     model: str = None,
     max_retries: int = None,
 ):
-    """Stream /zen/v1/responses as OpenAI chat.completion.chunk SSE with proxy retry.
+    """Stream /inference/v1/responses as OpenAI chat.completion.chunk SSE with proxy retry.
 
     Response events are folded back into chat chunks: output_text deltas →
     content, reasoning deltas → reasoning_content, function_call items →
@@ -3763,6 +3788,7 @@ async def _zen_responses_stream_with_retry(
 
     attempt = 0
     free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
     pinned_proxy: str | None = None  # reasoning-recovery retry: reuse this exit for one iteration
     reasoning_recovery_done = False  # one same-exit retry per request, then fall through
     while True:
@@ -3781,7 +3807,7 @@ async def _zen_responses_stream_with_retry(
         elif PROXY_POOL_ENABLED and not direct_only:
             if not proxy_pool.ready:
                 await proxy_pool.load()
-            p = await _select_with_repoll()
+            p = await _select_with_repoll(gated_exits)
             if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
                 await _maybe_force_refresh("No proxy available")
@@ -3819,7 +3845,7 @@ async def _zen_responses_stream_with_retry(
 
         try:
             upstream_request = client.build_request(
-                "POST", "/zen/v1/responses", json=resp_body, headers=headers
+                "POST", "/inference/v1/responses", json=resp_body, headers=headers
             )
             resp = await client.send(upstream_request, stream=True)
         except Exception as e:
@@ -3944,6 +3970,7 @@ async def _zen_responses_stream_with_retry(
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(resp_body)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     _report_free_tier_block(proxy_addr)
+                    gated_exits.add(proxy_addr)
                     proxy_pool.release(proxy_addr)
                 if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
                     _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(resp_body)}")
@@ -4648,6 +4675,7 @@ async def _zen_request_with_retry(
     last_status: int | None = None
     pool_exhausted_retriable = False
     free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
 
     for attempt in range(attempts + 1):
         if await _client_gone(request):
@@ -4658,7 +4686,7 @@ async def _zen_request_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            p = await _select_with_repoll()
+            p = await _select_with_repoll(gated_exits)
             if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), "
                      f"forcing refresh")
@@ -4683,7 +4711,7 @@ async def _zen_request_with_retry(
         try:
             try:
                 resp = await client.post(
-                    "/zen/v1/chat/completions",
+                    "/inference/v1/chat/completions",
                     json=req_body,
                     headers=headers,
                 )
@@ -4787,6 +4815,7 @@ async def _zen_request_with_retry(
                     _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
                     if PROXY_POOL_ENABLED and proxy_addr:
                         _report_free_tier_block(proxy_addr)
+                        gated_exits.add(proxy_addr)
                     if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
                         _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
                         return JSONResponse(
@@ -4884,7 +4913,7 @@ async def _zen_request_with_retry(
         else:
             _log_direct_fallback(model, last_status)
             code, data, text = await _direct_buffered_post(
-                "/zen/v1/chat/completions", req_body, headers
+                "/inference/v1/chat/completions", req_body, headers
             )
             if code is not None and code < 400 and isinstance(data, dict) and data.get("choices"):
                 usage = (data.get("usage") or {})
@@ -4946,6 +4975,7 @@ async def _zen_stream_with_retry(
 
     attempt = 0
     free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
     while True:
         # Total work cap: plain retries (attempts) + mid-stream continuations
         # (MAX_STREAM_CONTINUATIONS) share one counter, so 4 torn-stream resumes
@@ -4960,7 +4990,7 @@ async def _zen_stream_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            p = await _select_with_repoll()
+            p = await _select_with_repoll(gated_exits)
             if p is None:
                 _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
                 await _maybe_force_refresh("No proxy available")
@@ -5009,7 +5039,7 @@ async def _zen_stream_with_retry(
             _log(f"[zen] Retrying with direct client after None client (attempt {attempt})")
         try:
             upstream_request = client.build_request(
-                "POST", "/zen/v1/chat/completions", json=req_body, headers=headers
+                "POST", "/inference/v1/chat/completions", json=req_body, headers=headers
             )
             resp = await client.send(upstream_request, stream=True)
         except Exception as e:
@@ -5164,6 +5194,7 @@ async def _zen_stream_with_retry(
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
                     _report_free_tier_block(proxy_addr)
+                    gated_exits.add(proxy_addr)
                 await resp.aclose()
                 if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
                     _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(req_body)}")
@@ -5572,6 +5603,7 @@ async def _zen_stream_anthropic_with_retry(
 
     attempt = 0
     free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
     while True:
         # Total work cap: plain retries (attempts) + continuations share one counter.
         # It's intentional — see _zen_stream_with_retry.
@@ -5584,7 +5616,7 @@ async def _zen_stream_anthropic_with_retry(
             if not proxy_pool.ready:
                 await proxy_pool.load()
 
-            p = await _select_with_repoll()
+            p = await _select_with_repoll(gated_exits)
             if p is None:
                 _log(f"[pool] No proxy ({proxy_pool.get_pool_state()}), forcing refresh")
                 await _maybe_force_refresh("No proxy")
@@ -5608,7 +5640,7 @@ async def _zen_stream_anthropic_with_retry(
             proxy_addr = None
 
         try:
-            async with client.stream("POST", "/zen/v1/chat/completions", json=req_body, headers=headers) as resp:
+            async with client.stream("POST", "/inference/v1/chat/completions", json=req_body, headers=headers) as resp:
                 if resp.status_code == 429:
                     try:
                         raw = await resp.aread()
@@ -5658,6 +5690,7 @@ async def _zen_stream_anthropic_with_retry(
                         _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
                         if PROXY_POOL_ENABLED and proxy_addr:
                             _report_free_tier_block(proxy_addr)
+                            gated_exits.add(proxy_addr)
                         if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
                             _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(req_body)}")
                             yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
@@ -8436,7 +8469,7 @@ async def messages(request: Request):
     up_messages = _prepare_upstream_messages(session_id, _normalize_messages(oai_messages))
 
     if _is_muse_spark(model) or _model_wire_api(model) == "openai-responses":
-        # Muse Spark via /zen/v1/responses (see chat route); aggregate and
+        # Muse Spark via /inference/v1/responses (see chat route); aggregate and
         # reframe as Anthropic SSE (or a plain message when not streaming).
         _, headers = zen_request(model, up_messages, True, tools, None, session_id, body.get("max_tokens"), body.get("max_completion_tokens"), _sampling_from(body))
         resp_body = _zen_responses_body(
@@ -8801,7 +8834,7 @@ async def handle_responses(request: Request):
 
         if _is_muse_spark(zen_model) or _model_wire_api(zen_model) == "openai-responses":
             # Client speaks Responses already, but the Zen upstream for muse is
-            # /zen/v1/responses, not chat/completions (which 500s). Stream there
+            # /inference/v1/responses, not chat/completions (which 500s). Stream there
             # natively, then map the events to client Responses events as usual.
             resp_body = _zen_responses_body(
                 zen_model, up_messages, tools,

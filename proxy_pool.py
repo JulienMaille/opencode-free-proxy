@@ -108,6 +108,15 @@ COOLDOWN_MAX_MULT = 4
 # (throttled to at most one log per window).
 BURST_WINDOW_SECS = 60.0
 BURST_THRESHOLD = 5
+# FreeTier-gate exit quarantine: the gate is SOMETIMES exit-sticky (a burned
+# exit IP gates every request while other exits OK the same model seconds
+# apart). Count gates per exit in a sliding window; an exit that gates
+# repeatedly is quarantined (cooling) so selection routes around it. Any
+# success on the exit resets the count. Single isolated gates stay
+# penalty-free (the request-shaped case).
+GATE_QUARANTINE_WINDOW_SECS = 300.0
+GATE_QUARANTINE_STRIKES = 3
+GATE_QUARANTINE_SECS = 600.0
 
 # Public SOCKS lists contain many stale or mislabelled HTTP endpoints. Keep the
 # default candidate set focused on the two SOCKS ports that are most common in
@@ -134,8 +143,9 @@ except (TypeError, ValueError):
     GEO_TIMEOUT = 5.0
 
 # pi-freeflow fingerprint for the verify probe (must match server.py):
-# UA opencode/1.18.34 + full x-opencode-* set + stable ses_ session.
-# No Authorization, ever (Zen free tier is keyless).
+# UA opencode/1.18.34 + full x-opencode-* set (no x-opencode-request — the
+# inference gateway 403s on it) + stable ses_ session + Bearer public.
+# Never forward a caller key: the public credential is the only auth sent.
 import hashlib as _hashlib
 
 _ZEN_PROJECT_ID = _hashlib.sha1(b"git-remote:github.com/anomalyco/opencode").hexdigest()
@@ -158,16 +168,11 @@ def _verify_session() -> str:
 
 def _verify_headers() -> dict:
     sid = _verify_session()
-    import time as _t2
-
-    ts2 = int(_t2.time() * 1000)
-    time_part2 = format(((ts2 << 12) + 2) & 0xFFFFFFFFFFFF, "012x")
-    rand2 = "".join(_ZEN_ID_CHARS[b % 62] for b in secrets.token_bytes(14))
     return {
+        "Authorization": "Bearer public",
         "User-Agent": f"opencode/{_OC_VERSION}",
         "x-opencode-client": "cli",
         "x-opencode-project": _ZEN_PROJECT_ID,
-        "x-opencode-request": f"msg_{time_part2}{rand2}",
         "x-opencode-session": sid,
         "x-opencode-session-id": sid,
         "x-session-affinity": sid,
@@ -244,6 +249,10 @@ class ProxyPool:
         self.entries: dict[str, dict] = {}
         self._429_times: list[float] = []
         self._last_burst_warn = 0.0
+        # FreeTier-gate timestamps per exit (sliding window; see
+        # GATE_QUARANTINE_*): burned exits that gate everything get
+        # quarantined so selection routes around them.
+        self._gate_hits: dict[str, list[float]] = {}
         self._try_load_cache()
 
     # ── Stability stats ──────────────────────────────────────────────
@@ -627,7 +636,7 @@ class ProxyPool:
                         else:
                             _log(f"Verify {addr}: country unknown (geo lookup failed); allowing Zen probe")
                 r = await c.get(
-                    "https://opencode.ai/zen/v1/models",
+                    "https://opencode.ai/inference/v1/models",
                     headers=_verify_headers(),
                 )
                 if 200 <= r.status_code < 300:
@@ -704,20 +713,62 @@ class ProxyPool:
                 break
         return batch
 
-    async def select(self) -> dict | None:
+    def _rank_hot(self, now: float, overloaded_current: str | None,
+                  exclude: set[str] | None) -> tuple[dict | None, dict | None]:
+        """Best healthy hot entry + earliest-recovering cooling fallback.
+
+        ``exclude`` addresses are skipped (already failed this request).
+        """
+        best = None
+        best_score = None
+        fallback = None
+        for p in self.getOrdered():
+            verified_at = float(p.get("verified_at", 0))
+            if now - verified_at > HOT_TTL:
+                continue
+            if self._is_bad(p["address"]):
+                continue
+            if exclude and p["address"] in exclude:
+                continue
+            if p["address"] == overloaded_current:
+                continue
+            load = self._load(p["address"])
+            if load >= MAX_PER_PROXY:
+                continue
+            if self._is_cooling(p["address"], now):
+                # All healthy entries are busy — remember the earliest
+                # recovering cooling entry as a last resort.
+                if fallback is None:
+                    fallback = p
+                continue
+            # Rank by stability: latency EWMA discounted by reliability
+            # (Laplace-smoothed ok/fail), with a mild penalty per extra
+            # in-flight request so bursts still spread across exits.
+            score = self._quality(p["address"]) * (1 + load)
+            if best is None or score < best_score:
+                best = p
+                best_score = score
+        return best, fallback
+
+    async def select(self, exclude: set[str] | None = None) -> dict | None:
         """Get the next usable proxy. Checks hot buffer first, then verifies one on-the-fly.
 
         Serialized with a lock so concurrent requests share one verification
         pass instead of each blacklisting its own failed batch.
+
+        ``exclude``: addresses this request already failed on (e.g. just
+        FreeTier-gated exits) — skipped in the sticky fast path and the hot
+        ranking, with a logged last-resort pass over them if nothing else is
+        usable, so a request is never stranded by its own exclusion set.
 
         Returns the selected proxy entry (callers read the address off it and
         MUST pair each successful select with a release() when the request
         attempt finishes). Returns None if nothing usable is available.
         """
         async with self._select_lock:
-            return await self._select_unlocked()
+            return await self._select_unlocked(exclude=exclude)
 
-    async def _select_unlocked(self) -> dict | None:
+    async def _select_unlocked(self, exclude: set[str] | None = None) -> dict | None:
         """select() body; callers must hold _select_lock.
 
         Sticky by default: reuse the current proxy while it is healthy and
@@ -725,9 +776,15 @@ class ProxyPool:
         of concurrent requests, e.g. omp subagent spawns), spill to the
         least-loaded verified hot proxy instead of overloading the single one.
         """
+        exclude = exclude or set()
         if self.current:
             addr = self.current["address"]
-            if not self._is_unavailable(addr):
+            if addr in exclude:
+                # This request already failed on the sticky exit: do NOT
+                # return it (and do NOT clear it — other requests may still
+                # want the stickiness). Fall through to the hot ranking.
+                overloaded_current = None
+            elif not self._is_unavailable(addr):
                 if self._load(addr) < MAX_PER_PROXY:
                     self._inflight[addr] = self._inflight.get(addr, 0) + 1
                     self._inflight_at[addr] = time.time()
@@ -753,33 +810,10 @@ class ProxyPool:
             if (now - float(p.get("verified_at", 0))) <= HOT_TTL
             and not self._is_bad(p["address"])
         ]
-        best = None
-        best_score = None
-        fallback = None
-        for p in self.getOrdered():
-            verified_at = float(p.get("verified_at", 0))
-            if now - verified_at > HOT_TTL:
-                continue
-            if self._is_bad(p["address"]):
-                continue
-            if p["address"] == overloaded_current:
-                continue
-            load = self._load(p["address"])
-            if load >= MAX_PER_PROXY:
-                continue
-            if self._is_cooling(p["address"], now):
-                # All healthy entries are busy — remember the earliest
-                # recovering cooling entry as a last resort.
-                if fallback is None:
-                    fallback = p
-                continue
-            # Rank by stability: latency EWMA discounted by reliability
-            # (Laplace-smoothed ok/fail), with a mild penalty per extra
-            # in-flight request so bursts still spread across exits.
-            score = self._quality(p["address"]) * (1 + load)
-            if best is None or score < best_score:
-                best = p
-                best_score = score
+        best, fallback = self._rank_hot(now, overloaded_current, exclude or None)
+        if best is None and fallback is None and exclude:
+            _log(f"No usable proxy excluding {len(exclude)} gated exit(s); last-resort retry on a gated exit")
+            best, fallback = self._rank_hot(now, overloaded_current, None)
         if best is None and fallback is not None:
             best = fallback
             _log(f"Selected cooling proxy (earliest recovery): {best['address']}")
@@ -957,24 +991,27 @@ class ProxyPool:
         return True
 
     def report_free_tier_block(self, addr: str | None = None) -> bool:
-        """403 FreeTierError: request-shaped gate signal, not an exit health signal.
+        """403 FreeTierError: USUALLY request-shaped, SOMETIMES exit-shaped.
 
-        Log evidence shows the gate is request-sticky, not exit-sticky: the
-        same request id 403s on every rotated exit (``proxy.log`` 21:07–21:08
-        ``req=6471b37d`` gated on 4 exits, 21:19–21:20 ``req=592f7836`` on 6,
-        neither ever OK), while OTHER requests OK on those same exits seconds
-        apart (``b526ecc5`` OK on 68.71.252.38:4145 one second after
-        ``6471b37d`` gated there; ``122d95d7``/``9281b2be`` OK on
-        68.71.251.134:4145 around ``592f7836``'s gate). The exit did nothing
-        wrong — blacklisting it for 120m burns healthy exits for a
-        request-shaped rejection.
+        Request-shaped case (old log evidence: same request id 403s on every
+        rotated exit while OTHER requests OK on those same exits seconds
+        apart): the exit did nothing wrong — blacklisting it burns healthy
+        exits, so single isolated gates carry zero penalty.
 
-        So NOTHING is penalized: no ``cooling_until``, no blacklist, no
-        rate-limit, no ``consecutive_failures`` increment, no success/fail
-        counter change, no transport-failure count, and the pooled client is
-        kept (no reconnect churn). Just clears the sticky ``current`` so the
-        next ``select()`` picks the next healthy entry and the request can
-        retry elsewhere.
+        Exit-shaped case (proxy.log 2026-10-14 evening: muse-spark OK via
+        216.105.143.146 ten times while 192.252.214.17 + 192.252.210.233 gate
+        60+ times on the same model, same code, same headers): the exit IP is
+        burned and gates everything. Gates are therefore ALSO counted per
+        exit in a sliding window; an exit reaching GATE_QUARANTINE_STRIKES is
+        quarantined (cooling) for GATE_QUARANTINE_SECS so selection routes
+        around it. Any success on the exit resets the count. Quarantine
+        touches cooling only — no blacklist, no rate-limit, no
+        success/fail counter change, pooled client kept.
+
+        Just clears the sticky ``current`` so the next ``select()`` picks a
+        different entry (callers should additionally pass their already-gated
+        exits as ``select(exclude=...)`` so the same request never re-picks
+        the exit it just gated on).
 
         Returns True (caller should roll to the next entry and retry, subject
         to the server-side consecutive-gate fail-fast).
@@ -982,7 +1019,19 @@ class ProxyPool:
         target = addr or (self.current and self.current["address"])
         if not target:
             return True
-        _log(f"FreeTier gate via {target}; rotating (no penalty — request-shaped, not exit health)")
+        now = time.time()
+        hits = self._gate_hits.setdefault(target, [])
+        hits.append(now)
+        cutoff = now - GATE_QUARANTINE_WINDOW_SECS
+        self._gate_hits[target] = [t for t in hits if t > cutoff]
+        if len(self._gate_hits[target]) >= GATE_QUARANTINE_STRIKES:
+            e = self._entry(target)
+            e["cooling_until"] = now + GATE_QUARANTINE_SECS
+            self._gate_hits[target] = []
+            self._stats_dirty = True
+            _log(f"FreeTier gate x{GATE_QUARANTINE_STRIKES} on {target} in {int(GATE_QUARANTINE_WINDOW_SECS)}s — exit looks burned, quarantined {int(GATE_QUARANTINE_SECS)}s (cooling only, no blacklist/fail counters)")
+        else:
+            _log(f"FreeTier gate via {target}; rotating (no penalty — request-shaped, not exit health)")
         if self.current and self.current["address"] == target:
             self.current = None
         return True
@@ -1219,6 +1268,9 @@ class ProxyPool:
         e = self._entry(target)
         e["consecutive_failures"] = 0
         e["cooling_until"] = 0.0
+        # A success proves the exit is not burned: reset its FreeTier-gate
+        # streak (see report_free_tier_block quarantine).
+        self._gate_hits.pop(target, None)
         e["success"] = int(e.get("success", 0)) + 1
         self._stats_dirty = True
         self._maybe_save_stats()
