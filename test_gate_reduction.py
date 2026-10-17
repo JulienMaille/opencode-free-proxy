@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """FreeTier 403 reduction invariants (offline, no network, no live probes).
 
-Covers the three fixes:
+Covers the two fixes:
   1. A gate is counted against the DISTINCT exits a request hit, and a pool
      last-resort repeat is flagged instead of counted again.
-  2. A conversation that gated out recently gets its rotation capped to one
-     exit (a cheap recovery probe), then the memory expires.
-  3. Conversation -> session ids survive a restart, and every Zen request
+  2. Conversation -> session ids survive a restart, and every Zen request
      carries a stable prompt_cache_key so a known conversation is not treated
      as a fresh session upstream.
 
 Run with `python -m pytest test_gate_reduction.py -q`.
 """
 import sys
-import time
 
 import pytest
 
@@ -78,40 +75,7 @@ def test_note_gate_treats_direct_as_its_own_issuer():
         srv._report_free_tier_block = prev_report
 
 
-# ── 2. conversation gate memory ────────────────────────────────────
-
-def test_gate_memory_caps_rotation_then_expires():
-    srv._gate_rejected.clear()
-    assert srv._gate_rotation_budget("ses_a", "m") == srv._FREE_TIER_FAIL_FAST_GATES
-
-    srv._remember_gate_rejection("ses_a")
-    assert srv._gate_rejection_is_fresh("ses_a")
-    assert srv._gate_rotation_budget("ses_a", "m") == 1
-    # Another conversation is untouched.
-    assert srv._gate_rotation_budget("ses_b", "m") == srv._FREE_TIER_FAIL_FAST_GATES
-
-    # Expiry drops the entry (a lifted gate is picked up on the next turn).
-    srv._gate_rejected["ses_a"] = time.time() - 1
-    assert not srv._gate_rejection_is_fresh("ses_a")
-    assert "ses_a" not in srv._gate_rejected
-
-    # A missing/blank session id is never remembered or capped.
-    srv._remember_gate_rejection(None)
-    srv._remember_gate_rejection("")
-    assert srv._gate_rejected == {}
-    assert srv._gate_rotation_budget(None, "m") == srv._FREE_TIER_FAIL_FAST_GATES
-
-
-def test_gate_memory_is_bounded():
-    srv._gate_rejected.clear()
-    for i in range(srv._GATE_REJECTED_MAX + 10):
-        srv._remember_gate_rejection(f"ses_{i}")
-    assert len(srv._gate_rejected) <= srv._GATE_REJECTED_MAX
-    # The newest entry survives the pruning.
-    assert srv._gate_rejection_is_fresh(f"ses_{srv._GATE_REJECTED_MAX + 9}")
-
-
-# ── 3. session persistence + stable prompt_cache_key ───────────────
+# ── 2. session persistence + stable prompt_cache_key ───────────────
 
 def test_session_id_survives_restart():
     messages = [{"role": "user", "content": "bonjour"}]
