@@ -308,6 +308,10 @@ Notes:
 - Config is read **once at startup** — restart opencode after editing it.
 - select the model with `/models`.
 
+Full setup — where the model list lives, how OpenChamber stores its UI state,
+and the `/v1/models` limits as source of truth — lives in
+[`docs/opencode.md`](docs/opencode.md).
+
 ### oh-my-pi (omp)
 
 Full step-by-step config (provider + models in `~/.omp/agent/models.yml`,
