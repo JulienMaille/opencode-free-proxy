@@ -2758,8 +2758,14 @@ def _model_wire_api(model: str | None) -> str:
     "openai-completions") when present, else falls back to the existing
     ``_is_muse_spark()`` substring check — so muse-spark behavior is
     identical when meta is missing.
+
+    deepseek-v4.1-flash-free is chat-only upstream (a Responses-shaped
+    request is refused with 400 ModelProtocolUnsupported), so it is pinned
+    to openai-completions regardless of what models.dev metadata claims.
     """
     try:
+        if str(model or "").lower() == "deepseek-v4.1-flash-free":
+            return "openai-completions"
         api = (_models_meta.get(str(model)) or {}).get("api")
         if api in ("openai-responses", "openai-completions"):
             return api
@@ -3243,13 +3249,51 @@ def _strip_injected_tool_calls(calls, caller_declared_tools: bool):
     return out
 
 
-def _strip_injected_tool_deltas(piece: dict, caller_declared_tools: bool) -> None:
+def _strip_injected_tool_deltas(piece: dict, caller_declared_tools: bool, _slot1_fixed=None) -> None:
     """Strip injected placeholder calls from one streamed SSE chunk in place.
 
     Only touch chunks that actually carry a ``tool_calls`` delta, so the
     common case costs a dict lookup per chunk.
+
+    ``_slot1_fixed`` is a one-element ``[bool]`` cell owned by the chat
+    retry loop (reset per upstream attempt): upstream emits the FIRST head
+    of a turn on slot 1 instead of 0 (measured twice on
+    deepseek-v4.1-flash-free via this proxy), and strict clients reject the
+    turn. The first head-carrying call renumbers to 0; later heads keep
+    their relative order. Pass ``None`` when no renumbering applies.
     """
     if caller_declared_tools:
+        # Caller declared its own tools: upstream indices stand — EXCEPT the
+        # known-buggy slot-1 head, which upstream emits for the FIRST call of
+        # a turn (measured twice on deepseek-v4.1-flash-free via this proxy:
+        # index=1 with a full head, followed by index=0 fragments). Renumber
+        # the FIRST head-carrying call of the turn to 0; later heads keep
+        # their relative order. `seen` is per-stream (reset below per
+        # attempt); a head is a fragment carrying a function name or call id.
+        try:
+            choices = piece.get("choices") or []
+            first = choices[0] if choices and isinstance(choices[0], dict) else {}
+            delta = first.get("delta")
+            if isinstance(delta, dict):
+                tcs = delta.get("tool_calls") or []
+                if isinstance(tcs, list):
+                    for tc in tcs:
+                        if not isinstance(tc, dict):
+                            continue
+                        fn = tc.get("function")
+                        fn = fn if isinstance(fn, dict) else {}
+                        is_head = bool((fn.get("name") or "").strip() or (tc.get("id") or "").strip())
+                        if not is_head:
+                            continue
+                        try:
+                            if _slot1_fixed is not None and tc.get("index", 0) == 1 and not _slot1_fixed[0]:
+                                tc["index"] = 0
+                            _slot1_fixed[0] = True
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
         return
     try:
         choices = piece.get("choices") or []
@@ -4174,7 +4218,26 @@ async def _zen_responses_stream_with_retry(
                             streamed_any = True
                     elif ptype == "response.function_call_arguments.delta":
                         iid = piece.get("item_id") or ""
-                        idx = tool_idx.get(iid, 0)
+                        # An arguments delta may arrive for an item_id the
+                        # add-handler never registered (upstream omits the
+                        # output_item.added, or the delta lands on a DIFFERENT
+                        # stream event shape). Defaulting blindly to slot 0
+                        # emits a nameless arguments fragment the client
+                        # cannot attach to any declared call — synthesize the
+                        # head first (name may be empty; _normalize will drop
+                        # or fix it downstream) so indices stay consistent.
+                        idx = tool_idx.get(iid)
+                        if idx is None:
+                            idx = tool_count_holder[0]
+                            tool_count_holder[0] += 1
+                            tool_idx[iid] = idx
+                            tool_args[idx] = ""
+                            yield _chunk({"tool_calls": [{
+                                "index": idx,
+                                "id": iid or oc_id("call"),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }]})
                         frag = piece.get("delta") or ""
                         yield _chunk({"tool_calls": [{
                             "index": idx,
@@ -4972,6 +5035,7 @@ async def _zen_stream_with_retry(
     finish_delivered = False  # True once a finish_reason chunk was forwarded
     tool_streamed = False  # True once a tool-call fragment was forwarded
     continuations = 0  # mid-stream resume attempts (see MAX_STREAM_CONTINUATIONS)
+    _slot1_fixed = [False]  # per-attempt: upstream slot-1 first-head renumbered (see _strip_injected_tool_deltas)
 
     attempt = 0
     free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
@@ -5296,6 +5360,7 @@ async def _zen_stream_with_retry(
         retry_stream = False
         streamed_any = False
         stream_completed = False
+        _slot1_fixed[0] = False  # new upstream attempt: first-head renumbering resets
         _reason_buf = ""
         _content_buf = ""
         try:
@@ -5351,7 +5416,7 @@ async def _zen_stream_with_retry(
                     # 1.30.0). Applied after the JSON parse so the forwarded
                     # chunk and the parsed copy stay in sync. ``caller_tools``
                     # is pre-injection, so this actually fires.
-                    _strip_injected_tool_deltas(piece, caller_tools)
+                    _strip_injected_tool_deltas(piece, caller_tools, _slot1_fixed)
                     if not isinstance(piece, dict):
                         err = ValueError("malformed upstream SSE JSON: expected an object")
                         _log(
