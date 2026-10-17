@@ -8,6 +8,7 @@ data/
 proxy.log
 tokens.json
 reasoning_cache.json
+sessions.json
 build/
 dist/
 *.spec

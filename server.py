@@ -1266,11 +1266,81 @@ def _report_free_tier_block(proxy_addr: str | None):
         pass
 
 
-# Fail fast on a request-shaped gate: the same request id 403s on every
+# Fail fast on a session-shaped gate: the same conversation 403s on every
 # rotated exit (neither ``6471b37d`` nor ``592f7836`` ever succeeded), so
 # sweeping all 6 attempts just burns latency + healthy exits. Surface after
-# this many CONSECUTIVE gates; any non-gate outcome resets the count.
+# this many DISTINCT gated exits; any non-gate outcome resets the count.
 _FREE_TIER_FAIL_FAST_GATES = 3
+
+# Conversation-level gate memory. Upstream's FreeTierError is refused per
+# *session*, not per exit: one conversation gates while another passes on the
+# very same exit. A conversation whose whole exit sweep just gated will gate
+# again on its next turn, so remember it and let that turn stop at its FIRST
+# gate instead of replaying the sweep. Only a gate stop writes here, so a
+# recovered conversation simply succeeds and is never capped. Volatile: a
+# restart costs one full sweep.
+_GATE_REJECTED_TTL = 3600.0
+_GATE_REJECTED_MAX = 1000
+_gate_rejected: dict[str, float] = {}
+
+
+def _remember_gate_rejection(session_id):
+    """Remember that this conversation's exit sweep ended on the gate."""
+    if not session_id:
+        return
+    now = time.time()
+    for key in [k for k, exp in _gate_rejected.items() if exp <= now]:
+        _gate_rejected.pop(key, None)
+    while len(_gate_rejected) >= _GATE_REJECTED_MAX:
+        oldest = min(_gate_rejected, key=lambda k: _gate_rejected[k])
+        _gate_rejected.pop(oldest, None)
+    _gate_rejected[session_id] = now + _GATE_REJECTED_TTL
+
+
+def _gate_rejection_is_fresh(session_id) -> bool:
+    """True when this conversation gated out recently (cap its next rotation)."""
+    if not session_id:
+        return False
+    expires_at = _gate_rejected.get(session_id)
+    if expires_at is None:
+        return False
+    if expires_at <= time.time():
+        _gate_rejected.pop(session_id, None)
+        return False
+    return True
+
+
+def _gate_rotation_budget(session_id, model) -> int:
+    """FreeTier gates this request may spend before surfacing.
+
+    A conversation that gated out within ``_GATE_REJECTED_TTL`` gets a single
+    attempt: enough to notice recovery, without replaying the whole sweep.
+    """
+    if _gate_rejection_is_fresh(session_id):
+        _log(f"[zen] [{model}] conversation gated within {int(_GATE_REJECTED_TTL)}s — capping FreeTier rotation to 1 exit")
+        return 1
+    return _FREE_TIER_FAIL_FAST_GATES
+
+
+def _note_free_tier_gate(free_tier_gates: int, gated_exits: set, proxy_addr) -> tuple[int, bool]:
+    """Count a FreeTier gate against the DISTINCT exits this request hit.
+
+    The pool honours ``exclude`` but deliberately hands an already-gated exit
+    back as a last resort when nothing else is eligible
+    (``proxy_pool._rank_hot``: exclusion must never strand the request), so a
+    retry can land on the exit it just gated. Counting *attempts* would then
+    report "N consecutive exits" from a single IP (observed: ~19% of
+    multi-gate requests re-gated the same exit). Returns ``(count,
+    exhausted)``; ``exhausted`` means the pool gave back an already-gated
+    exit, i.e. no fresh issuer is left to try.
+    """
+    key = proxy_addr or ""
+    if key in gated_exits:
+        return free_tier_gates, True
+    gated_exits.add(key)
+    if PROXY_POOL_ENABLED and proxy_addr:
+        _report_free_tier_block(proxy_addr)
+    return free_tier_gates + 1, False
 
 
 def _blocks_text(content) -> str:
@@ -1934,12 +2004,90 @@ def get_session(user: str, messages: list[dict]) -> str:
         if h in sessions:
             full_h = _hash_messages(messages)
             _remember_session(sessions, full_h, sessions[h])
+            _save_user_sessions()
             return sessions[h]
 
     new_id = oc_id("ses", descending=True)
     full_h = _hash_messages(messages)
     _remember_session(sessions, full_h, new_id)
+    _save_user_sessions(force=True)
     return new_id
+
+
+# ── Session id persistence ────────────────────────────────────────
+# Upstream's FreeTierError is refused per *session* ("fresh" conversations),
+# so a conversation that keeps one id stays proven across turns. The map above
+# is in-memory, which minted a brand-new ses_ for every conversation on every
+# restart (13 runs in the log = 13 fresh id sets). Persist it to disk so a
+# restart resumes the same ids; entries are pruned to the same per-user cap.
+_SESSIONS_FILE = _BASE_DIR / "sessions.json"
+_SESSIONS_SAVE_MIN_INTERVAL = 2.0  # seconds between throttled (non-forced) saves
+_last_sessions_save = 0.0
+_sessions_save_lock = threading.Lock()
+
+
+def _load_user_sessions():
+    """Restore conversation -> session ids so a restart keeps Zen sessions proven."""
+    global _user_sessions
+    try:
+        with open(_SESSIONS_FILE, encoding="utf-8") as f:
+            raw = json.load(f) or {}
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    loaded: dict[str, dict[str, str]] = {}
+    for user, sessions in raw.items():
+        if not isinstance(sessions, dict):
+            continue
+        clean = {
+            k: v for k, v in sessions.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+        if clean:
+            loaded[user] = dict(list(clean.items())[-_MAX_SESSIONS_PER_USER:])
+    if loaded:
+        _user_sessions = loaded
+        total = sum(len(s) for s in loaded.values())
+        print(f"[session] restored {total} conversation id(s) across {len(loaded)} user bucket(s)", flush=True)
+
+
+def _save_user_sessions(force: bool = False):
+    """Persist the session map off the event loop (atomic tmp + replace).
+
+    Snapshots inline (the map is tiny and only mutated on the loop thread),
+    then writes in a worker thread so a burst of new conversations never
+    blocks a request.
+    """
+    global _last_sessions_save
+    now = time.time()
+    if not force and now - _last_sessions_save < _SESSIONS_SAVE_MIN_INTERVAL:
+        return
+    _last_sessions_save = now
+    body = {user: dict(sessions) for user, sessions in _user_sessions.items()}
+
+    def _write():
+        try:
+            _SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _SESSIONS_FILE.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(body, f, ensure_ascii=False)
+            os.replace(tmp, _SESSIONS_FILE)
+        except OSError:
+            pass
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _write()
+        return
+    try:
+        _track_bg_io(loop.run_in_executor(None, _write))
+    except RuntimeError:
+        _write()
+
+
+_load_user_sessions()
 
 
 async def _backoff(attempt: int, base: float = 1.0, max_delay: float = 10.0):
@@ -2717,6 +2865,13 @@ def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tok
     # rides along additively via sampling.
     req_body.pop("prompt_cache_retention", None)
     req_body.pop("store", None)  # never forward store:true to Zen
+    # Stable per-conversation cache key. Upstream keys its "proven vs fresh
+    # session" free-tier gate on prompt_cache_key, and our session_id is
+    # already a deterministic hash of the conversation, so send it when the
+    # caller sent none — a conversation that is known is then not treated as
+    # fresh. A caller-supplied value always wins.
+    if session_id and not req_body.get("prompt_cache_key"):
+        req_body["prompt_cache_key"] = session_id
 
     # Public-auth applied-last-wins: /inference/v1 REQUIRES
     # Authorization: Bearer public (the /zen/v1 keyless era is over — the
@@ -3106,7 +3261,8 @@ def _responses_diag(resp_body: dict) -> str:
         return (
             f"reasoning={resp_body.get('reasoning')!r} "
             f"tools={len(tools)} input_items={len(inp)} "
-            f"input_chars~{chars} max_out={resp_body.get('max_output_tokens')!r}"
+            f"input_chars~{chars} max_out={resp_body.get('max_output_tokens')!r} "
+            f"pck={resp_body.get('prompt_cache_key')!r}"
         )
     except Exception:
         return "?"
@@ -3149,6 +3305,7 @@ def _gate_req_diag(req_body: dict | None) -> str:
             f"max_tokens={body.get('max_tokens')!r} max_completion_tokens={body.get('max_completion_tokens')!r} "
             f"tool_choice={body.get('tool_choice')!r} stream={body.get('stream')!r} "
             f"temperature={body.get('temperature')!r} top_p={body.get('top_p')!r} "
+            f"pck={body.get('prompt_cache_key')!r} "
             f"reasoning_effort={(body.get('reasoning') or {}).get('effort') if isinstance(body.get('reasoning'), dict) else body.get('reasoning_effort', body.get('reasoningEffort'))!r}"
         )
     except Exception:
@@ -3851,9 +4008,16 @@ async def _zen_responses_stream_with_retry(
             tool_streamed = True
         return chunks
 
+    # Stable per-conversation cache key: see zen_request. Upstream keys its
+    # "proven vs fresh session" gate on prompt_cache_key; reuse our session id
+    # so a known conversation is not treated as fresh. A caller value wins.
+    if session_id and not resp_body.get("prompt_cache_key"):
+        resp_body["prompt_cache_key"] = session_id
+
     attempt = 0
-    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at gate_budget
     gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gate_budget = _gate_rotation_budget(session_id, model)
     pinned_proxy: str | None = None  # reasoning-recovery retry: reuse this exit for one iteration
     reasoning_recovery_done = False  # one same-exit retry per request, then fall through
     while True:
@@ -4031,22 +4195,20 @@ async def _zen_responses_stream_with_retry(
                     _log(f"[zen] pool exhausted on 413; direct fallback disabled (opt in with --allow-direct-fallback)")
                 yield _openai_stream_error(err_msg, "upstream_error", "413")
             if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                free_tier_gates += 1
-                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(resp_body)}")
+                free_tier_gates, gate_exhausted = _note_free_tier_gate(free_tier_gates, gated_exits, proxy_addr)
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{gate_budget}): {err_msg}{' — pool out of fresh exits' if gate_exhausted else ' — rotating (no penalty)'}; req={_gate_req_diag(resp_body)}")
                 if PROXY_POOL_ENABLED and proxy_addr:
-                    _report_free_tier_block(proxy_addr)
-                    gated_exits.add(proxy_addr)
                     proxy_pool.release(proxy_addr)
-                if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
-                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(resp_body)}")
-                    await resp.aclose()
-                    yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
-                    return
-                if attempt < attempts and not await _client_gone(request):
-                    await resp.aclose()
-                    await _maybe_backoff(attempt, resp.status_code)
-                    attempt += 1
-                    continue
+                # Direct fallback is a genuinely fresh issuer (the machine's own
+                # egress), so it stays available even when the pool has no fresh
+                # exit left; only the pointless re-pick of an already-gated pool
+                # exit is skipped.
+                if not gate_exhausted and free_tier_gates < gate_budget:
+                    if attempt < attempts and not await _client_gone(request):
+                        await resp.aclose()
+                        await _maybe_backoff(attempt, resp.status_code)
+                        attempt += 1
+                        continue
                 if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
                     direct_only = True
                     _log_direct_fallback(model, resp.status_code)
@@ -4055,6 +4217,8 @@ async def _zen_responses_stream_with_retry(
                     await _maybe_backoff(attempt, resp.status_code)
                     attempt += 1
                     continue
+                _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} distinct exit(s){' (no fresh exit to try)' if gate_exhausted else ''} — failing fast; req={_gate_req_diag(resp_body)}")
+                _remember_gate_rejection(session_id)
                 await resp.aclose()
                 yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
                 return
@@ -4758,8 +4922,9 @@ async def _zen_request_with_retry(
     attempts = MAX_RETRIES if max_retries is None else max_retries
     last_status: int | None = None
     pool_exhausted_retriable = False
-    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at gate_budget
     gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gate_budget = _gate_rotation_budget(session_id, model)
 
     for attempt in range(attempts + 1):
         if await _client_gone(request):
@@ -4895,13 +5060,11 @@ async def _zen_request_with_retry(
                         content={"error": {"message": f"{model} is no longer available: {err_msg}", "type": "upstream_error", "code": "model_retired"}},
                     )
                 if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                    free_tier_gates += 1
-                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
-                    if PROXY_POOL_ENABLED and proxy_addr:
-                        _report_free_tier_block(proxy_addr)
-                        gated_exits.add(proxy_addr)
-                    if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
-                        _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast")
+                    free_tier_gates, gate_exhausted = _note_free_tier_gate(free_tier_gates, gated_exits, proxy_addr)
+                    _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{gate_budget}): {err_msg}{' — pool out of fresh exits' if gate_exhausted else ' — rotating (no penalty)'}; req={_gate_req_diag(req_body)}")
+                    if gate_exhausted or free_tier_gates >= gate_budget:
+                        _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} distinct exit(s){' (no fresh exit to try)' if gate_exhausted else ''} — failing fast")
+                        _remember_gate_rejection(session_id)
                         return JSONResponse(
                             status_code=403,
                             content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
@@ -4909,6 +5072,7 @@ async def _zen_request_with_retry(
                     if attempt < attempts and not await _client_gone(request):
                         await _maybe_backoff(attempt, resp.status_code)
                         continue
+                    _remember_gate_rejection(session_id)
                     return JSONResponse(
                         status_code=403,
                         content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
@@ -5059,8 +5223,9 @@ async def _zen_stream_with_retry(
     _slot1_fixed = [False]  # per-attempt: upstream slot-1 first-head renumbered (see _strip_injected_tool_deltas)
 
     attempt = 0
-    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at gate_budget
     gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gate_budget = _gate_rotation_budget(session_id, model)
     while True:
         # Total work cap: plain retries (attempts) + mid-stream continuations
         # (MAX_STREAM_CONTINUATIONS) share one counter, so 4 torn-stream resumes
@@ -5275,20 +5440,18 @@ async def _zen_stream_with_retry(
                 return
 
             if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                free_tier_gates += 1
-                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
-                if PROXY_POOL_ENABLED and proxy_addr:
-                    _report_free_tier_block(proxy_addr)
-                    gated_exits.add(proxy_addr)
+                free_tier_gates, gate_exhausted = _note_free_tier_gate(free_tier_gates, gated_exits, proxy_addr)
+                _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{gate_budget}): {err_msg}{' — pool out of fresh exits' if gate_exhausted else ' — rotating (no penalty)'}; req={_gate_req_diag(req_body)}")
                 await resp.aclose()
-                if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
-                    _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(req_body)}")
-                    yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
-                    return
-                if attempt < attempts and not await _client_gone(request):
-                    await _maybe_backoff(attempt, resp.status_code)
-                    attempt += 1
-                    continue
+                # Direct fallback is a genuinely fresh issuer (the machine's own
+                # egress), so it stays available even when the pool has no fresh
+                # exit left; only the pointless re-pick of an already-gated pool
+                # exit is skipped.
+                if not gate_exhausted and free_tier_gates < gate_budget:
+                    if attempt < attempts and not await _client_gone(request):
+                        await _maybe_backoff(attempt, resp.status_code)
+                        attempt += 1
+                        continue
                 if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
                     direct_only = True
                     _log_direct_fallback(model, resp.status_code)
@@ -5296,6 +5459,8 @@ async def _zen_stream_with_retry(
                     await _maybe_backoff(attempt, resp.status_code)
                     attempt += 1
                     continue
+                _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} distinct exit(s){' (no fresh exit to try)' if gate_exhausted else ''} — failing fast; req={_gate_req_diag(req_body)}")
+                _remember_gate_rejection(session_id)
                 yield _openai_stream_error(err_msg, "upstream_error", "free_tier_gate")
                 return
 
@@ -5719,8 +5884,9 @@ async def _zen_stream_anthropic_with_retry(
         return idx
 
     attempt = 0
-    free_tier_gates = 0  # consecutive FreeTier gates this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
+    free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at gate_budget
     gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gate_budget = _gate_rotation_budget(session_id, model)
     while True:
         # Total work cap: plain retries (attempts) + continuations share one counter.
         # It's intentional — see _zen_stream_with_retry.
@@ -5803,19 +5969,18 @@ async def _zen_stream_anthropic_with_retry(
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                         return
                     if resp.status_code == 403 and _is_free_tier_gate_error(data, body_text):
-                        free_tier_gates += 1
-                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{_FREE_TIER_FAIL_FAST_GATES}): {err_msg} — rotating (no penalty); req={_gate_req_diag(req_body)}")
-                        if PROXY_POOL_ENABLED and proxy_addr:
-                            _report_free_tier_block(proxy_addr)
-                            gated_exits.add(proxy_addr)
-                        if free_tier_gates >= _FREE_TIER_FAIL_FAST_GATES:
-                            _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} consecutive exits — request-shaped, failing fast; req={_gate_req_diag(req_body)}")
+                        free_tier_gates, gate_exhausted = _note_free_tier_gate(free_tier_gates, gated_exits, proxy_addr)
+                        _log(f"[zen] [{model}|{proxy_addr or 'direct'}] FreeTier gate 403 ({free_tier_gates}/{gate_budget}): {err_msg}{' — pool out of fresh exits' if gate_exhausted else ' — rotating (no penalty)'}; req={_gate_req_diag(req_body)}")
+                        if gate_exhausted or free_tier_gates >= gate_budget:
+                            _log(f"[zen] [{model}] FreeTier gate on {free_tier_gates} distinct exit(s){' (no fresh exit to try)' if gate_exhausted else ''} — failing fast; req={_gate_req_diag(req_body)}")
+                            _remember_gate_rejection(session_id)
                             yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                             return
                         if attempt < attempts and not await _client_gone(request):
                             await _maybe_backoff(attempt, resp.status_code)
                             attempt += 1
                             continue
+                        _remember_gate_rejection(session_id)
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                         return
                     # Not a proxy failure: 4xx/5xx are upstream or request
