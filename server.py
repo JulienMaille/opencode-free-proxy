@@ -3697,6 +3697,17 @@ async def _repair_stream_tool_args(lines, schemas: dict, model: str = None):
         delta = first.get("delta") or {}
         tcs = delta.get("tool_calls") if isinstance(delta, dict) else None
         if not tcs:
+            if first.get("finish_reason") is not None:
+                # Pending arguments are emitted as a final tool_calls delta.
+                # They must precede the terminal chunk, not be flushed at
+                # [DONE] after the client has already observed finish_reason.
+                for key in list(pending):
+                    chunk = _flush(key)
+                    if chunk:
+                        yield chunk
+                pending.clear()
+                active = None
+                flushed = True
             yield unit
             continue
 
@@ -3731,12 +3742,22 @@ async def _repair_stream_tool_args(lines, schemas: dict, model: str = None):
                     yield chunk
             active = key
 
+        terminal = first.get("finish_reason") is not None
+        if terminal:
+            for key in list(pending):
+                chunk = _flush(key)
+                if chunk:
+                    yield chunk
+            pending.clear()
+            active = None
+            flushed = True
+
         if rewrote:
             piece["choices"][0]["delta"] = delta
             yield f"data: {json.dumps(piece, ensure_ascii=False)}\n\n"
         else:
             yield unit
-        if first.get("finish_reason") == "tool_calls":
+        if first.get("finish_reason") == "tool_calls" and not terminal:
             for key in list(pending):
                 chunk = _flush(key)
                 if chunk:
@@ -5360,6 +5381,8 @@ async def _zen_stream_with_retry(
         retry_stream = False
         streamed_any = False
         stream_completed = False
+        pending_finish_choices = []
+        pending_finish_meta = None
         _slot1_fixed[0] = False  # new upstream attempt: first-head renumbering resets
         _reason_buf = ""
         _content_buf = ""
@@ -5386,6 +5409,9 @@ async def _zen_stream_with_retry(
 
                     payload = line[5:].strip()
                     if payload == "[DONE]":
+                        if pending_finish_choices and pending_finish_meta:
+                            yield _terminal_stream_chunk(pending_finish_meta, pending_finish_choices)
+                            finish_delivered = True
                         if PROXY_POOL_ENABLED and proxy_addr:
                             proxy_pool.report_success(proxy_addr)
                         stream_completed = True
@@ -5430,6 +5456,17 @@ async def _zen_stream_with_retry(
                             break
                         yield _openai_stream_error(str(err), "upstream_error", "malformed_stream")
                         return
+
+                    deferred = _defer_stream_finish_reason(piece)
+                    if deferred:
+                        pending_finish_choices = deferred
+                        pending_finish_meta = {
+                            k: piece[k] for k in ("id", "object", "created", "model") if k in piece
+                        }
+                        # Re-serialize only terminal-bearing chunks, with a
+                        # null finish reason. Subsequent late tool deltas are
+                        # then legal until we emit the deferred terminal.
+                        line = "data: " + json.dumps(piece, ensure_ascii=False)
 
                     # A valid fragment only proves that the stream is alive;
                     # it is not a successful request yet. Keep the transport
@@ -5499,6 +5536,14 @@ async def _zen_stream_with_retry(
                 # away immediately rather than giving the same proxy another
                 # chance. Client aborts never mark the pool failed.
                 _safe_pool_stream_failure(proxy_addr, e)
+                if pending_finish_choices and pending_finish_meta:
+                    # The upstream already declared the turn complete; a lost
+                    # trailing [DONE] must not turn that into a post-finish
+                    # error (nor trigger a replay after tool deltas escaped).
+                    yield _terminal_stream_chunk(pending_finish_meta, pending_finish_choices)
+                    finish_delivered = True
+                    yield "data: [DONE]\n\n"
+                    return
                 if finish_delivered:
                     # The client already saw finish_reason; the turn completed.
                     # Just terminate the stream cleanly instead of failing it.
@@ -5600,14 +5645,21 @@ async def _zen_stream_with_retry(
             # but content/tool fragments were already delivered: tool_calls
             # pending -> "tool_calls", else content present -> "stop". Only
             # the truly-empty case falls through to the error path below.
-            inferred = "tool_calls" if tool_streamed else ("stop" if _content_buf else None)
+            inferred = (
+                pending_finish_choices[0]["finish_reason"]
+                if pending_finish_choices
+                else ("tool_calls" if tool_streamed else ("stop" if _content_buf else None))
+            )
             if inferred and streamed_any:
                 _log(f"[zen] [{model}|{proxy_addr or 'direct'}] inferring finish={inferred} on graceful close without [DONE] (content_len={len(_content_buf)})")
                 if session_id and _reason_buf and _content_buf:
                     _remember_reasoning(session_id, _content_buf, _reason_buf)
-                _term_id = oc_id("chatcmpl")
-                _term_created = int(time.time())
-                yield f"data: {json.dumps({'id': _term_id, 'object': 'chat.completion.chunk', 'created': _term_created, 'model': model or '', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': inferred}]})}\n\n"
+                if pending_finish_choices and pending_finish_meta:
+                    yield _terminal_stream_chunk(pending_finish_meta, pending_finish_choices)
+                else:
+                    _term_id = oc_id("chatcmpl")
+                    _term_created = int(time.time())
+                    yield f"data: {json.dumps({'id': _term_id, 'object': 'chat.completion.chunk', 'created': _term_created, 'model': model or '', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': inferred}]})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             yield _openai_stream_error(
@@ -6210,6 +6262,81 @@ def _cline_preferred_skip(is_free: bool) -> set:
     except Exception:
         pass
     return skip
+
+
+def _defer_stream_finish_reason(piece: dict) -> list[dict]:
+    """Clear terminal finish reasons from an upstream chunk before forwarding.
+
+    Some upstream streams send ``finish_reason`` and then continue emitting
+    tool-call deltas. OpenAI-compatible clients (including OpenCode's SDK)
+    reject any content after that terminal chunk. The caller must emit one
+    terminal chunk after the upstream stream is fully consumed.
+    """
+    choices = piece.get("choices") if isinstance(piece, dict) else None
+    if not isinstance(choices, list):
+        return []
+    terminal_choices = []
+    for choice in choices:
+        if isinstance(choice, dict) and choice.get("finish_reason") is not None:
+            terminal_choices.append({
+                "index": choice.get("index", 0),
+                "finish_reason": choice["finish_reason"],
+            })
+            choice["finish_reason"] = None
+    return terminal_choices
+
+
+def _terminal_stream_chunk(meta: dict, choices: list[dict]) -> str:
+    """Serialize the deferred terminal chunk after all content is forwarded."""
+    terminal = dict(meta)
+    terminal["choices"] = [
+        {"index": c.get("index", 0), "delta": {}, "finish_reason": c["finish_reason"]}
+        for c in choices
+    ]
+    return "data: " + json.dumps(terminal, ensure_ascii=False) + "\n\n"
+
+
+async def _defer_finish_reason_stream(lines):
+    """Keep OpenAI finish chunks terminal even for pass-through providers."""
+    pending_choices = []
+    pending_meta = None
+    async for unit in lines:
+        text = str(unit)
+        body = text[:-2] if text.endswith("\n\n") else text
+        if not body.startswith("data:"):
+            yield unit
+            continue
+        payload = body[5:].strip()
+        if payload == "[DONE]":
+            if pending_choices and pending_meta:
+                yield _terminal_stream_chunk(pending_meta, pending_choices)
+            yield unit
+            return
+        try:
+            piece = json.loads(payload)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            yield unit
+            continue
+        if not isinstance(piece, dict):
+            yield unit
+            continue
+        if _upstream_error(piece):
+            # An explicit provider error supersedes a finish that was never
+            # committed to the client.
+            pending_choices = []
+            pending_meta = None
+            yield unit
+            continue
+        deferred = _defer_stream_finish_reason(piece)
+        if deferred:
+            pending_choices = deferred
+            pending_meta = {k: piece[k] for k in ("id", "object", "created", "model") if k in piece}
+            yield "data: " + json.dumps(piece, ensure_ascii=False) + "\n\n"
+        else:
+            yield unit
+    if pending_choices and pending_meta:
+        yield _terminal_stream_chunk(pending_meta, pending_choices)
+        yield "data: [DONE]\n\n"
 
 
 def _cline_retire_slot(skip_set, key, slot_name=None):
@@ -8341,7 +8468,9 @@ async def chat_completions(request: Request):
         )
         if stream:
             return StreamingResponse(
-                cline_stream_with_retry(req_body, user, cline_model),
+                _defer_finish_reason_stream(
+                    cline_stream_with_retry(req_body, user, cline_model)
+                ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )

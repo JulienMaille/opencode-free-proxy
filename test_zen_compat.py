@@ -640,6 +640,54 @@ def _sse(delta, finish=None):
     return f"data: {json.dumps({'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]})}\n\n"
 
 
+def test_stream_finish_reason_is_deferred_while_late_tool_deltas_arrive():
+    piece = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "big-pickle",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    }
+    deferred = srv._defer_stream_finish_reason(piece)
+    assert deferred == [{"index": 0, "finish_reason": "tool_calls"}]
+    assert piece["choices"][0]["finish_reason"] is None
+
+    late_delta = {
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 1, "id": "call_1"}]}, "finish_reason": None}]
+    }
+    assert srv._defer_stream_finish_reason(late_delta) == []
+    assert late_delta["choices"][0]["delta"]["tool_calls"][0]["index"] == 1
+
+    terminal = srv._terminal_stream_chunk(piece, deferred)
+    decoded = json.loads(terminal.removeprefix("data: ").strip())
+    assert decoded["choices"] == [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+
+
+def test_passthrough_stream_defers_finish_until_after_late_deltas():
+    async def _run():
+        seq = [
+            "data: " + json.dumps({
+                "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                "created": 1, "model": "cline/test",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            }) + "\n\n",
+            _sse({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "shell"}}]}),
+            "data: [DONE]\n\n",
+        ]
+
+        async def _agen(items):
+            for item in items:
+                yield item
+
+        return await _collect(srv._defer_finish_reason_stream(_agen(seq)))
+
+    chunks = asyncio.run(_run())
+    finish_at = next(i for i, c in enumerate(chunks) if '"finish_reason": "tool_calls"' in c)
+    tool_at = next(i for i, c in enumerate(chunks) if '"name": "shell"' in c)
+    assert tool_at < finish_at
+    assert chunks[-1] == "data: [DONE]\n\n"
+
+
 async def _collect(gen):
     return [c async for c in gen]
 
@@ -678,6 +726,28 @@ def test_stream_repair_withholds_and_flushes_repaired_args():
     name, args = _reassemble(asyncio.run(_run()))
     assert name == "todo", name
     assert json.loads(args)["list"][0]["items"] == ["x"], args
+
+
+def test_stream_repair_flushes_pending_tool_args_before_terminal_chunk():
+    async def _run():
+        seq = [
+            _sse({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                  "function": {"name": "todo", "arguments": '{"op":"init"}'}}]}),
+            _sse({}, finish="tool_calls"),
+            "data: [DONE]\n\n",
+        ]
+
+        async def _agen(items):
+            for item in items:
+                yield item
+
+        return await _collect(srv._repair_stream_tool_args(_agen(seq), {"todo": _TODO_SCHEMA}, "m"))
+
+    chunks = asyncio.run(_run())
+    finish_at = next(i for i, c in enumerate(chunks) if '"finish_reason": "tool_calls"' in c)
+    args_at = next(i for i, c in enumerate(chunks) if '"arguments": "{\\"op\\":\\"init\\"}"' in c)
+    assert args_at < finish_at
+    assert chunks[-1] == "data: [DONE]\n\n"
 
 
 def test_stream_passthrough_when_no_schemas():
