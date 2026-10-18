@@ -768,6 +768,75 @@ def test_stream_passthrough_when_no_schemas():
     assert "".join(asyncio.run(_run())) == "".join(seq)
 
 
+# ── pi-freeflow 1.36.0 / bf358da: previous call's tail + missing brace ─
+def test_salvage_repairs_tail_and_missing_brace_together():
+    """Both faults at once: a fragment in front AND the final brace lost."""
+    bash_schema = {"type": "object",
+                   "properties": {"i": {"type": "string"}, "command": {"type": "string"}}}
+    fixed = srv._repair_tool_arguments('],"timeout":400}{"i":"p1","command":"ls -la"', bash_schema)
+    assert fixed is not None
+    assert json.loads(fixed) == {"i": "p1", "command": "ls -la"}
+
+
+def test_salvage_refuses_bare_candidate_and_mid_string_cut():
+    schema = {"type": "object", "properties": {"command": {"type": "string"}}}
+    # Cut inside a string literal: closing it would silently shorten the value,
+    # and these arguments carry shell commands.
+    assert srv._append_closers('{"command":"rm -rf /tmp/x') is None
+    # A candidate at the very start carries no preceding fragment, so it is
+    # never completed: the fragment is the evidence the model was mid-call.
+    assert srv._parse_tool_args('{"command":"ls"')[1] is False
+    assert srv._repair_tool_arguments('{"command":"ls"', schema) is None
+
+
+# ── pi-freeflow 1.38.0 / 9c2bac1: strict-mode nullable wrapper ─────
+def _nullable(schema):
+    return {"anyOf": [schema, {"type": "null"}]}
+
+
+def test_strict_nullable_wrapper_shapes_are_resolved():
+    """Strict hosts wrap every optional property; shape reads must descend."""
+    schema = {"type": "object", "properties": {
+        "list": _nullable({"type": "array", "items": {"type": "object"}}),
+        "items": _nullable({"type": "array", "items": {"type": "string"}}),
+        "task": {"type": "string"},
+    }}
+    assert srv._schema_shape(schema["properties"]["list"]) == "array<object>"
+    # Without the descent the wrapped declaration read as free-form, so the
+    # promotion below never fired and the whole repair stayed inert on exactly
+    # the strict tools it exists for.
+    fixed = srv._repair_tool_arguments(json.dumps({"items": [{"a": 1}]}), schema)
+    assert fixed is not None
+    assert json.loads(fixed) == {"list": [{"a": 1}]}
+
+
+def test_strict_nullable_required_key_may_be_absent():
+    schema = {"type": "object", "properties": {
+        "command": _nullable({"type": "string"}),
+        "timeout": _nullable({"type": "number"}),
+    }, "required": ["command", "timeout"]}
+    # Strict hosts list EVERY key in `required` ("must be addressable"), so an
+    # absent nullable key is correct, not a violation.
+    assert srv._matches_schema({"command": "ls"}, schema) is True
+    # A genuinely required non-nullable key is still enforced.
+    assert srv._matches_schema({}, {"type": "object",
+                                    "properties": {"command": {"type": "string"}},
+                                    "required": ["command"]}) is False
+
+
+# ── pi-freeflow 3408dad / 1.35.0: replayed commentary items 400 ─────
+def test_commentary_phase_stripped_from_replayed_history():
+    """A narrated tool call leaves phase=commentary; every replay then 400s."""
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "phase": "commentary", "content": "I will call the tool"},
+        {"role": "assistant", "phase": "final_answer", "content": "done"},
+    ]
+    assert srv._strip_commentary_phase(msgs) == 1
+    assert "phase" not in msgs[1]
+    assert msgs[2]["phase"] == "final_answer"
+
+
 _TESTS = [
     test_max_tokens_never_renamed,
     test_reasoning_tool_calls_survive_cache_key_ops,
@@ -798,6 +867,11 @@ _TESTS = [
     test_salvage_leaves_wellformed_alone,
     test_stream_repair_withholds_and_flushes_repaired_args,
     test_stream_passthrough_when_no_schemas,
+    test_salvage_repairs_tail_and_missing_brace_together,
+    test_salvage_refuses_bare_candidate_and_mid_string_cut,
+    test_strict_nullable_wrapper_shapes_are_resolved,
+    test_strict_nullable_required_key_may_be_absent,
+    test_commentary_phase_stripped_from_replayed_history,
 ]
 
 

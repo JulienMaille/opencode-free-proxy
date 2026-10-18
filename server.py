@@ -2785,8 +2785,31 @@ def _ensure_native_responses_tools(resp_tools):
     return out
 
 
+# ── Request shapes upstream rejects (pi-freeflow 3408dad / 1.35.0) ──
+# A model that narrates a tool call instead of making one leaves a
+# ``phase: "commentary"`` assistant item behind, and upstream then rejects
+# EVERY replay of that history with ``400 invalid_request_error: The request
+# contains invalid parameters`` — the session can neither continue nor be
+# resumed, because each retry sends the same history again. Only the phase
+# field is removed: it is output metadata the model never reads, so dropping it
+# cannot change the answer. Every assistant item is swept, not just the last
+# one, because upstream validates the whole replayed history.
+def _strip_commentary_phase(messages) -> int:
+    """Drop ``phase: "commentary"`` from replayed assistant messages."""
+    if not isinstance(messages, list):
+        return 0
+    dropped = 0
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("phase") == "commentary":
+            del msg["phase"]
+            dropped += 1
+    return dropped
+
+
 def zen_request(model, messages, stream, tools, tool_choice, session_id, max_tokens=None, max_completion_tokens=None, sampling: dict | None = None):
     model = _normalize_model(model)
+    if _strip_commentary_phase(messages):
+        _log("[zen] dropped phase=commentary from replayed assistant message(s)")
     req_body: dict = {"model": model, "messages": messages, "stream": bool(stream)}
     tools = _ensure_native_tools(tools)
     if tools:
@@ -3135,6 +3158,8 @@ def _responses_continuation_body(resp_body: dict, content: str) -> dict:
 def _zen_responses_body(model, messages, tools, effort=None, max_tokens=None,
                         max_completion_tokens=None, sampling: dict | None = None) -> dict:
     """Build the /inference/v1/responses request body from chat-style parameters."""
+    if _strip_commentary_phase(messages):
+        _log("[zen] dropped phase=commentary from replayed assistant message(s)")
     body: dict = {
         "model": model,
         "input": _chat_to_responses_input(messages),
@@ -3448,16 +3473,70 @@ def _strip_injected_tool_deltas(piece: dict, caller_declared_tools: bool, _slot1
 _SCHEMA_SHAPE_CACHE: dict[int, str | None] = {}
 
 
+# ── Strict-mode nullable wrapper (pi-freeflow 9c2bac1 / 1.38.0) ─────
+# Strict hosts wrap every optional property as ``anyOf: [<schema>, {"type":
+# "null"}]`` with no top-level ``type``, and list EVERY key in ``required``
+# ("must be addressable", not "must be present"). Read literally, the
+# conformance gate below refused every well-formed call on such a tool, which
+# left the whole repair family inert on exactly the strict tools it exists for.
+# These three helpers descend the wrapper so shape reads see the declared
+# branch, and treat a nullable declaration as legitimately absent/null.
+
+def _non_null_branch(prop):
+    """The non-null branch of an ``anyOf`` nullable wrapper, or None."""
+    if not isinstance(prop, dict):
+        return None
+    any_of = prop.get("anyOf")
+    if not isinstance(any_of, list):
+        return None
+    for branch in any_of:
+        if isinstance(branch, dict) and branch.get("type") != "null":
+            return branch
+    return None
+
+
+def _is_nullable_property(prop) -> bool:
+    """True when a declaration explicitly allows ``null``."""
+    if not isinstance(prop, dict):
+        return False
+    t = prop.get("type")
+    if isinstance(t, list) and "null" in t:
+        return True
+    any_of = prop.get("anyOf")
+    if isinstance(any_of, list):
+        for branch in any_of:
+            if isinstance(branch, dict) and branch.get("type") == "null":
+                return True
+    return False
+
+
+def _effective_schema(schema):
+    """The node a shape keyword (``properties``, ``items``) lives on.
+
+    A node that declares its own ``type`` keeps it: an ``anyOf`` beside it is
+    conjunctive, not a wrapper.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    if schema.get("type") is not None or schema.get("anyOf") is None:
+        return schema
+    branch = _non_null_branch(schema)
+    return schema if branch is None else _effective_schema(branch)
+
+
 def _schema_shape(schema) -> str | None:
     """Coarse shape tag of a declared JSON schema, or None when free-form."""
     if not isinstance(schema, dict):
         return None
+    branch = _non_null_branch(schema)
+    if branch is not None:
+        return _schema_shape(branch)
     t = schema.get("type")
     if isinstance(t, str):
         if t == "object":
             return "object"
         if t == "array":
-            items = schema.get("items")
+            items = _effective_schema(schema.get("items"))
             it = items.get("type") if isinstance(items, dict) else None
             return f"array<{it}>" if isinstance(it, str) else "array<any>"
         return t
@@ -3492,6 +3571,7 @@ def _value_shape(value) -> str | None:
 
 def _schema_props(schema):
     """An object schema's declared property names, or an empty mapping."""
+    schema = _effective_schema(schema)
     if not isinstance(schema, dict):
         return {}
     props = schema.get("properties")
@@ -3553,7 +3633,7 @@ def _repair_object(obj: dict, schema) -> bool:
 
     # Rule 3 — recurse into nested objects and array items.
     for k, v in list(obj.items()):
-        sub = props.get(k)
+        sub = _effective_schema(props.get(k))
         if not isinstance(sub, dict):
             continue
         if isinstance(v, dict):
@@ -3576,11 +3656,21 @@ def _matches_schema(value: dict, schema) -> bool:
     """
     if not isinstance(value, dict) or not isinstance(schema, dict):
         return False
+    # A value the declaration explicitly allows is a match before any shape is
+    # read: the walkers now descend through the strict-mode nullable wrapper, so
+    # a legitimately-null value would otherwise be REJECTED by that descent.
+    if value is None and _is_nullable_property(schema):
+        return True
     props = _schema_props(schema)
     if not props:
         return False
     for req in schema.get("required") or []:
         if isinstance(req, str) and req not in value:
+            # Strict-mode hosts list every key here and mark the optional ones
+            # nullable, so a nullable key that is absent is correct, not a
+            # violation.
+            if _is_nullable_property(props.get(req)):
+                continue
             return False
     for key, val in value.items():
         if key not in props:
@@ -3594,6 +3684,47 @@ def _matches_schema(value: dict, schema) -> bool:
     return True
 
 
+def _append_closers(text: str):
+    """Append the closers an unterminated JSON object is missing, or None.
+
+    Measures the open brackets left by ``text`` and closes them, so a call cut
+    off right before its final brace can still be parsed. Refuses in two cases,
+    both deliberate (pi-freeflow 1.36.0 / bf358da):
+
+    - Cut inside a string literal (an unterminated ``"``): the value itself is
+      incomplete, so any closing brace would silently shorten it — and these
+      arguments carry shell commands.
+    - Nothing left open: a well-formed candidate never reaches this path.
+
+    Appending a closer never adds or removes a value, so a caller whose payload
+    parsed here is getting back exactly what the model emitted, minus the
+    previous call's echo. Only ever called on a candidate that starts at a
+    ``{`` preceded by a fragment of the previous call.
+    """
+    open_stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in ("{", "["):
+            open_stack.append("}" if ch == "{" else "]")
+        elif ch in ("}", "]"):
+            if open_stack:
+                open_stack.pop()
+    if in_string or not open_stack:
+        return None
+    return text + "".join(reversed(open_stack))
+
+
 def _parse_tool_args(args: str):
     """Parse tool-call arguments, salvaging a stale prefix off the front.
 
@@ -3603,6 +3734,10 @@ def _parse_tool_args(args: str):
 
         ',"timeout":400}{"i":"…","command":"…"}'
         ']}]}{"i":"Planning research phases","op":"init",…}'
+
+    A second live shape carries BOTH faults at once — the previous call's tail
+    in front AND the closing brace missing (pi-freeflow 1.36.0 / bf358da), so
+    the scan also offers the candidate with its closers appended.
 
     Because the stream carried ONE tool call, keying fragments by call id
     cannot separate them, and the host rejects the payload as invalid JSON.
@@ -3620,12 +3755,24 @@ def _parse_tool_args(args: str):
         return (value, False) if isinstance(value, dict) else (None, False)
     start = args.find("{")
     while start != -1:
-        try:
-            salvaged = json.loads(args[start:])
-        except (json.JSONDecodeError, TypeError, ValueError):
-            salvaged = None
-        if isinstance(salvaged, dict):
-            return salvaged, True
+        candidate = args[start:]
+        # Two shapes to try, in order: the candidate as written, then the
+        # candidate with its missing closers appended. The closer is offered
+        # only when a fragment precedes the brace — that fragment is the
+        # evidence the model was mid-call and lost the tail. A bare
+        # ``{"op":"init"`` stays refused, and so does an inner ``{"phase":``
+        # inside an already-truncated object, which is why this is not offered
+        # at every brace.
+        candidates = [candidate] if start == 0 else [candidate, _append_closers(candidate)]
+        for attempt in candidates:
+            if attempt is None:
+                continue
+            try:
+                salvaged = json.loads(attempt)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if isinstance(salvaged, dict):
+                return salvaged, True
         start = args.find("{", start + 1)
     return None, False
 
