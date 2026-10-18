@@ -2103,6 +2103,30 @@ def _rotate_on_too_large(addr: str | None) -> bool:
     return True
 
 
+def _rotate_on_upstream_internal_error(addr: str | None, status: int | None) -> bool:
+    """Rotate off a non-retriable 5xx exit with zero health penalty. True (retry).
+
+    A 500/501/505 from upstream is a model/backend fault, not the exit's
+    (measured 2026-10-18 on deepseek-v4.1-flash-free: the same empty-bodied 500
+    on every exit for 24 requests). Delegates to
+    proxy_pool.report_upstream_internal_error, which only clears the sticky
+    ``current`` — no cooldown, no blacklist, no counters. Callers exclude the
+    exit and roll at most once (``rolled_5xx``), then surface: never cycle the
+    pool on a 5xx.
+    """
+    if not PROXY_POOL_ENABLED or not addr:
+        return True
+    try:
+        proxy_pool.report_upstream_internal_error(addr, status)
+    except Exception:
+        try:
+            if proxy_pool.current and proxy_pool.current.get("address") == addr:
+                proxy_pool.current = None
+        except Exception:
+            pass
+    return True
+
+
 # ── Watchdog matrix (pi-freeflow client.ts:shouldRecoverOnHealth) ───
 # Pure gate: True = force a pool refresh / key rotation (recover), False =
 # hold the current selection (prevent flapping). Matrix:
@@ -4116,7 +4140,7 @@ async def _zen_responses_stream_with_retry(
 
     attempt = 0
     free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
-    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gated_exits: set[str] = set()  # exits this request must not re-pick via select(exclude=...)
     pinned_proxy: str | None = None  # reasoning-recovery retry: reuse this exit for one iteration
     reasoning_recovery_done = False  # one same-exit retry per request, then fall through
     while True:
@@ -5020,8 +5044,9 @@ async def _zen_request_with_retry(
     attempts = MAX_RETRIES if max_retries is None else max_retries
     last_status: int | None = None
     pool_exhausted_retriable = False
+    rolled_5xx = False  # a non-retriable 5xx rolls ONCE (zero pool penalty) then surfaces
     free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
-    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gated_exits: set[str] = set()  # exits this request must not re-pick via select(exclude=...)
 
     for attempt in range(attempts + 1):
         if await _client_gone(request):
@@ -5209,12 +5234,20 @@ async def _zen_request_with_retry(
                     pool_exhausted_retriable = bool(PROXY_POOL_ENABLED)
                     if pool_exhausted_retriable:
                         break
-                elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
-                    if not _report_upstream_status(proxy_addr, resp.status_code):
-                        return JSONResponse(
-                            status_code=resp.status_code,
-                            content={"error": {"message": err_msg, "type": "upstream_error"}},
-                        )
+                elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts and not rolled_5xx:
+                    # A non-retriable 5xx (500/501/505) is a model/backend
+                    # fault, not the exit's: measured 2026-10-18 on
+                    # deepseek-v4.1-flash-free, 24 requests × up to 6 exits all
+                    # answered the SAME empty-bodied 500, and the old
+                    # cooldown+_mark_fail per exit swept the pool while
+                    # penalizing exits that were fine. Roll ONCE to a SIBLING
+                    # exit — the used one is excluded, so the retry really
+                    # moves — with zero pool penalty, then surface: never cycle
+                    # the pool on a 5xx.
+                    rolled_5xx = True
+                    if proxy_addr:
+                        gated_exits.add(proxy_addr)  # the single roll must reach a sibling, not this exit
+                    _rotate_on_upstream_internal_error(proxy_addr, resp.status_code)
                     await _maybe_backoff(attempt, resp.status_code)
                     continue
                 return JSONResponse(
@@ -5318,8 +5351,9 @@ async def _zen_stream_with_retry(
     _slot1_fixed = [False]  # per-attempt: upstream slot-1 first-head renumbered (see _strip_injected_tool_deltas)
 
     attempt = 0
+    rolled_5xx = False  # a non-retriable 5xx rolls ONCE (zero pool penalty) then surfaces
     free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
-    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gated_exits: set[str] = set()  # exits this request must not re-pick via select(exclude=...)
     while True:
         # Total work cap: plain retries (attempts) + mid-stream continuations
         # (MAX_STREAM_CONTINUATIONS) share one counter, so 4 torn-stream resumes
@@ -5625,10 +5659,15 @@ async def _zen_stream_with_retry(
                     attempt += 1
                     continue
                 _log(f"[zen] pool exhausted on retriable {resp.status_code}; direct fallback disabled (opt in with --allow-direct-fallback)")
-            elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
-                if not _report_upstream_status(proxy_addr, resp.status_code):
-                    yield _openai_stream_error(err_msg, "upstream_error", str(resp.status_code))
-                    return
+            elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts and not rolled_5xx:
+                # Non-retriable 5xx = model/backend fault, not the exit's (see
+                # the buffered path). Roll ONCE to a SIBLING exit (the used one
+                # is excluded), with zero pool penalty, then surface — never
+                # cycle the pool on a 5xx.
+                rolled_5xx = True
+                if proxy_addr:
+                    gated_exits.add(proxy_addr)
+                _rotate_on_upstream_internal_error(proxy_addr, resp.status_code)
                 await _maybe_backoff(attempt, resp.status_code)
                 attempt += 1
                 continue
@@ -5977,8 +6016,9 @@ async def _zen_stream_anthropic_with_retry(
         return idx
 
     attempt = 0
+    rolled_5xx = False  # a non-retriable 5xx rolls ONCE (zero pool penalty) then surfaces
     free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
-    gated_exits: set[str] = set()  # exits gated this request — never re-pick them via select(exclude=...)
+    gated_exits: set[str] = set()  # exits this request must not re-pick via select(exclude=...)
     while True:
         # Total work cap: plain retries (attempts) + continuations share one counter.
         # It's intentional — see _zen_stream_with_retry.
@@ -6107,10 +6147,15 @@ async def _zen_stream_anthropic_with_retry(
                         await _maybe_backoff(attempt, resp.status_code)
                         attempt += 1
                         continue
-                    elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts:
-                        if not _report_upstream_status(proxy_addr, resp.status_code):
-                            yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
-                            return
+                    elif resp.status_code >= 500 and not is_context_exceeded and attempt < attempts and not rolled_5xx:
+                        # Non-retriable 5xx = model/backend fault, not the
+                        # exit's. Roll ONCE to a SIBLING exit (the used one is
+                        # excluded), with zero pool penalty, then surface —
+                        # never cycle the pool on a 5xx.
+                        rolled_5xx = True
+                        if proxy_addr:
+                            gated_exits.add(proxy_addr)
+                        _rotate_on_upstream_internal_error(proxy_addr, resp.status_code)
                         await _maybe_backoff(attempt, resp.status_code)
                         attempt += 1
                         continue

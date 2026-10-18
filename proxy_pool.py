@@ -990,6 +990,29 @@ class ProxyPool:
             self.current = None
         return True
 
+    def report_upstream_internal_error(self, addr: str | None = None, status: int | None = None) -> bool:
+        """A non-retriable 5xx (500/501/505) is a model/upstream fault, not the exit.
+
+        Measured 2026-10-18 (10:07->10:18, deepseek-v4.1-flash-free): every
+        exit answered the SAME empty-bodied 500 for 24 requests, and cooling +
+        ``_mark_fail`` on each one swept the pool while penalizing exits that
+        were fine. Same zero-penalty contract as ``report_too_large``: no
+        ``cooling_until``, no blacklist, no rate-limit, no
+        ``consecutive_failures`` increment, no success/fail counter change.
+        Only the sticky ``current`` rotates; the caller also excludes the exit
+        from selection so its single roll reaches a sibling, then surfaces —
+        never cycles the pool on a 5xx.
+
+        Returns True (caller should roll to the next entry and retry).
+        """
+        target = addr or (self.current and self.current["address"])
+        if not target:
+            return True
+        _log(f"HTTP {status or 500} from {target}; rotating once (no penalty — upstream 5xx, not the exit)")
+        if self.current and self.current["address"] == target:
+            self.current = None
+        return True
+
     def report_free_tier_block(self, addr: str | None = None) -> bool:
         """403 FreeTierError: USUALLY request-shaped, SOMETIMES exit-shaped.
 
