@@ -94,6 +94,19 @@ REQUEST_READ_TIMEOUT = 120
 # thinking phase between SSE events. Keep the shorter timeout for buffered
 # requests, but give streaming clients a longer idle window.
 STREAM_READ_TIMEOUT = 300
+# Hard deadline on connect + upload + response headers for one upstream
+# attempt (the body read afterwards keeps its own timeout). Computed per
+# request as base + body_bytes / upload_bps, capped at CAP, so a large
+# context gets more time than a tiny one while a dead exit still rotates fast
+# (no more 129s stalls). A first-byte timeout on an exit is a SOFT rotation
+# signal: slow-but-alive exits are not hard-blacklisted for it.
+FIRST_BYTE_TIMEOUT_BASE = float(os.environ.get("OPENCODE_FIRST_BYTE_TIMEOUT_BASE", "15"))
+FIRST_BYTE_TIMEOUT_CAP = float(os.environ.get("OPENCODE_FIRST_BYTE_TIMEOUT_CAP", "45"))
+FIRST_BYTE_UPLOAD_BPS = float(os.environ.get("OPENCODE_FIRST_BYTE_UPLOAD_BPS", "16384"))
+# Cap on total upstream attempts (includes the first) for the four Zen lanes.
+# Each retry re-uploads the whole context, so a handful suffices; Cline lanes
+# keep their own retry budget.
+MAX_UPSTREAM_ATTEMPTS = int(os.environ.get("OPENCODE_MAX_UPSTREAM_ATTEMPTS", "4"))
 
 # ── Sticky-primary + healthy-first + escalating cooldown (pi-freeflow port) ──
 # Per-entry cooldowns (ms). Base 30s; 45s on generic 5xx; 60s on 504 gateway

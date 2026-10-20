@@ -23,7 +23,11 @@ from starlette.responses import JSONResponse, PlainTextResponse, StreamingRespon
 from proxy_pool import pool as proxy_pool
 from proxy_pool import (
     ALLOWED_PROXY_PORTS,
+    FIRST_BYTE_TIMEOUT_BASE,
+    FIRST_BYTE_TIMEOUT_CAP,
+    FIRST_BYTE_UPLOAD_BPS,
     MAX_RETRIES,
+    MAX_UPSTREAM_ATTEMPTS,
     PROXY_PORT_FILTER_ENABLED,
     REQUEST_CONNECT_TIMEOUT,
     REQUEST_READ_TIMEOUT,
@@ -1620,20 +1624,24 @@ def _has_promotion_phrase(data: dict | None = None, body: str = "") -> bool:
         return False
 
 
-_BACKEND_DOWN_RETIRE_AFTER = 3
+_BACKEND_DOWN_WARN_AFTER = 3
 _BACKEND_DOWN_WINDOW = 3600.0
 _backend_down_hits: dict[str, list] = {}
 
 
 def _note_backend_unavailable(model: str | None) -> None:
-    """Count a model-backend-down sighting; retire the model past the threshold.
+    """Count a model-backend-down sighting and log it — never retire the model.
 
     Zen answers ``503 Endpoint is unavailable`` for a model whose own endpoint
-    is gone. Retiring it keeps it out of the served list and stops every turn
-    from paying the fail-fast round trip. The threshold matters: a single
-    transient 503 must not brick a healthy model across restarts, so the
-    sightings must repeat inside a window before the id is persisted
-    (pi-freeflow 50696fd / 1.33.0 removes dead upstreams permanently).
+    is briefly gone. Those 503s are intermittent (deepseek-v4.1-flash-free
+    answers again seconds later), so retiring on them hid a healthy model from
+    the served list and persisted it to ``data/dead-models.json`` across
+    restarts — the fail-fast path already surfaces the upstream verdict on the
+    turn that hits it, without any pool penalty.
+
+    Persisting is therefore reserved for the one hard signal that means the
+    id is gone for good: the explicit "promotion has ended" ModelError (see
+    ``_mark_model_dead``). This counter is diagnostic only.
     """
     if not model:
         return
@@ -1643,11 +1651,13 @@ def _note_backend_unavailable(model: str | None) -> None:
         _backend_down_hits[model] = [1, now]
         return
     ent[0] += 1
-    if ent[0] >= _BACKEND_DOWN_RETIRE_AFTER:
-        # Clear the counter so the retirement is logged once, not per turn.
-        _backend_down_hits.pop(model, None)
-        _log(f"[zen] Model {model}: backend unavailable {_BACKEND_DOWN_RETIRE_AFTER}x in window — retiring from served list")
-        _mark_model_dead(model, persistent=True, reason="endpoint unavailable upstream")
+    if ent[0] == _BACKEND_DOWN_WARN_AFTER:
+        # Log once per window, then keep counting silently: the model stays
+        # served and each later request still gets its fast upstream verdict.
+        _log(
+            f"[zen] Model {model}: backend unavailable {_BACKEND_DOWN_WARN_AFTER}x in "
+            f"{int(_BACKEND_DOWN_WINDOW // 60)}m — staying available (never retired or persisted)"
+        )
 
 
 def _mark_model_dead(model: str | None, persistent: bool = True, reason: str | None = None) -> bool:
@@ -2195,6 +2205,212 @@ async def _select_with_repoll(exclude: set[str] | None = None):
     return await proxy_pool.select(exclude=exclude)
 
 
+def _request_body_len(request) -> int:
+    """Length of the request body in bytes (0 when unknown / streamed)."""
+    content = getattr(request, "content", None)
+    if content is None:
+        return 0
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        return len(content)
+    try:
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            return int(cl)
+    except Exception:
+        pass
+    return 0
+
+
+def _first_byte_timeout(request) -> float:
+    """Deadline for connect + upload + headers on one upstream attempt.
+
+    Scales with body size so large contexts aren't killed by a flat deadline,
+    while a dead exit still rotates fast (no more 129s stalls). The body read
+    afterwards keeps the configured read timeout.
+    """
+    body_len = _request_body_len(request)
+    upload_s = body_len / FIRST_BYTE_UPLOAD_BPS
+    return min(FIRST_BYTE_TIMEOUT_CAP, FIRST_BYTE_TIMEOUT_BASE + upload_s)
+
+
+async def _send_bounded(client, request, *, stream: bool = True, timeout: float | None = None):
+    """``client.send`` with a size-aware deadline on connect+upload+headers.
+
+    Raises ``httpx.ConnectTimeout`` carrying the request (so ``_exc_desc`` can
+    log the URL) when headers don't arrive within the deadline. A first-byte
+    timeout is a *soft* rotation signal: callers should release the exit and
+    try a fresh one, not hard-blacklist it.
+    """
+    if timeout is None:
+        timeout = _first_byte_timeout(request)
+    try:
+        return await asyncio.wait_for(
+            client.send(request, stream=stream), timeout=timeout
+        )
+    except asyncio.TimeoutError as exc:
+        raise httpx.ConnectTimeout(
+            f"no response headers within {timeout:g}s", request=request
+        ) from exc
+
+
+def _is_first_byte_timeout(exc: BaseException | None) -> bool:
+    """True when the failure is the size-aware first-byte deadline.
+
+    Used to down-classify the pool report to a SOFT rotation: a deadline miss
+    also covers a slow-but-alive exit uploading a large context, so the exit
+    must not be hard-blacklisted for it (that drained the pool to 100% failure
+    once). Real dead tunnels (SOCKS handshake/refused mid-connect) keep their
+    hard accounting.
+    """
+    return isinstance(exc, httpx.ConnectTimeout) and "no response headers within" in str(exc)
+
+
+def _attempt_budget(max_retries: int | None) -> int:
+    """Retries allowed for one request (total upstream attempts = budget + 1).
+
+    A caller-requested lower budget wins; the ceiling stops a request from
+    re-uploading a large context more than MAX_UPSTREAM_ATTEMPTS times.
+    """
+    n = MAX_RETRIES if max_retries is None else max_retries
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = MAX_RETRIES
+    return max(0, min(n, MAX_UPSTREAM_ATTEMPTS - 1))
+
+
+async def _hedge_gate_retry(
+    *,
+    method: str,
+    path: str,
+    json_body,
+    headers,
+    exclude: set[str],
+    n: int = 2,
+):
+    """Race the same request on up to ``n`` fresh exits after a FreeTier gate.
+
+    Returns ``(resp, client, addr, gated, failed)`` for the first 2xx, or
+    ``None`` when every hedged exit gated/failed. The winner's slot is kept
+    (caller owns it like a normal select, handed off via ``prefetched``);
+    every loser is closed and released. A first-byte timeout on a loser is a
+    SOFT failure (no hard blacklist) so slow-but-alive exits aren't executed.
+    """
+    if not PROXY_POOL_ENABLED:
+        return None
+    picks: list[dict] = []
+    seen = set(exclude)
+    for _ in range(max(1, n)):
+        p = await _select_with_repoll(seen)
+        if p is None:
+            break
+        addr = p["address"]
+        if addr in seen:
+            # Last-resort pass handed back an already-gated exit: no fresh
+            # issuer is left to hedge with.
+            proxy_pool.release(addr)
+            break
+        seen.add(addr)
+        picks.append(p)
+    if not picks:
+        return None
+
+    clients = [
+        proxy_pool.get_client(f"socks5://{p['address']}", streaming=True)
+        for p in picks
+    ]
+    tasks = []
+    for p, client in zip(picks, clients):
+        request = client.build_request(method, path, json=json_body, headers=headers)
+        tasks.append(asyncio.ensure_future(_send_bounded(client, request, stream=True)))
+
+    gated: list[str] = []
+    failed: list[str] = []
+    winner = None  # (resp, client, addr)
+    try:
+        pending = set(tasks)
+        while pending and winner is None:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                idx = tasks.index(task)
+                addr = picks[idx]["address"]
+                try:
+                    resp = task.result()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _log(f"[pool] hedge exit {addr} failed: {_exc_desc(exc)}")
+                    _safe_pool_failure(addr, exc, hard=False)
+                    failed.append(addr)
+                    continue
+                if resp.status_code == 403:
+                    gated.append(addr)
+                    if PROXY_POOL_ENABLED:
+                        _report_free_tier_block(addr)
+                    await resp.aclose()
+                    continue
+                if resp.status_code == 429:
+                    proxy_pool.report_ratelimit(addr)
+                    failed.append(addr)
+                    await resp.aclose()
+                    continue
+                if 200 <= resp.status_code < 300:
+                    if winner is None:
+                        winner = (resp, clients[idx], addr)
+                    # Keep scanning the batch so a loser that finished in the
+                    # same batch still gets booked / closed.
+                    continue
+                # Any other status repeats on every exit: no pool penalty.
+                failed.append(addr)
+                await resp.aclose()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        winner_resp = winner[0] if winner is not None else None
+        winner_addr = winner[2] if winner is not None else None
+        for task in tasks:
+            if not task.done() or task.cancelled():
+                continue
+            try:
+                resp = task.result()
+            except BaseException:
+                continue
+            if resp is winner_resp:
+                continue
+            addr = picks[tasks.index(task)]["address"]
+            # The winner may finish before a slower loser answers; book that
+            # answer here so the pool still counts the gate / rate limit.
+            if resp.status_code == 403 and addr not in gated:
+                gated.append(addr)
+                _report_free_tier_block(addr)
+            elif resp.status_code == 429 and addr not in failed:
+                proxy_pool.report_ratelimit(addr)
+                failed.append(addr)
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+        for p in picks:
+            addr = p["address"]
+            if addr != winner_addr:
+                proxy_pool.release(addr)
+        if winner is not None:
+            # Keep stickiness on the exit that actually answered.
+            for p in picks:
+                if p["address"] == winner_addr:
+                    proxy_pool.current = p
+                    break
+
+    if winner is None:
+        return None
+    return winner[0], winner[1], winner[2], gated, failed
+
+
 async def _maybe_force_refresh(reason: str) -> bool:
     """Force a pool refresh only when the watchdog gate says rotate.
 
@@ -2307,10 +2523,15 @@ def _log_429_hint():
 
 
 async def _maybe_backoff(attempt: int, status_code=None):
-    """Backoff except fast-break on 504: rotate pool immediately, no sleep."""
+    """Backoff except when the answer is deterministic: rotate immediately.
+
+    504 (gateway timeout), 403 (FreeTier gate) and 413 (body too large) are
+    not going to change on the same exit, so sleeping only adds latency
+    before the rotation.
+    """
     if status_code is not None:
         try:
-            if int(status_code) == 504:
+            if int(status_code) in (403, 413, 504):
                 return
         except Exception:
             pass
@@ -3749,6 +3970,15 @@ def _append_closers(text: str):
     return text + "".join(reversed(open_stack))
 
 
+# Bounds on the prefix-glue salvage in ``_parse_tool_args``. The scan is
+# O(candidates × payload): a brace-heavy emission used to spend 34.5 s on
+# 80 KB on the single-threaded proxy (pi-freeflow 7427771 / 1.39.0). 64 KiB is
+# far beyond any tool call a host actually sends, and the live glued payloads
+# carry the caller's object within the first few braces.
+_SALVAGE_MAX_BYTES = 64 * 1024
+_SALVAGE_MAX_CANDIDATES = 128
+
+
 def _parse_tool_args(args: str):
     """Parse tool-call arguments, salvaging a stale prefix off the front.
 
@@ -3770,6 +4000,12 @@ def _parse_tool_args(args: str):
     that yields a complete object is accepted — so a well-formed call never
     reaches this path and a truncated one is still refused rather than
     completed. Returns ``(value, salvaged)`` or ``(None, False)``.
+
+    The rescan is bounded (``_SALVAGE_MAX_BYTES`` / ``_SALVAGE_MAX_CANDIDATES``):
+    every candidate re-slices and re-parses the remaining text, so a
+    brace-heavy payload would otherwise cost a quadratic scan. Beyond the
+    bounds the caller's host sees its own schema error instead of the proxy
+    hanging, and no live shape needs them.
     """
     try:
         value = json.loads(args)
@@ -3777,8 +4013,14 @@ def _parse_tool_args(args: str):
         value = None
     else:
         return (value, False) if isinstance(value, dict) else (None, False)
+    if len(args) > _SALVAGE_MAX_BYTES:
+        return None, False
     start = args.find("{")
+    candidates_seen = 0
     while start != -1:
+        candidates_seen += 1
+        if candidates_seen > _SALVAGE_MAX_CANDIDATES:
+            break
         candidate = args[start:]
         # Two shapes to try, in order: the candidate as written, then the
         # candidate with its missing closers appended. The closer is offered
@@ -4074,7 +4316,7 @@ async def _zen_responses_stream_with_retry(
     """
     _ensure_req_id()
     last_error = None
-    attempts = MAX_RETRIES if max_retries is None else max_retries
+    attempts = _attempt_budget(max_retries)
     direct_only = False  # set after pool exhaustion: next loop is the one direct-fetch attempt
     cid = oc_id("chatcmpl")
     created = int(time.time())
@@ -4143,42 +4385,49 @@ async def _zen_responses_stream_with_retry(
     gated_exits: set[str] = set()  # exits this request must not re-pick via select(exclude=...)
     pinned_proxy: str | None = None  # reasoning-recovery retry: reuse this exit for one iteration
     reasoning_recovery_done = False  # one same-exit retry per request, then fall through
+    prefetched = None  # (resp, client, proxy_addr) won by the gate hedge; skips selection
     while True:
         if attempt > attempts + MAX_STREAM_CONTINUATIONS:
             break
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
-        if pinned_proxy is not None:
-            # Reasoning-recovery retry: the exit that took the 400 is innocent
-            # (upstream signed the blob to a different backend), so rebuild on
-            # the SAME exit instead of rotating. The pin lasts one iteration.
-            proxy_addr = pinned_proxy
-            pinned_proxy = None
-            client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
-        elif PROXY_POOL_ENABLED and not direct_only:
-            if not proxy_pool.ready:
-                await proxy_pool.load()
-            p = await _select_with_repoll(gated_exits)
-            if p is None:
-                _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
-                await _maybe_force_refresh("No proxy available")
-                p = await proxy_pool.select()
+        resp_ready = None  # response already obtained (gate-hedge winner): skip the send
+        if prefetched is not None:
+            resp, client, proxy_addr = prefetched
+            resp_ready = resp
+            prefetched = None
+        else:
+            if pinned_proxy is not None:
+                # Reasoning-recovery retry: the exit that took the 400 is innocent
+                # (upstream signed the blob to a different backend), so rebuild on
+                # the SAME exit instead of rotating. The pin lasts one iteration.
+                proxy_addr = pinned_proxy
+                pinned_proxy = None
+                client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
+            elif PROXY_POOL_ENABLED and not direct_only:
+                if not proxy_pool.ready:
+                    await proxy_pool.load()
+                p = await _select_with_repoll(gated_exits)
                 if p is None:
-                    _log("[pool] Still no proxy after refresh, falling back to direct")
-                    client = _stream_direct_client
-                    proxy_addr = None
+                    _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
+                    await _maybe_force_refresh("No proxy available")
+                    p = await proxy_pool.select()
+                    if p is None:
+                        _log("[pool] Still no proxy after refresh, falling back to direct")
+                        client = _stream_direct_client
+                        proxy_addr = None
+                    else:
+                        proxy_addr = p["address"]
+                        client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
                 else:
                     proxy_addr = p["address"]
                     client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
             else:
-                proxy_addr = p["address"]
-                client = proxy_pool.get_client(f"socks5://{proxy_addr}", streaming=True)
-        else:
-            if direct_only:
-                headers = _strip_direct_headers(headers)
-            client = _stream_direct_client if direct_only else _stream_default_client
-            proxy_addr = None
+                if direct_only:
+                    headers = _strip_direct_headers(headers)
+                client = _stream_direct_client if direct_only else _stream_default_client
+                proxy_addr = None
 
         # Issuer affinity: upstream signs each reasoning encrypted_content blob
         # to the backend that produced it. If this conversation was established
@@ -4196,10 +4445,13 @@ async def _zen_responses_stream_with_retry(
                 _log(f"[zen] issuer changed ({old_relay} -> {proxy_addr}); sending without caller-bound reasoning")
 
         try:
-            upstream_request = client.build_request(
-                "POST", "/inference/v1/responses", json=resp_body, headers=headers
-            )
-            resp = await client.send(upstream_request, stream=True)
+            if resp_ready is not None:
+                resp, resp_ready = resp_ready, None
+            else:
+                upstream_request = client.build_request(
+                    "POST", "/inference/v1/responses", json=resp_body, headers=headers
+                )
+                resp = await _send_bounded(client, upstream_request, stream=True)
         except Exception as e:
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Responses request failed (attempt {attempt}): {_exc_desc(e)}")
             if _is_client_abort(e):
@@ -4210,12 +4462,10 @@ async def _zen_responses_stream_with_retry(
             # Setup failure = the tunnel never established (SOCKS
             # handshake / connect / TLS died before any HTTP bytes).
             # Always hard: retrying the same exit just burns another
-            # attempt on it. Note the allowlist approach misses
-            # socksio's raw ProtocolError("Malformed reply") — it escapes
-            # httpx unwrapped (no req= URL in the log), so it fell into
-            # the soft 1/2 grace path and was retried on the dead exit.
-            # (Abort already returned above, so _safe_pool_failure records.)
-            _safe_pool_failure(proxy_addr, e, hard=True)
+            # attempt on it. A first-byte deadline miss is instead SOFT
+            # (slow-but-alive exit, possibly mid-upload of a big context) —
+            # rotate to a fresh exit, never hard-blacklist for it.
+            _safe_pool_failure(proxy_addr, e, hard=not _is_first_byte_timeout(e))
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             last_error = e
@@ -4329,9 +4579,37 @@ async def _zen_responses_stream_with_retry(
                 if not gate_exhausted and free_tier_gates < _FREE_TIER_FAIL_FAST_GATES:
                     if attempt < attempts and not await _client_gone(request):
                         await resp.aclose()
-                        await _maybe_backoff(attempt, resp.status_code)
-                        attempt += 1
-                        continue
+                        hedge_body = resp_body
+                        if _responses_conversation_key(resp_body):
+                            # The hedge lands on a different exit than the
+                            # conversation's issuer, so the same affinity rule
+                            # applies: replay without caller-bound reasoning.
+                            hedge_body = _strip_reasoning_encryption(resp_body)
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.release(proxy_addr)
+                            proxy_addr = None  # slot returned; do not release again
+                        hedged = await _hedge_gate_retry(
+                            method="POST",
+                            path="/inference/v1/responses",
+                            json_body=hedge_body,
+                            headers=headers,
+                            exclude=gated_exits,
+                        )
+                        if hedged is not None:
+                            winner_resp, client, winner_addr, hgated, _hfailed = hedged
+                            gated_exits.update(hgated)
+                            free_tier_gates += len(hgated)
+                            attempt += 1
+                            prefetched = (winner_resp, client, winner_addr)
+                            resp = None         # iteration finally must not close the handed-off response
+                            proxy_addr = None   # ... nor release the handed-off slot
+                            continue
+                        if hedged is None:
+                            # No fresh exit answered 2xx: rotate like the plain
+                            # gate path — the gated exit's slot is already out.
+                            await _maybe_backoff(attempt, resp.status_code)
+                            attempt += 1
+                            continue
                 if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
                     direct_only = True
                     _log_direct_fallback(model, resp.status_code)
@@ -5041,51 +5319,60 @@ async def _zen_request_with_retry(
             caller_tools=caller_tools,
         )
     last_error = None
-    attempts = MAX_RETRIES if max_retries is None else max_retries
+    attempts = _attempt_budget(max_retries)
     last_status: int | None = None
     pool_exhausted_retriable = False
     rolled_5xx = False  # a non-retriable 5xx rolls ONCE (zero pool penalty) then surfaces
     free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
     gated_exits: set[str] = set()  # exits this request must not re-pick via select(exclude=...)
+    prefetched = None  # (resp, client, proxy_addr) won by the gate hedge; skips selection
 
     for attempt in range(attempts + 1):
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return None
-        if PROXY_POOL_ENABLED:
-            # Load pool if needed
-            if not proxy_pool.ready:
-                await proxy_pool.load()
+        resp_ready = None  # response already obtained (gate-hedge winner): skip the send
+        if prefetched is not None:
+            resp, client, proxy_addr = prefetched
+            resp_ready = resp
+            prefetched = None
+        else:
+            if PROXY_POOL_ENABLED:
+                # Load pool if needed
+                if not proxy_pool.ready:
+                    await proxy_pool.load()
 
-            p = await _select_with_repoll(gated_exits)
-            if p is None:
-                _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), "
-                     f"forcing refresh")
-                await _maybe_force_refresh("No proxy available")
-                p = await proxy_pool.select()
+                p = await _select_with_repoll(gated_exits)
                 if p is None:
-                    _log("[pool] Still no proxy after refresh, falling back to direct")
-                    client = _default_client
-                    proxy_addr = None
+                    _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), "
+                         f"forcing refresh")
+                    await _maybe_force_refresh("No proxy available")
+                    p = await proxy_pool.select()
+                    if p is None:
+                        _log("[pool] Still no proxy after refresh, falling back to direct")
+                        client = _default_client
+                        proxy_addr = None
+                    else:
+                        proxy_addr = p["address"]
+                        client = proxy_pool.get_client(f"socks5://{proxy_addr}")
+                        _log(f"[pool] Retry {attempt}: using proxy {proxy_addr}")
                 else:
                     proxy_addr = p["address"]
                     client = proxy_pool.get_client(f"socks5://{proxy_addr}")
-                    _log(f"[pool] Retry {attempt}: using proxy {proxy_addr}")
-            else:
-                proxy_addr = p["address"]
-                client = proxy_pool.get_client(f"socks5://{proxy_addr}")
 
-        else:
-            client = _default_client
-            proxy_addr = None
+            else:
+                client = _default_client
+                proxy_addr = None
 
         try:
             try:
-                resp = await client.post(
-                    "/inference/v1/chat/completions",
-                    json=req_body,
-                    headers=headers,
-                )
+                if resp_ready is not None:
+                    resp, resp_ready = resp_ready, None
+                else:
+                    upstream_request = client.build_request(
+                        "POST", "/inference/v1/chat/completions", json=req_body, headers=headers
+                    )
+                    resp = await _send_bounded(client, upstream_request, stream=False)
             except Exception as e:
                 _log(f"[zen] Request failed (attempt {attempt}): {_exc_desc(e)}")
                 _safe_pool_failure(proxy_addr, e, hard=False)
@@ -5191,8 +5478,28 @@ async def _zen_request_with_retry(
                             content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
                         )
                     if attempt < attempts and not await _client_gone(request):
-                        await _maybe_backoff(attempt, resp.status_code)
-                        continue
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.release(proxy_addr)
+                            proxy_addr = None  # slot returned; do not release again
+                        hedged = await _hedge_gate_retry(
+                            method="POST",
+                            path="/inference/v1/chat/completions",
+                            json_body=req_body,
+                            headers=headers,
+                            exclude=gated_exits,
+                        )
+                        if hedged is not None:
+                            winner_resp, client, winner_addr, hgated, _hfailed = hedged
+                            gated_exits.update(hgated)
+                            free_tier_gates += len(hgated)
+                            prefetched = (winner_resp, client, winner_addr)
+                            proxy_addr = None  # iteration finally must not release the handed-off slot
+                            continue
+                        if hedged is None:
+                            # No fresh exit answered 2xx: rotate like the plain
+                            # gate path — the gated exit's slot is already out.
+                            await _maybe_backoff(attempt, resp.status_code)
+                            continue
                     return JSONResponse(
                         status_code=403,
                         content={"error": {"message": err_msg, "type": "upstream_error", "code": "free_tier_gate"}},
@@ -5344,7 +5651,7 @@ async def _zen_stream_with_retry(
     last_status: int | None = None
     pool_exhausted_retriable = False
     direct_only = False  # set after pool exhaustion: next loop is the one direct-fetch attempt
-    attempts = MAX_RETRIES if max_retries is None else max_retries
+    attempts = _attempt_budget(max_retries)
     finish_delivered = False  # True once a finish_reason chunk was forwarded
     tool_streamed = False  # True once a tool-call fragment was forwarded
     continuations = 0  # mid-stream resume attempts (see MAX_STREAM_CONTINUATIONS)
@@ -5354,6 +5661,7 @@ async def _zen_stream_with_retry(
     rolled_5xx = False  # a non-retriable 5xx rolls ONCE (zero pool penalty) then surfaces
     free_tier_gates = 0  # DISTINCT FreeTier-gated exits this request; fail fast at _FREE_TIER_FAIL_FAST_GATES
     gated_exits: set[str] = set()  # exits this request must not re-pick via select(exclude=...)
+    prefetched = None  # (resp, client, proxy_addr) won by the gate hedge; skips selection
     while True:
         # Total work cap: plain retries (attempts) + mid-stream continuations
         # (MAX_STREAM_CONTINUATIONS) share one counter, so 4 torn-stream resumes
@@ -5364,37 +5672,43 @@ async def _zen_stream_with_retry(
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
-        if PROXY_POOL_ENABLED and not direct_only:
-            if not proxy_pool.ready:
-                await proxy_pool.load()
+        resp_ready = None  # response already obtained (gate-hedge winner): skip the send
+        if prefetched is not None:
+            resp, client, proxy_addr = prefetched
+            resp_ready = resp
+            prefetched = None
+        else:
+            if PROXY_POOL_ENABLED and not direct_only:
+                if not proxy_pool.ready:
+                    await proxy_pool.load()
 
-            p = await _select_with_repoll(gated_exits)
-            if p is None:
-                _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
-                await _maybe_force_refresh("No proxy available")
-                p = await proxy_pool.select()
+                p = await _select_with_repoll(gated_exits)
                 if p is None:
-                    _log("[pool] Still no proxy after refresh, falling back to direct")
-                    client = _stream_default_client
-                    proxy_addr = None
+                    _log(f"[pool] No proxy available ({proxy_pool.get_pool_state()}), forcing refresh")
+                    await _maybe_force_refresh("No proxy available")
+                    p = await proxy_pool.select()
+                    if p is None:
+                        _log("[pool] Still no proxy after refresh, falling back to direct")
+                        client = _stream_default_client
+                        proxy_addr = None
+                    else:
+                        proxy_addr = p["address"]
+                        client = proxy_pool.get_client(
+                            f"socks5://{proxy_addr}", streaming=True
+                        )
                 else:
                     proxy_addr = p["address"]
                     client = proxy_pool.get_client(
                         f"socks5://{proxy_addr}", streaming=True
                     )
             else:
-                proxy_addr = p["address"]
-                client = proxy_pool.get_client(
-                    f"socks5://{proxy_addr}", streaming=True
-                )
-        else:
-            # Mirror the Responses-stream branch: the post-exhaustion
-            # direct-fetch attempt strips relay headers and uses the
-            # dedicated no-proxy client instead of the default one.
-            if direct_only:
-                headers = _strip_direct_headers(headers)
-            client = _stream_direct_client if direct_only else _stream_default_client
-            proxy_addr = None
+                # Mirror the Responses-stream branch: the post-exhaustion
+                # direct-fetch attempt strips relay headers and uses the
+                # dedicated no-proxy client instead of the default one.
+                if direct_only:
+                    headers = _strip_direct_headers(headers)
+                client = _stream_direct_client if direct_only else _stream_default_client
+                proxy_addr = None
 
         if client is None:
             err = RuntimeError(
@@ -5416,10 +5730,13 @@ async def _zen_stream_with_retry(
                 return
             _log(f"[zen] Retrying with direct client after None client (attempt {attempt})")
         try:
-            upstream_request = client.build_request(
-                "POST", "/inference/v1/chat/completions", json=req_body, headers=headers
-            )
-            resp = await client.send(upstream_request, stream=True)
+            if resp_ready is not None:
+                resp, resp_ready = resp_ready, None
+            else:
+                upstream_request = client.build_request(
+                    "POST", "/inference/v1/chat/completions", json=req_body, headers=headers
+                )
+                resp = await _send_bounded(client, upstream_request, stream=True)
         except Exception as e:
             _log(f"[zen] [{model}|{proxy_addr or 'direct'}] Stream request failed (attempt {attempt} pool={proxy_pool.get_pool_state() if PROXY_POOL_ENABLED else 'disabled'}): {_exc_desc(e)}")
             if _is_client_abort(e):
@@ -5435,8 +5752,10 @@ async def _zen_stream_with_retry(
             # Same as the responses setup path: a setup failure means the
             # tunnel never established, so rotate immediately instead of
             # spending the soft-grace retry on the same dead exit.
-            # (Abort already returned above, so _safe_pool_failure records.)
-            _safe_pool_failure(proxy_addr, e, hard=True)
+            # A first-byte deadline miss is instead SOFT (slow-but-alive
+            # exit, possibly mid-upload of a big context) — rotate to a
+            # fresh exit, never hard-blacklist for it.
+            _safe_pool_failure(proxy_addr, e, hard=not _is_first_byte_timeout(e))
             if PROXY_POOL_ENABLED and proxy_addr:
                 proxy_pool.release(proxy_addr)
             last_error = e
@@ -5577,9 +5896,31 @@ async def _zen_stream_with_retry(
                 # exit is skipped.
                 if not gate_exhausted and free_tier_gates < _FREE_TIER_FAIL_FAST_GATES:
                     if attempt < attempts and not await _client_gone(request):
-                        await _maybe_backoff(attempt, resp.status_code)
-                        attempt += 1
-                        continue
+                        if PROXY_POOL_ENABLED and proxy_addr:
+                            proxy_pool.release(proxy_addr)
+                            proxy_addr = None  # slot returned; do not release again
+                        hedged = await _hedge_gate_retry(
+                            method="POST",
+                            path="/inference/v1/chat/completions",
+                            json_body=req_body,
+                            headers=headers,
+                            exclude=gated_exits,
+                        )
+                        if hedged is not None:
+                            winner_resp, client, winner_addr, hgated, _hfailed = hedged
+                            gated_exits.update(hgated)
+                            free_tier_gates += len(hgated)
+                            attempt += 1
+                            prefetched = (winner_resp, client, winner_addr)
+                            resp = None         # iteration finally must not close the handed-off response
+                            proxy_addr = None   # ... nor release the handed-off slot
+                            continue
+                        if hedged is None:
+                            # No fresh exit answered 2xx: rotate like the plain
+                            # gate path — the gated exit's slot is already out.
+                            await _maybe_backoff(attempt, resp.status_code)
+                            attempt += 1
+                            continue
                 if PROXY_POOL_ENABLED and not direct_only and ALLOW_DIRECT_FALLBACK:
                     direct_only = True
                     _log_direct_fallback(model, resp.status_code)
@@ -5995,9 +6336,10 @@ async def _zen_stream_anthropic_with_retry(
     last_error = None
     _reason_buf = ""
     _content_buf = ""
-    attempts = MAX_RETRIES if max_retries is None else max_retries
+    attempts = _attempt_budget(max_retries)
     continuations = 0  # mid-stream resume attempts (see MAX_STREAM_CONTINUATIONS)
     finish_delivered = False  # True once the terminal finish_reason chunk was emitted
+    prefetched = None  # (resp, client, proxy_addr) won by the gate hedge; skips selection
     tool_streamed = False  # True once an input_json_delta / tool block was emitted
 
     def send_sse(event: str, data: dict) -> str:
@@ -6027,35 +6369,48 @@ async def _zen_stream_anthropic_with_retry(
         if await _client_gone(request):
             _log("[zen] Client disconnected; aborting retries")
             return
-        if PROXY_POOL_ENABLED:
-            if not proxy_pool.ready:
-                await proxy_pool.load()
+        resp_ready = None  # response already obtained (gate-hedge winner): skip the send
+        if prefetched is not None:
+            resp, client, proxy_addr = prefetched
+            resp_ready = resp
+            prefetched = None
+        else:
+            if PROXY_POOL_ENABLED:
+                if not proxy_pool.ready:
+                    await proxy_pool.load()
 
-            p = await _select_with_repoll(gated_exits)
-            if p is None:
-                _log(f"[pool] No proxy ({proxy_pool.get_pool_state()}), forcing refresh")
-                await _maybe_force_refresh("No proxy")
-                p = await proxy_pool.select()
+                p = await _select_with_repoll(gated_exits)
                 if p is None:
-                    _log("[pool] Fallback to direct")
-                    client = _stream_default_client
-                    proxy_addr = None
+                    _log(f"[pool] No proxy ({proxy_pool.get_pool_state()}), forcing refresh")
+                    await _maybe_force_refresh("No proxy")
+                    p = await proxy_pool.select()
+                    if p is None:
+                        _log("[pool] Fallback to direct")
+                        client = _stream_default_client
+                        proxy_addr = None
+                    else:
+                        proxy_addr = p["address"]
+                        client = proxy_pool.get_client(
+                            f"socks5://{proxy_addr}", streaming=True
+                        )
                 else:
                     proxy_addr = p["address"]
                     client = proxy_pool.get_client(
                         f"socks5://{proxy_addr}", streaming=True
                     )
             else:
-                proxy_addr = p["address"]
-                client = proxy_pool.get_client(
-                    f"socks5://{proxy_addr}", streaming=True
-                )
-        else:
-            client = _stream_default_client
-            proxy_addr = None
+                client = _stream_default_client
+                proxy_addr = None
 
         try:
-            async with client.stream("POST", "/inference/v1/chat/completions", json=req_body, headers=headers) as resp:
+            if resp_ready is not None:
+                resp, resp_ready = resp_ready, None
+            else:
+                upstream_request = client.build_request(
+                    "POST", "/inference/v1/chat/completions", json=req_body, headers=headers
+                )
+                resp = await _send_bounded(client, upstream_request, stream=True)
+            async with resp:
                 if resp.status_code == 429:
                     try:
                         raw = await resp.aread()
@@ -6108,9 +6463,30 @@ async def _zen_stream_anthropic_with_retry(
                             yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                             return
                         if attempt < attempts and not await _client_gone(request):
-                            await _maybe_backoff(attempt, resp.status_code)
-                            attempt += 1
-                            continue
+                            if PROXY_POOL_ENABLED and proxy_addr:
+                                proxy_pool.release(proxy_addr)
+                                proxy_addr = None  # slot returned; do not release again
+                            hedged = await _hedge_gate_retry(
+                                method="POST",
+                                path="/inference/v1/chat/completions",
+                                json_body=req_body,
+                                headers=headers,
+                                exclude=gated_exits,
+                            )
+                            if hedged is not None:
+                                winner_resp, winner_client, winner_addr, hgated, _hfailed = hedged
+                                gated_exits.update(hgated)
+                                free_tier_gates += len(hgated)
+                                attempt += 1
+                                prefetched = (winner_resp, winner_client, winner_addr)
+                                proxy_addr = None  # iteration finally must not release the handed-off slot
+                                continue  # async-with closes the gated resp on exit
+                            if hedged is None:
+                                # No fresh exit answered 2xx: rotate like the
+                                # plain gate path — the slot is already out.
+                                await _maybe_backoff(attempt, resp.status_code)
+                                attempt += 1
+                                continue
                         yield send_sse("error", {"type": "error", "error": {"type": "upstream_error", "message": err_msg}})
                         return
                     # Not a proxy failure: 4xx/5xx are upstream or request
@@ -6380,7 +6756,13 @@ async def _zen_stream_anthropic_with_retry(
             # translation code must not blacklist a healthy proxy. Client
             # aborts never mark the pool failed.
             if isinstance(e, httpx.HTTPError):
-                _safe_pool_stream_failure(proxy_addr, e)
+                if _is_first_byte_timeout(e):
+                    # Deadline miss: SOFT rotation (slow-but-alive exit,
+                    # possibly mid-upload of a big context) — same accounting
+                    # as the streaming lanes' first-byte path.
+                    _safe_pool_failure(proxy_addr, e, hard=False)
+                else:
+                    _safe_pool_stream_failure(proxy_addr, e)
             last_error = e
             if headers_sent and finish_delivered:
                 # Terminal finish_reason already delivered; stop cleanly.
@@ -7531,7 +7913,7 @@ async def cline_stream_with_retry(
                 "POST", "/chat/completions", json=req_body,
                 headers=_cline_headers(key),
             )
-            resp = await client.send(upstream_request, stream=True)
+            resp = await _send_bounded(client, upstream_request, stream=True)
         except Exception as e:
             last_error = e
             _log(f"[cline] Stream request failed (attempt {attempt}, key ...{key[-8:] if len(key) >= 8 else key}): {_exc_desc(e)}")
