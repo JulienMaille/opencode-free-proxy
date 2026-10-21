@@ -94,6 +94,39 @@ def test_salvage_still_reaches_a_call_within_the_bound():
     assert srv._parse_tool_args(args) == ({"command": "ls"}, True)
 
 
+def test_spec_overrides_raise_known_zen_limits():
+    meta = {
+        mid: {"name": mid, "limit": dict(srv._DEFAULT_LIMIT), "modalities": {}}
+        for mid in srv._MODEL_SPEC_OVERRIDES
+    }
+    srv._apply_model_spec_overrides(meta)
+
+    deepseek = meta["deepseek-v4.1-flash-free"]["limit"]
+    assert deepseek == {
+        "context": 1_048_576,
+        "output": 393_216,
+        "contextWindow": 1_048_576,
+        "maxTokens": 393_216,
+    }
+    assert meta["nemotron-3-ultra-free"]["limit"]["context"] == 1_000_000
+    assert meta["cat-jam-free"]["limit"]["maxTokens"] == 131_072
+
+
+def test_spec_overrides_leave_unknown_models_alone():
+    meta = {"mystery-free": {"limit": dict(srv._DEFAULT_LIMIT)}}
+    srv._apply_model_spec_overrides(meta)
+    assert meta["mystery-free"]["limit"] == srv._DEFAULT_LIMIT
+
+
+def test_effort_ceilings_follow_the_zen_catalog():
+    # Verified rungs (pi-freeflow 24bd955 / 1.40.0): a request above the
+    # ceiling must be clamped instead of sent as an unenumerated rung.
+    assert srv._clamp_effort_for_model("deepseek-v4.1-flash-free", "ultra") == "max"
+    assert srv._clamp_effort_for_model("exo-free", "max") == "xhigh"
+    assert srv._clamp_effort_for_model("longcat-2.5-preview-free", "max") == "xhigh"
+    assert srv._clamp_effort_for_model("cat-jam-free", "max") == "max"
+
+
 def test_wellformed_large_args_parse_before_the_bound():
     args = json.dumps({"command": "x" * (80 * 1024)})
     assert len(args) > srv._SALVAGE_MAX_BYTES

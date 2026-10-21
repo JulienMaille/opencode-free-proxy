@@ -1440,6 +1440,36 @@ def _stealth_admitted(model_id: str, zen_free: set[str] | None = None) -> bool:
 _load_dead_ids()
 
 
+# Verified live specs for the Zen free lane (pi-freeflow 24bd955 / 1.40.0,
+# reconciled against the published twins and boundary probes). models.dev
+# lags or repeats a context figure as the output cap on several of these rows
+# — deepseek was published as 200K/32K while the lane serves ~1.05M/384K — so
+# the served limits understated what the model accepts and hosts truncated
+# context they could have sent. These are lane caps, not twin maxima, so they
+# replace the models.dev values verbatim rather than taking the larger one.
+_MODEL_SPEC_OVERRIDES: dict[str, tuple[int, int]] = {
+    "cat-jam-free": (1_048_576, 131_072),
+    "mimo-v2.6-flash-free": (1_048_576, 131_072),
+    "nemotron-3-ultra-free": (1_000_000, 182_520),
+    "nemotron-3.5-lightning-free": (1_000_000, 235_929),
+    "nemotron-3.5-super-vl-free": (1_048_576, 235_929),
+    "longcat-2.5-preview-free": (1_048_576, 131_072),
+    "glm-5.3-flash-free": (1_048_576, 131_072),
+    "beam-free": (1_048_576, 131_072),
+    "exo-free": (1_048_576, 131_072),
+    "deepseek-v4.1-flash-free": (1_048_576, 393_216),
+}
+
+
+def _apply_model_spec_overrides(meta: dict[str, dict]) -> None:
+    """Replace the served limits of known Zen ids with their verified values."""
+    for mid, (ctx, out) in _MODEL_SPEC_OVERRIDES.items():
+        ent = meta.get(mid)
+        if not isinstance(ent, dict):
+            continue
+        ent["limit"] = {"context": ctx, "output": out, "contextWindow": ctx, "maxTokens": out}
+
+
 async def _fetch_free_models():
     """Query Zen API + models.dev, merge free model list with context limits.
 
@@ -1542,13 +1572,16 @@ async def _fetch_free_models():
                                 "modalities": dict(_DEFAULT_MODALITIES),
                                 "api": _prev_api if _prev_api in ("openai-responses", "openai-completions") else None,
                             }
+                    _apply_model_spec_overrides(meta)
                     _models_meta = meta
                     _log(f"[models] Loaded metadata for {len(meta)} models from models.dev")
                 else:
                     raise RuntimeError(f"models.dev returned {md.status_code}")
             except Exception as e:
                 _log(f"[models] models.dev fetch failed: {e}, using conservative defaults")
-                _models_meta = {mid: {"name": _humanize_name(mid), "limit": dict(_DEFAULT_LIMIT), "modalities": dict(_DEFAULT_MODALITIES), "api": ((_models_meta.get(mid) or {}).get("api") if isinstance(_models_meta.get(mid), dict) else None)} for mid in free}
+                fallback = {mid: {"name": _humanize_name(mid), "limit": dict(_DEFAULT_LIMIT), "modalities": dict(_DEFAULT_MODALITIES), "api": ((_models_meta.get(mid) or {}).get("api") if isinstance(_models_meta.get(mid), dict) else None)} for mid in free}
+                _apply_model_spec_overrides(fallback)
+                _models_meta = fallback
 
             _models_cache = free
             _models_checked_at = time.time()
@@ -3214,12 +3247,20 @@ _MODEL_MAX_EFFORT.update({
     "muse-spark": "xhigh",
     "big-pickle": "max",
     "space-bunny-free": "max",
-    "longcat-2.5-preview-free": "max",
+    # longcat tops out at xhigh (pi-freeflow 24bd955 / 1.40.0); it used to be
+    # listed at max, which sent an unenumerated rung the gateway refuses.
+    "longcat-2.5-preview-free": "xhigh",
     "fledge-alpha-free": "max",
     "ling-3.1-flash-free": "max",
     "nemotron-3-ultra-free": "xhigh",
     "nemotron-3.5-lightning-free": "xhigh",
+    "nemotron-3.5-super-vl-free": "xhigh",
     "mimo-v2.6-flash-free": "xhigh",
+    "cat-jam-free": "max",
+    "glm-5.3-flash-free": "max",
+    "beam-free": "max",
+    "exo-free": "xhigh",
+    "deepseek-v4.1-flash-free": "max",
     # Step 5 Preview offers only low/medium/high and disables "minimal"
     # (pi-freeflow 50981fb / 1.34.0: the Zen entry corrected from its Kilo twin).
     "step-5-preview-free": "high",

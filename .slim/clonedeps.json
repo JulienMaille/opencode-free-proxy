@@ -4,9 +4,9 @@
   "dependencies": [
     {
       "name": "pi-freeflow",
-      "resolvedVersion": "1.38.5",
+      "resolvedVersion": "1.40.0",
       "repoUrl": "https://github.com/trefeon/pi-freeflow.git",
-      "ref": "v1.38.5",
+      "ref": "v1.40.0",
       "path": ".slim/clonedeps/repos/trefeon__pi-freeflow",
       "reason": "Upstream reference this proxy is a faithful port of. src/tool-translation.ts, src/tool-args.ts, src/stream-pipe.ts, src/upstream-health.ts and src/opencode-fingerprint.ts are the sources ported into server.py; ported changes are cited by pi-freeflow version in the code comments."
     }

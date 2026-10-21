@@ -543,8 +543,9 @@ def test_effort_clamped_to_model_ceiling():
     # muse-spark tops out at xhigh; max/ultra clamp down.
     assert srv._clamp_effort_for_model("muse-spark-1.3-contributor-free", "max") == "xhigh"
     assert srv._clamp_effort_for_model("muse-spark-1.3-contributor-free", "high") == "high"
-    # longcat/space-bunny legitimately offer max: it must survive.
-    assert srv._clamp_effort_for_model("longcat-2.5-preview-free", "max") == "max"
+    # space-bunny legitimately offers max: it must survive. longcat tops out
+    # at xhigh (pi-freeflow 24bd955 / 1.40.0), so max clamps down.
+    assert srv._clamp_effort_for_model("longcat-2.5-preview-free", "max") == "xhigh"
     assert srv._clamp_effort_for_model("space-bunny-free", "max") == "max"
     assert srv._clamp_effort_for_model("longcat-2.5-preview-free", "minimal") == "minimal"
     # Unrecognised levels are dropped, not guessed.
