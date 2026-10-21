@@ -825,6 +825,14 @@ class ProxyPool:
         ]
         best, fallback = self._rank_hot(now, overloaded_current, exclude or None)
         if best is None and fallback is None and exclude:
+            # Every usable hot exit is already excluded (e.g. FreeTier-gated).
+            # The hot buffer is deliberately small (HOT_TARGET), so untouched
+            # candidates usually remain: verify one before reusing an exit that
+            # would only gate again. Without this, a single gate could strand a
+            # request while hundreds of candidates were still unprobed.
+            picked = await self._verify_batch(excluded=exclude)
+            if picked is not None:
+                return picked
             _log(f"No usable proxy excluding {len(exclude)} gated exit(s); last-resort retry on a gated exit")
             best, fallback = self._rank_hot(now, overloaded_current, None)
         if best is None and fallback is not None:
@@ -846,52 +854,62 @@ class ProxyPool:
             return self.current
 
         # 2. On-the-fly: verify a batch of candidates in parallel
-        batch = self._take_verification_batch(VERIFY_BATCH_SIZE)
-
-        if batch:
-            _log(
-                f"Verifying {len(batch)} candidates on-the-fly across "
-                f"{len({p.get('source', 'legacy') for p in batch})} sources..."
-            )
-            pending = {asyncio.create_task(self._verify_with_retry(p)): p for p in batch}
-            try:
-                while pending:
-                    done, _ = await asyncio.wait(
-                        pending, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for fut in done:
-                        p = pending.pop(fut)
-                        if fut.cancelled():
-                            continue
-                        addr = p["address"]
-                        if fut.result() is True:
-                            # First verified proxy wins; don't wait for the rest
-                            # (up to ~8s of latency saved per cold request).
-                            for f in pending:
-                                f.cancel()
-                            self.current = p
-                            self._inflight[addr] = self._inflight.get(addr, 0) + 1
-                            self._inflight_at[addr] = time.time()
-                            _log(f"Selected after on-the-fly verify: {addr}")
-                            self._trigger_refill()
-                            return p
-                        self.blacklist[addr] = time.time() + BLACKLIST_TTL
-                # All failed
-                _log(f"No usable proxy ({self.get_pool_state()})")
-                return None
-            finally:
-                # Cancel stragglers (success path or caller cancellation) and
-                # always release the in-flight markers, even if the request
-                # handler is cancelled mid-verify.
-                if pending:
-                    for f in pending:
-                        f.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                for p in batch:
-                    self.verifying.discard(p["address"])
+        picked = await self._verify_batch()
+        if picked is not None:
+            return picked
 
         # 3. Nothing usable
         _log(f"No usable proxy ({self.get_pool_state()})")
+        return None
+
+    async def _verify_batch(self, excluded: set[str] | None = None) -> dict | None:
+        """Verify a parallel batch of fresh candidates; return the first good one.
+
+        ``excluded`` (addresses this request already gated) is forwarded to the
+        candidate rotation so a gated request can reach untouched exits instead
+        of immediately reusing an exit that will only gate again. Failed
+        candidates are blacklisted; stragglers are cancelled on the winner.
+        """
+        batch = self._take_verification_batch(VERIFY_BATCH_SIZE, excluded=excluded)
+        if not batch:
+            return None
+        _log(
+            f"Verifying {len(batch)} candidates on-the-fly across "
+            f"{len({p.get('source', 'legacy') for p in batch})} sources..."
+        )
+        pending = {asyncio.create_task(self._verify_with_retry(p)): p for p in batch}
+        try:
+            while pending:
+                done, _ = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for fut in done:
+                    p = pending.pop(fut)
+                    if fut.cancelled():
+                        continue
+                    addr = p["address"]
+                    if fut.result() is True:
+                        # First verified proxy wins; don't wait for the rest
+                        # (up to ~8s of latency saved per cold request).
+                        for f in pending:
+                            f.cancel()
+                        self.current = p
+                        self._inflight[addr] = self._inflight.get(addr, 0) + 1
+                        self._inflight_at[addr] = time.time()
+                        _log(f"Selected after on-the-fly verify: {addr}")
+                        self._trigger_refill()
+                        return p
+                    self.blacklist[addr] = time.time() + BLACKLIST_TTL
+        finally:
+            # Cancel stragglers (success path or caller cancellation) and
+            # always release the in-flight markers, even if the request
+            # handler is cancelled mid-verify.
+            if pending:
+                for f in pending:
+                    f.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            for p in batch:
+                self.verifying.discard(p["address"])
         return None
 
     def release(self, addr: str | None = None):
@@ -1216,7 +1234,7 @@ class ProxyPool:
                 self.current = None
 
     def report_failure(self, addr: str | None = None, hard: bool = False,
-                       exc: BaseException | None = None):
+                       exc: BaseException | None = None, grace: bool = True):
         """Record a transport-level failure for ``addr``.
 
         Soft failures (e.g. a single ReadError) get one grace retry on the
@@ -1224,6 +1242,13 @@ class ProxyPool:
         blacklist immediately — an exit that refuses connections is dead for
         the rest of this request anyway. Client AbortError/cancel (``exc``)
         is never penalized.
+
+        ``grace=False`` marks a failure that already consumed the full attempt
+        deadline (the size-aware first-byte timeout). Rotating to a fresh exit
+        is the whole point there: a same-exit grace retry would spend a second
+        full deadline on the exit that just timed out. These are cooled
+        briefly, never blacklisted — a large upload over a slow-but-alive exit
+        looks identical to a dead one from here.
 
         Idempotent: if ``target`` is already blacklisted with a future expiry
         (concurrent requests sharing one sticky exit failing together), only
@@ -1252,8 +1277,16 @@ class ProxyPool:
         # immediately; soft failures (<2) get one grace retry on the same exit
         # before it is blacklisted.
         self.hot = [p for p in self.hot if p["address"] != target]
-        if not hard and failures < 2:
+        if not hard and failures < 2 and grace:
             _log(f"Transport failure {target} ({failures}/2); retrying same proxy")
+            return
+        if not hard and not grace:
+            ms = self._apply_entry_cooldown(target, None)
+            self.transport_failures.pop(target, None)
+            if self.current and self.current["address"] == target:
+                self.current = None
+            _log(f"Attempt deadline on {target}; rotating to a fresh exit "
+                 f"(cooled {ms // 1000}s, not blacklisted)")
             return
         self._apply_entry_cooldown(target, None)
         self.blacklist[target] = time.time() + BLACKLIST_TTL

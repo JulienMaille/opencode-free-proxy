@@ -2593,7 +2593,9 @@ def _safe_pool_failure(addr: str | None, exc: BaseException | None = None, hard:
     if _is_client_abort(exc):
         _log(f"[pool] client abort ({type(exc).__name__ if exc is not None else '?'}); not marking {addr} failed")
         return False
-    proxy_pool.report_failure(addr, hard=hard)
+    proxy_pool.report_failure(
+        addr, hard=hard, grace=not _is_first_byte_timeout(exc)
+    )
     return True
 
 

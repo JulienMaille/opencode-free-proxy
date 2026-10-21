@@ -345,3 +345,23 @@ def test_hedge_wins_and_lower_status_booked_without_penalty(monkeypatch):
     assert pool_reports == []  # 5xx inside the hedge = no pool penalty
     assert result[4] == ["a:1"]
     assert pool.released == ["a:1"]
+
+
+def test_safe_pool_failure_drops_the_grace_retry_on_a_deadline_miss(monkeypatch):
+    # A first-byte deadline miss already spent the full attempt window, so it
+    # must not also earn the same-exit grace retry; other soft failures keep it.
+    calls = []
+    monkeypatch.setattr(srv, "PROXY_POOL_ENABLED", True)
+    monkeypatch.setattr(
+        srv.proxy_pool,
+        "report_failure",
+        lambda addr, **kw: calls.append((addr, kw)),
+    )
+    srv._safe_pool_failure(
+        "a:1", httpx.ConnectTimeout("no response headers within 45s"), hard=False
+    )
+    srv._safe_pool_failure("b:2", httpx.ReadError("torn tunnel"), hard=False)
+    assert calls == [
+        ("a:1", {"hard": False, "grace": False}),
+        ("b:2", {"hard": False, "grace": True}),
+    ]
